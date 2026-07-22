@@ -1,0 +1,23 @@
+[Unit]
+Description=Skipa Watchdog - Telegram bot for CyberOK/Skipa scanner alerts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Поправьте путь на реальное расположение проекта
+WorkingDirectory=/opt/skipa_watchdog
+ExecStart=/opt/skipa_watchdog/venv/bin/python /opt/skipa_watchdog/main.py
+Restart=always
+RestartSec=10
+
+# Нужны права на чтение чужих сокетов в /proc/net (см. README).
+# Если не хотите запускать от root - раскомментируйте капабилити ниже
+# и укажите непривилегированного пользователя/группу.
+# User=skipa
+# Group=skipa
+# AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+# CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

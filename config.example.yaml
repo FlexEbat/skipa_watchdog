@@ -1,0 +1,37 @@
+# Скопируйте этот файл в config.yaml и заполните своими значениями.
+
+telegram:
+  # Токен бота, полученный у @BotFather
+  bot_token: "123456789:AAAA-your-bot-token-here"
+  # ID чата/канала, куда слать уведомления (можно узнать через @userinfobot
+  # или @getmyid_bot; для канала — это отрицательное число вида -100XXXXXXXXXX)
+  chat_id: -1001234567890
+  # ID пользователей, которым разрешено дергать команды бота (/status, /update, ...)
+  # Если список пуст — команды разрешены всем, кто пишет боту в личку.
+  admin_ids: []
+
+sources:
+  # Откуда брать списки IP (raw-ссылки на репозиторий tread-lightly/CyberOK_Skipa_ips)
+  cidr_list_url: "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
+  range_list_url: "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_range.txt"
+  # Как часто обновлять базу IP (в днях). По заданию — раз в неделю.
+  update_interval_days: 7
+
+monitoring:
+  # Как часто (в секундах) опрашивать активные сетевые соединения сервера
+  poll_interval_seconds: 5
+  # Через сколько минут можно снова слать алерт по тому же IP (антиспам)
+  alert_cooldown_minutes: 60
+  # Свои IP/подсети, которые никогда не должны триггерить алерт (например, ваш VPN/офис)
+  ignore_ips: []
+
+enrichment:
+  # Токен ipinfo.io (необязателен, без него тоже работает, но с меньшим лимитом запросов)
+  # Получить бесплатно: https://ipinfo.io/signup
+  ipinfo_token: ""
+  # Ключ ipregistry.co для блока "Privacy info" (Proxy/Abuser/Server)
+  # Бесплатный тариф: https://ipregistry.co
+  ipregistry_key: ""
+
+logging:
+  level: "INFO"

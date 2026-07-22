@@ -1,0 +1,13 @@
+[Unit]
+Description=Install skipa-watchdog CONN logging rules (INPUT + DOCKER-USER)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Поправьте путь на реальное расположение проекта
+ExecStart=/opt/skipa_watchdog/install-logging-rules.sh
+
+[Install]
+WantedBy=multi-user.target

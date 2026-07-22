@@ -1,25 +1,3 @@
-"""
-Постоянный мониторинг подключений к серверу. Два метода на выбор
-(настраивается через monitoring.method в config.yaml):
-
-1. "psutil" - опрос активных сетевых соединений через psutil.net_connections().
-   Работает "из коробки" без дополнительной настройки, но может пропускать
-   очень короткие TCP-сессии (одиночный SYN от zmap/zgrab, который сразу
-   рвётся RST) - именно так часто ведёт себя Skipa.
-
-2. "kernel_log" - хвостует `journalctl -k -f` и ищет строки лога nftables/
-   iptables (правило с `log prefix "CONN: "`), парсит SRC=/DPT= из каждой
-   записи. Ловит вообще любой входящий SYN, независимо от того, успело ли
-   соединение дойти до ESTABLISHED. Требует настройки nftables/iptables -
-   см. README.md, раздел "Расширенный мониторинг через nftables".
-
-3. "both" - оба метода одновременно (два независимых asyncio-таска),
-   антиспам-кулдаун общий на IP, так что дублей алертов не будет.
-
-Оба метода в итоге вызывают один и тот же on_hit(Hit) callback, поэтому
-вся остальная цепочка (обогащение -> форматирование -> отправка в Telegram)
-не зависит от источника события.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -36,7 +14,7 @@ from .ip_lists import ThreatDB
 log = logging.getLogger("skipa_watchdog.monitor")
 
 # Пример строки лога netfilter, которую парсим:
-# CONN: IN=eth0 OUT= MAC=... SRC=185.135.81.106 DST=1.2.3.4 LEN=60 TOS=0x00
+# CONN: IN=eth0 OUT= MAC=... SRC=89.169.28.214 DST=1.2.3.4 LEN=60 TOS=0x00
 # PREC=0x00 TTL=63 ID=12345 DF PROTO=TCP SPT=54321 DPT=80 WINDOW=... SYN
 _SRC_RE = re.compile(r"SRC=(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
 _DPT_RE = re.compile(r"DPT=(\d+)")

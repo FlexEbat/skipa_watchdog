@@ -1,14 +1,3 @@
-"""
-Skipa Watchdog — Telegram-бот, который постоянно мониторит подключения к
-серверу и присылает уведомления, если источник входит в базу IP-адресов
-сканеров CyberOK/Skipa, ГРЧЦ и НКЦКИ:
-https://github.com/tread-lightly/CyberOK_Skipa_ips
-
-Запуск:
-    pip install -r requirements.txt
-    cp config.example.yaml config.yaml   # и заполнить
-    python main.py
-"""
 from __future__ import annotations
 
 import asyncio
@@ -123,7 +112,7 @@ async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     config: Config = context.bot_data["config"]
     if not _is_admin(config, update.effective_user.id):
         return
-    test_ip = context.args[0] if context.args else "185.135.81.106"
+    test_ip = context.args[0] if context.args else "89.169.28.214"
     data = await enrich_ip(test_ip, config.ipinfo_token, config.ipregistry_key)
     text = build_alert_message(test_ip, "тестовый вызов /testalert", data)
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)

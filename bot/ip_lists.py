@@ -1,8 +1,3 @@
-"""
-Загрузка, кэширование и еженедельное обновление базы IP-адресов сканеров
-из репозитория tread-lightly/CyberOK_Skipa_ips (файлы lists/skipa_cidr.txt
-и lists/skipa_range.txt).
-"""
 from __future__ import annotations
 
 import ipaddress

@@ -12,20 +12,20 @@ Telegram-бот, который **постоянно** мониторит сет
 ## Пример уведомления
 
 ```
-🚨 УГРОЗА. СКАНЕР ОБНАРУЖЕН - IP
+🚨 УГРОЗА. СКАНЕР ОБНАРУЖЕН
 
-IP: 111.111.11.111
+IP: 89.169.28.214
 BGP | Censys | IPinfo | IPQS | More
 ▢ MaxMind & IPinfo & Cloudflare:
-🇷🇺 RU Russia, Novosibirsk Oblast, Kudryashovskiy
-AS12345 / XXXX LLC
+🇷🇺 RU Russia, Moscow
+AS29182 / JSC IOT
 ▢ Registration (RIPE):
 🇷🇺 RU Russia (IP)
-RU-XXXXX-1234567890
+RU-JSCIOT-20060224
 🇷🇺 RU Russia (AS)
-XXXXX-AS / XXXX.com
-▢ Privacy info (ipregistry.co):
-Proxy ❌ | Abuser ❌ | Server ✅
+RU-JSCIOT / Joint Stock Company «IOT»
+▢ Privacy info (ipregistry․co):
+Proxy ✅ | Abuser ❌ | Server ✅
 ```
 
 ## Установка
@@ -64,7 +64,8 @@ python main.py
 
 - `/status` — сколько записей в базе, когда было последнее обновление
 - `/update` — принудительно обновить базу IP прямо сейчас
-- `/testalert [ip]` — прислать тестовое уведомление в нужном формате, удобно для проверки форматирования
+- `/testalert [ip]` — прислать тестовое уведомление в нужном формате (по умолчанию
+  на примере `89.169.28.214`), удобно для проверки форматирования
 - `/start` — краткая справка
 
 Если в `config.yaml` задан `telegram.admin_ids`, команды будут работать только
@@ -78,15 +79,21 @@ python main.py
 права root — поэтому рекомендуется запускать бота от root или через systemd
 с `AmbientCapabilities=CAP_NET_ADMIN` (см. `skipa-watchdog.service` ниже).
 
-## Расширенный мониторинг через nftables (надёжнее, ловит одиночные SYN)
+## Расширенный мониторинг через nftables/iptables (надёжнее, ловит одиночные SYN)
 
 Опрос через `psutil` раз в несколько секунд может пропустить очень короткие
 соединения (одиночный SYN от zmap/zgrab, который сразу же рвётся RST) —
 это как раз то, чем печально славится Skipa. Реализован второй, более
-надёжный метод: логирование новых TCP-соединений через nftables прямо
-в лог ядра (kernel ring buffer), который бот читает через `journalctl -k -f`.
+надёжный метод: логирование новых TCP-соединений прямо в лог ядра (kernel
+ring buffer), который бот читает через `journalctl -k -f`.
 
-### 1. Проверьте текущий rulebase
+Ниже два варианта настройки — выберите тот, что соответствует вашему серверу.
+Оба варианта пишут в лог ядра в одном и том же формате, поэтому дальше
+конфиг бота и парсер (`tail_kernel_log_loop()`) одинаковые для обоих.
+
+### Вариант A: чистый nftables (сервер без Docker, свой rulebase)
+
+**1. Проверьте текущий rulebase**
 
 ```bash
 sudo nft list ruleset
@@ -100,9 +107,9 @@ sudo nft add table inet filter
 sudo nft add chain inet filter input '{ type filter hook input priority filter ; policy accept ; }'
 ```
 
-### 2. Добавьте правило логирования
+**2. Добавьте правило логирования**
 
-Важно поставить его **до** правил `drop`/`reject` (иначе то, что дропается
+Важно поставить его до правил `drop`/`reject` (иначе то, что дропается
 раньше — не долетит до лога), и с лимитом скорости, чтобы при реальной
 атаке/скан-шторме не забить диск и CPU логированием:
 
@@ -117,18 +124,19 @@ sudo nft insert rule inet filter input tcp flags syn ct state new \
 напрямую в kernel log buffer, который читается через `journalctl -k` или
 `dmesg`, без необходимости поднимать отдельный демон вроде ulogd.
 
-### 3. Сохраните правило, чтобы оно пережило перезагрузку
+**3. Сохраните правило, чтобы оно пережило перезагрузку**
 
 ```bash
 sudo nft list ruleset | sudo tee /etc/nftables.conf
 sudo systemctl enable --now nftables
 ```
 
-### 4. Проверьте, что записи реально появляются
+**4. Проверьте, что записи реально появляются**
 
 ```bash
 sudo journalctl -k -f
 ```
+
 и с другого хоста дёрните любой порт (`curl <ваш_ip>` или `nc -zv <ваш_ip> 80`) —
 должна появиться строка вида:
 
@@ -136,32 +144,120 @@ sudo journalctl -k -f
 CONN: IN=eth0 OUT= MAC=... SRC=89.169.28.214 DST=1.2.3.4 LEN=60 ... PROTO=TCP SPT=54321 DPT=80 ... SYN
 ```
 
-### 5. Включите этот метод в config.yaml
-
-```yaml
-monitoring:
-  method: "kernel_log"   # "psutil" | "kernel_log" | "both"
-  kernel_log_prefix: "CONN: "
-```
-
-`bot/monitor.py` уже содержит готовую функцию `tail_kernel_log_loop()`,
-которая запускает `journalctl -k -f -o cat` как подпроцесс, построчно парсит
-`SRC=` / `DPT=` регуляркой и прогоняет IP через ту же `ThreatDB.match()` и ту
-же логику антиспама, что и метод через `psutil`. Меняется только источник
-событий — весь остальной пайплайн (обогащение, форматирование, отправка)
-переиспользуется без изменений.
-
-**Права доступа:** чтение kernel-логов через `journalctl -k` требует root
-либо членства в группе `systemd-journal`. Проще всего просто запускать бота
-от root (см. `skipa-watchdog.service`).
-
-Если у вас **iptables** вместо nftables — аналог:
+Если у вас классический **iptables** вместо nftables (и при этом нет Docker) —
+аналог:
 
 ```bash
 sudo iptables -I INPUT -p tcp --syn -m conntrack --ctstate NEW \
   -m limit --limit 20/second -j LOG --log-prefix "CONN: " --log-level 4
 ```
+
 это тоже пишется в kernel log buffer, парсер тот же самый.
+
+### Вариант B: сервер с Docker (бэкенд iptables-nft)
+
+Если на сервере крутится Docker — он **сам управляет iptables** через
+совместимый бэкенд `iptables-nft` (проверить: `sudo iptables -V` покажет
+`(nf_tables)`). Таблицы у него называются `ip filter`/`ip nat` с пометкой
+`managed by iptables-nft, do not touch!` — значит правила добавляются через
+команду `iptables`, а не напрямую через `nft add rule` в эти таблицы (Docker
+их периодически пересоздаёт/дополняет, самодельное nft-правило может
+потеряться или сконфликтовать).
+
+Кроме того, трафик на опубликованные порты контейнеров (те, что указаны
+в `docker run -p` / `ports:` в compose) идёт **не через INPUT**, а через
+`FORWARD → DOCKER-USER` (после DNAT, который меняет адрес назначения раньше,
+чем принимается решение о маршрутизации). Поэтому правило логирования нужно
+ставить в двух местах.
+
+**1. Одноразово примените правила**
+
+```bash
+sudo bash install-logging-rules.sh
+```
+
+Скрипт идемпотентный (безопасно перезапускать) и добавляет:
+
+```bash
+# хостовые сервисы (SSH и всё, что слушает не через Docker)
+iptables -I INPUT -p tcp --syn -m limit --limit 30/second --limit-burst 40 \
+  -j LOG --log-prefix "CONN: " --log-level 4
+
+# всё, что опубликовано через Docker (80/443/3000/8448/51821/turn-порты и т.д.)
+iptables -I DOCKER-USER -p tcp --syn -m limit --limit 30/second --limit-burst 40 \
+  -j LOG --log-prefix "CONN: " --log-level 4
+```
+
+`--syn` матчит именно первый пакет TCP-хендшейка — то есть буквально любую
+попытку соединения, даже если дальше сразу RST. `-m limit` — защита от
+переполнения kernel-лога при реальном шторме пакетов; сам трафик при этом
+не блокируется (`-j LOG` не терминальное действие, пакет идёт дальше как
+обычно).
+
+**2. Поставьте это на автозапуск после Docker**
+
+Правила из `DOCKER-USER` переживают рестарт демона Docker, но **не переживают
+перезагрузку сервера** (после ребута Docker создаёт цепочку заново пустой).
+Поэтому добавьте systemd-юнит, который применяет скрипт после старта Docker:
+
+```bash
+sudo cp skipa-watchdog-fw-rules.service /etc/systemd/system/
+sudo nano /etc/systemd/system/skipa-watchdog-fw-rules.service  # поправить путь ExecStart
+sudo systemctl daemon-reload
+sudo systemctl enable --now skipa-watchdog-fw-rules
+```
+
+**3. Проверьте, что записи реально появляются**
+
+```bash
+sudo journalctl -k -f
+```
+
+и с другого хоста дёрните любой порт:
+
+```bash
+curl -m 2 http://<ваш_ip>       # для 80/443
+nc -zv <ваш_ip> 3000            # для докер-порта
+```
+
+Должна появиться строка вида:
+
+```
+CONN: IN=eth0 OUT= MAC=... SRC=89.169.28.214 DST=172.20.0.9 LEN=60 ... PROTO=TCP SPT=54321 DPT=80 ... SYN
+```
+
+`DST=` для докер-трафика будет **внутренний** IP контейнера (172.x.x.x) —
+это нормально, бот парсит только `SRC=`, там всегда настоящий внешний IP
+сканера.
+
+**Если Docker не используется** и iptables у вас "чистый" (без `DOCKER-USER`) —
+скрипт сам это определит и пропустит второй шаг, останется только правило
+в INPUT (по сути превращается в вариант A, но через iptables вместо nft).
+
+#### Нужны ли для этого какие-то особые пакеты/права рядом с Docker?
+
+Нет, ничего сверх того, что у вас уже стоит вместе с Docker:
+
+- **Отдельный nftables-пакет не нужен и не запускается** — в варианте B мы
+  работаем только через команду `iptables` (её ставит сам Docker как
+  зависимость), `systemctl enable nftables` тут не при чём и может даже
+  конфликтовать, если параллельно поднимется отдельный демон nftables со
+  своим rulebase.
+- **conntrack/nat модули ядра** уже загружены и используются самим Docker
+  (для проброса портов), дополнительно включать их не нужно.
+- **Специальных capabilities/пакетов для скрипта не требуется** — `iptables`
+  и `-m limit` есть в стандартной поставке `iptables`/`iptables-nft`
+  практически на любом дистрибутиве с Docker.
+- Единственное, что важно соблюсти — **порядок запуска**: правило в
+  `DOCKER-USER` можно поставить только после того, как Docker создал эту
+  цепочку, поэтому systemd-юнит явно объявляет `After=docker.service` и
+  `Requires=docker.service`. Если применить скрипт раньше старта Docker —
+  он просто не найдёт `DOCKER-USER` и пропустит этот шаг (сам скрипт это
+  проверяет и не упадёт, но правило не встанет, пока вы не перезапустите
+  юнит уже после старта Docker).
+- Для самого бота (не для правил) права нужны такие же, как без Docker:
+  либо root, либо членство в группе `systemd-journal` для чтения
+  `journalctl -k`.
 
 ## Запуск как systemd-сервис (продакшен)
 
@@ -178,16 +274,19 @@ sudo journalctl -u skipa-watchdog -f
 
 ```
 skipa_watchdog/
-├── main.py                  # точка входа, команды бота, оркестрация job'ов
-├── config.example.yaml      # шаблон конфига
-├── config.yaml              # ваш конфиг
+├── main.py                          # точка входа, команды бота, оркестрация job'ов
+├── config.example.yaml              # шаблон конфига
+├── config.yaml                      # ваш конфиг
 ├── requirements.txt
+├── install-logging-rules.sh         # ставит iptables-правила логирования (INPUT + DOCKER-USER)
+├── skipa-watchdog-fw-rules.service  # systemd-юнит: применяет правила после старта Docker
+├── skipa-watchdog.service           # systemd-юнит: сам бот
 ├── bot/
 │   ├── config.py            # загрузка config.yaml
 │   ├── ip_lists.py          # скачивание/кэш/еженедельное обновление базы IP
 │   ├── enrich.py            # ipinfo.io + RIPEstat + ipregistry.co
 │   ├── formatter.py         # сборка текста алерта в нужном стиле
-│   └── monitor.py           # непрерывный мониторинг соединений (psutil)
+│   └── monitor.py           # мониторинг: psutil и/или чтение kernel-лога
 └── data/
     └── ip_cache.json        # локальный кэш базы (создаётся автоматически)
 ```

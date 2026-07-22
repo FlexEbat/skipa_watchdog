@@ -1,4 +1,3 @@
-"""Загрузка и валидация конфигурации бота из YAML."""
 from __future__ import annotations
 
 import ipaddress

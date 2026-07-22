@@ -21,7 +21,7 @@ from bot.config import Config
 from bot.enrich import enrich_ip
 from bot.formatter import build_alert_message
 from bot.ip_lists import fetch_threat_db, load_cache, needs_update, save_cache
-from bot.monitor import poll_connections_loop
+from bot.monitor import Deduper, poll_connections_loop, tail_kernel_log_loop
 
 CONFIG_PATH = "config.yaml"
 
@@ -98,6 +98,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "📊 Статус Skipa Watchdog\n"
         f"Записей в базе: {db.source_line_count}\n"
         f"Последнее обновление: {last_update}\n"
+        f"Метод мониторинга: {config.method}\n"
         f"Интервал опроса соединений: {config.poll_interval_seconds} сек.\n"
         f"Антиспам-кулдаун: {config.alert_cooldown_minutes} мин."
     )
@@ -150,17 +151,35 @@ async def post_init(app: Application) -> None:
     app.bot_data["db"] = db
 
     on_hit = make_hit_handler(app, config)
+    dedup = Deduper(config.alert_cooldown_minutes)
 
-    # запускаем бесконечный цикл мониторинга как фоновую asyncio-задачу
-    app.create_task(
-        poll_connections_loop(
-            get_db=lambda: app.bot_data.get("db"),
-            ignore_networks=config.ignore_networks,
-            poll_interval=config.poll_interval_seconds,
-            cooldown_minutes=config.alert_cooldown_minutes,
-            on_hit=on_hit,
+    method = config.method
+    if method not in ("psutil", "kernel_log", "both"):
+        log.warning("Неизвестный monitoring.method=%r, использую 'psutil'", method)
+        method = "psutil"
+
+    if method in ("psutil", "both"):
+        app.create_task(
+            poll_connections_loop(
+                get_db=lambda: app.bot_data.get("db"),
+                ignore_networks=config.ignore_networks,
+                poll_interval=config.poll_interval_seconds,
+                dedup=dedup,
+                on_hit=on_hit,
+            )
         )
-    )
+
+    if method in ("kernel_log", "both"):
+        app.create_task(
+            tail_kernel_log_loop(
+                get_db=lambda: app.bot_data.get("db"),
+                ignore_networks=config.ignore_networks,
+                dedup=dedup,
+                on_hit=on_hit,
+                log_prefix=config.kernel_log_prefix,
+                command=config.kernel_log_command or None,
+            )
+        )
 
     # раз в час проверяем, не пора ли обновить базу (реальное обновление - раз в неделю,
     # см. update_interval_days в config.yaml)

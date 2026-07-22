@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from html import escape
@@ -25,7 +24,7 @@ def _bool_icon(value: bool | None) -> str:
 
 def build_alert_message(ip: str, matched_source: str, data: EnrichedIP) -> str:
     lines = []
-    lines.append("🚨 <b>УГРОЗА. СКАНЕР ОБНАРУЖЕН</b>")
+    lines.append("🚨 <b>УГРОЗА. СКАНЕР ОБНАРУЖЕН - IP</b>")
     lines.append("")
     lines.append(f"IP: <code>{escape(ip)}</code>")
     lines.append(_links_line(ip))

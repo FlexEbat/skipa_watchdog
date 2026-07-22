@@ -18,7 +18,20 @@ sources:
   update_interval_days: 7
 
 monitoring:
-  # Как часто (в секундах) опрашивать активные сетевые соединения сервера
+  # Как обнаруживать подключения известных сканеров:
+  # "psutil"     - опрос активных сокетов через psutil (просто, но может пропускать
+  #                очень короткие TCP-сессии вроде одиночного SYN от zmap/zgrab)
+  # "kernel_log" - хвостование journalctl -k -f по логам nftables/iptables,
+  #                ловит любой входящий SYN (нужно один раз настроить nftables,
+  #                см. README.md -> "Расширенный мониторинг через nftables")
+  # "both"       - оба метода сразу, дедупликация алертов общая
+  method: "psutil"
+  # Префикс, который вы указали в правиле `log prefix "..."` (для method: kernel_log/both)
+  kernel_log_prefix: "CONN: "
+  # Необязательно: своя команда для чтения kernel-лога вместо journalctl -k -f,
+  # например ["tail", "-F", "/var/log/kern.log"] на системах с rsyslog вместо journald
+  kernel_log_command: []
+  # Как часто (в секундах) опрашивать активные сетевые соединения сервера (для method: psutil)
   poll_interval_seconds: 5
   # Через сколько минут можно снова слать алерт по тому же IP (антиспам)
   alert_cooldown_minutes: 60

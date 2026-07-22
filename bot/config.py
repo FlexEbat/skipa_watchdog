@@ -23,6 +23,10 @@ class Config:
     alert_cooldown_minutes: int
     ignore_networks: list[ipaddress._BaseNetwork] = field(default_factory=list)
 
+    method: str = "psutil"
+    kernel_log_prefix: str = "CONN: "
+    kernel_log_command: list[str] = field(default_factory=list)
+
     ipinfo_token: str = ""
     ipregistry_key: str = ""
 
@@ -76,6 +80,9 @@ class Config:
             poll_interval_seconds=int(mon.get("poll_interval_seconds", 5)),
             alert_cooldown_minutes=int(mon.get("alert_cooldown_minutes", 60)),
             ignore_networks=ignore_nets,
+            method=mon.get("method", "psutil"),
+            kernel_log_prefix=mon.get("kernel_log_prefix", "CONN: "),
+            kernel_log_command=list(mon.get("kernel_log_command") or []),
             ipinfo_token=enr.get("ipinfo_token", "") or "",
             ipregistry_key=enr.get("ipregistry_key", "") or "",
             log_level=log.get("level", "INFO"),

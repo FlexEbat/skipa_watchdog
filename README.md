@@ -259,7 +259,7 @@ CONN: IN=eth0 OUT= MAC=... SRC=89.169.28.214 DST=172.20.0.9 LEN=60 ... PROTO=TCP
   либо root, либо членство в группе `systemd-journal` для чтения
   `journalctl -k`.
 
-## Запуск как systemd-сервис (продакшен)
+## Запуск как systemd-сервис
 
 См. файл `skipa-watchdog.service`. Скопируйте его в `/etc/systemd/system/`,
 поправьте пути, затем:

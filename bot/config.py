@@ -1,3 +1,4 @@
+"""Загрузка и валидация конфигурации бота из YAML."""
 from __future__ import annotations
 
 import ipaddress
@@ -28,6 +29,8 @@ class Config:
 
     ipinfo_token: str = ""
     ipregistry_key: str = ""
+
+    retry_interval_seconds: int = 300
 
     log_level: str = "INFO"
 
@@ -84,5 +87,6 @@ class Config:
             kernel_log_command=list(mon.get("kernel_log_command") or []),
             ipinfo_token=enr.get("ipinfo_token", "") or "",
             ipregistry_key=enr.get("ipregistry_key", "") or "",
+            retry_interval_seconds=int(raw.get("alerting", {}).get("retry_interval_seconds", 300)),
             log_level=log.get("level", "INFO"),
         )

@@ -1,3 +1,14 @@
+"""
+Skipa Watchdog — Telegram-бот, который постоянно мониторит подключения к
+серверу и присылает уведомления, если источник входит в базу IP-адресов
+сканеров CyberOK/Skipa, ГРЧЦ и НКЦКИ:
+https://github.com/tread-lightly/CyberOK_Skipa_ips
+
+Запуск:
+    pip install -r requirements.txt
+    cp config.example.yaml config.yaml   # и заполнить
+    python main.py
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +19,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from bot.config import Config
 from bot.enrich import enrich_ip
+from bot.fallback import append_audit_log, load_pending, pending_count, queue_pending_alert, save_pending
 from bot.formatter import build_alert_message
 from bot.ip_lists import fetch_threat_db, load_cache, needs_update, save_cache
 from bot.monitor import Deduper, poll_connections_loop, tail_kernel_log_loop
@@ -55,6 +67,12 @@ def make_hit_handler(app: Application, config: Config):
     async def on_hit(hit) -> None:
         data = await enrich_ip(hit.ip, config.ipinfo_token, config.ipregistry_key)
         text = build_alert_message(hit.ip, hit.matched_source, data)
+
+        # Пишем в audit-лог ВСЕГДА, независимо от успеха отправки в Telegram -
+        # так ни один обнаруженный скан не потеряется, даже если Telegram
+        # недоступен долгое время.
+        append_audit_log(hit.ip, hit.matched_source, text)
+
         try:
             await app.bot.send_message(
                 chat_id=config.chat_id,
@@ -63,9 +81,39 @@ def make_hit_handler(app: Application, config: Config):
                 disable_web_page_preview=True,
             )
         except Exception as e:  # noqa: BLE001
-            log.error("Не удалось отправить алерт в Telegram: %s", e)
+            log.error(
+                "Не удалось отправить алерт в Telegram (%s), кладу в очередь на повтор", e
+            )
+            queue_pending_alert(config.chat_id, text)
 
     return on_hit
+
+
+async def job_flush_pending_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Периодически пытается доотправить алерты, которые не ушли в Telegram
+    из-за временной недоступности связи (см. bot/fallback.py)."""
+    records = load_pending()
+    if not records:
+        return
+
+    log.info("В очереди %d отложенных алертов, пробую отправить...", len(records))
+    still_pending = []
+    for record in records:
+        try:
+            await context.bot.send_message(
+                chat_id=record["chat_id"],
+                text=record["text"],
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("Повтор снова не удался, оставляю в очереди: %s", e)
+            still_pending.append(record)
+
+    save_pending(still_pending)
+    sent = len(records) - len(still_pending)
+    if sent:
+        log.info("Успешно доотправлено %d ранее отложенных алертов", sent)
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +137,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Последнее обновление: {last_update}\n"
         f"Метод мониторинга: {config.method}\n"
         f"Интервал опроса соединений: {config.poll_interval_seconds} сек.\n"
-        f"Антиспам-кулдаун: {config.alert_cooldown_minutes} мин."
+        f"Антиспам-кулдаун: {config.alert_cooldown_minutes} мин.\n"
+        f"Отложенных алертов в очереди: {pending_count()}"
     )
 
 
@@ -112,16 +161,30 @@ async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     config: Config = context.bot_data["config"]
     if not _is_admin(config, update.effective_user.id):
         return
-    test_ip = context.args[0] if context.args else "89.169.28.214"
+    test_ip = context.args[0] if context.args else "203.0.113.42"
     data = await enrich_ip(test_ip, config.ipinfo_token, config.ipregistry_key)
     text = build_alert_message(test_ip, "тестовый вызов /testalert", data)
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.bot_data["config"]
+    if not _is_admin(config, update.effective_user.id):
+        return
+    count = pending_count()
+    if count == 0:
+        await update.message.reply_text("Очередь отложенных алертов пуста, всё доставлено.")
+    else:
+        await update.message.reply_text(
+            f"⏳ В очереди {count} алертов, которые не удалось отправить ранее. "
+            f"Бот пытается доотправить их каждые {config.retry_interval_seconds} сек."
+        )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Skipa Watchdog запущен и следит за подключениями известных сканеров "
-        "(CyberOK/Skipa, ГРЧЦ, НКЦКИ). Команды: /status, /update, /testalert [ip]"
+        "(CyberOK/Skipa, ГРЧЦ, НКЦКИ). Команды: /status, /update, /testalert [ip], /pending"
     )
 
 
@@ -174,6 +237,12 @@ async def post_init(app: Application) -> None:
     # см. update_interval_days в config.yaml)
     app.job_queue.run_repeating(job_check_updates_tick, interval=3600, first=60)
 
+    # периодически пытаемся доотправить алерты, застрявшие в очереди из-за
+    # временной недоступности Telegram (см. bot/fallback.py)
+    app.job_queue.run_repeating(
+        job_flush_pending_alerts, interval=config.retry_interval_seconds, first=30
+    )
+
 
 def main() -> None:
     config = Config.load(CONFIG_PATH)
@@ -190,6 +259,7 @@ def main() -> None:
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("update", cmd_update))
     application.add_handler(CommandHandler("testalert", cmd_testalert))
+    application.add_handler(CommandHandler("pending", cmd_pending))
 
     log.info("Skipa Watchdog запускается...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

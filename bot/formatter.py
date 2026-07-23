@@ -1,3 +1,20 @@
+"""Сборка текста алерта в Telegram (HTML parse_mode) в заданном стиле:
+
+🚨 УГРОЗА. СКАНЕР ОБНАРУЖЕН - IP
+
+IP: 203.0.113.42
+BGP | Censys | IPinfo | IPQS | More
+▢ MaxMind & IPinfo & Cloudflare:
+🇩🇪 DE Germany, Bavaria, Example City
+AS64500 / Example Hosting GmbH
+▢ Registration (RIPE):
+🇩🇪 DE Germany (IP)
+DE-EXAMPLE-20200101
+🇩🇪 DE Germany (AS)
+EXAMPLE-AS / example-hosting.example
+▢ Privacy info (ipregistry.co):
+Proxy ❌ | Abuser ❌ | Server ✅
+"""
 from __future__ import annotations
 
 from html import escape
@@ -24,7 +41,7 @@ def _bool_icon(value: bool | None) -> str:
 
 def build_alert_message(ip: str, matched_source: str, data: EnrichedIP) -> str:
     lines = []
-    lines.append("🚨 <b>УГРОЗА. СКАНЕР ОБНАРУЖЕН</b>")
+    lines.append("🚨 <b>УГРОЗА. СКАНЕР ОБНАРУЖЕН - IP</b>")
     lines.append("")
     lines.append(f"IP: <code>{escape(ip)}</code>")
     lines.append(_links_line(ip))

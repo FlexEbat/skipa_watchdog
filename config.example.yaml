@@ -46,5 +46,14 @@ enrichment:
   # Бесплатный тариф: https://ipregistry.co
   ipregistry_key: ""
 
+alerting:
+  # Если отправка в Telegram не удалась (нет сети, Telegram недоступен и т.п.),
+  # алерт не теряется: он складывается в data/pending_telegram.jsonl и бот
+  # пытается доотправить его каждые retry_interval_seconds секунд, пока не
+  # получится. Проверить очередь можно командой /pending или /status.
+  # Кроме того, КАЖДЫЙ обнаруженный скан всегда пишется в data/alerts.log
+  # (человекочитаемый журнал), независимо от результата отправки в Telegram.
+  retry_interval_seconds: 300
+
 logging:
   level: "INFO"

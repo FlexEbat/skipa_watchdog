@@ -12,21 +12,26 @@ Telegram-бот, который **постоянно** мониторит сет
 ## Пример уведомления
 
 ```
-🚨 УГРОЗА. СКАНЕР ОБНАРУЖЕН
+🚨 УГРОЗА. СКАНЕР ОБНАРУЖЕН - IP
 
-IP: 89.169.28.214
+IP: 203.0.113.42
 BGP | Censys | IPinfo | IPQS | More
 ▢ MaxMind & IPinfo & Cloudflare:
-🇷🇺 RU Russia, Moscow
-AS29182 / JSC IOT
+🇩🇪 DE Germany, Bavaria, Example City
+AS64500 / Example Hosting GmbH
 ▢ Registration (RIPE):
-🇷🇺 RU Russia (IP)
-RU-JSCIOT-20060224
-🇷🇺 RU Russia (AS)
-RU-JSCIOT / Joint Stock Company «IOT»
-▢ Privacy info (ipregistry․co):
-Proxy ✅ | Abuser ❌ | Server ✅
+🇩🇪 DE Germany (IP)
+DE-EXAMPLE-20200101
+🇩🇪 DE Germany (AS)
+EXAMPLE-AS / example-hosting.example
+▢ Privacy info (ipregistry.co):
+Proxy ❌ | Abuser ❌ | Server ✅
 ```
+
+*(в примере выше используются зарезервированные для документации значения —
+`203.0.113.0/24` (RFC 5737) и `AS64500` (RFC 5398) — это не реальный IP или
+организация, а стандартные "заглушки", которые нигде в интернете реально
+не встречаются)*
 
 ## Установка
 
@@ -62,14 +67,37 @@ python main.py
 
 ## Команды бота в Telegram
 
-- `/status` — сколько записей в базе, когда было последнее обновление
+- `/status` — сколько записей в базе, когда было последнее обновление, сколько алертов в очереди на повтор
 - `/update` — принудительно обновить базу IP прямо сейчас
 - `/testalert [ip]` — прислать тестовое уведомление в нужном формате (по умолчанию
-  на примере `89.169.28.214`), удобно для проверки форматирования
+  на примере `203.0.113.42`), удобно для проверки форматирования
+- `/pending` — показать, сколько алертов сейчас застряло в очереди на повтор
+  из-за недоступности Telegram (см. раздел "Если Telegram недоступен" ниже)
 - `/start` — краткая справка
 
 Если в `config.yaml` задан `telegram.admin_ids`, команды будут работать только
 для этих пользователей.
+
+## Если Telegram недоступен
+
+Бот не теряет алерты, если временно не может достучаться до Telegram
+(нет сети, сам Telegram лежит, истёк/отозван токен и т.п.):
+
+- **Полный audit-журнал** — каждый обнаруженный скан всегда пишется в
+  `data/alerts.log` (простой читаемый текст с датой/временем), независимо
+  от того, ушло ли уведомление в Telegram. Это заодно и полная история всех
+  срабатываний, если захочется что-то найти постфактум.
+- **Очередь на повтор** — если сама отправка в Telegram упала с ошибкой,
+  сообщение кладётся в `data/pending_telegram.jsonl` и бот автоматически
+  пробует отправить его снова каждые `alerting.retry_interval_seconds`
+  секунд (по умолчанию 300 = 5 минут), пока не получится. Ничего вручную
+  переотправлять не нужно.
+- Проверить, что сейчас висит в очереди, можно командой `/pending` в
+  Telegram (сработает сразу после восстановления связи) либо посмотреть
+  файл напрямую: `cat data/pending_telegram.jsonl`.
+- Если нужен третий канал (email, webhook, локальный syslog и т.п.) —
+  добавляется в `bot/fallback.py`: там уже есть `queue_pending_alert()` /
+  `append_audit_log()`, туда можно дописать ещё один вызов рядом.
 
 ## Важно про права доступа
 
@@ -141,7 +169,7 @@ sudo journalctl -k -f
 должна появиться строка вида:
 
 ```
-CONN: IN=eth0 OUT= MAC=... SRC=89.169.28.214 DST=1.2.3.4 LEN=60 ... PROTO=TCP SPT=54321 DPT=80 ... SYN
+CONN: IN=eth0 OUT= MAC=... SRC=203.0.113.77 DST=203.0.113.10 LEN=60 ... PROTO=TCP SPT=54321 DPT=80 ... SYN
 ```
 
 Если у вас классический **iptables** вместо nftables (и при этом нет Docker) —
@@ -151,7 +179,6 @@ CONN: IN=eth0 OUT= MAC=... SRC=89.169.28.214 DST=1.2.3.4 LEN=60 ... PROTO=TCP SP
 sudo iptables -I INPUT -p tcp --syn -m conntrack --ctstate NEW \
   -m limit --limit 20/second -j LOG --log-prefix "CONN: " --log-level 4
 ```
-
 это тоже пишется в kernel log buffer, парсер тот же самый.
 
 ### Вариант B: сервер с Docker (бэкенд iptables-nft)
@@ -212,7 +239,6 @@ sudo systemctl enable --now skipa-watchdog-fw-rules
 ```bash
 sudo journalctl -k -f
 ```
-
 и с другого хоста дёрните любой порт:
 
 ```bash
@@ -223,7 +249,7 @@ nc -zv <ваш_ip> 3000            # для докер-порта
 Должна появиться строка вида:
 
 ```
-CONN: IN=eth0 OUT= MAC=... SRC=89.169.28.214 DST=172.20.0.9 LEN=60 ... PROTO=TCP SPT=54321 DPT=80 ... SYN
+CONN: IN=eth0 OUT= MAC=... SRC=203.0.113.42 DST=172.20.0.9 LEN=60 ... PROTO=TCP SPT=54321 DPT=80 ... SYN
 ```
 
 `DST=` для докер-трафика будет **внутренний** IP контейнера (172.x.x.x) —
@@ -259,7 +285,7 @@ CONN: IN=eth0 OUT= MAC=... SRC=89.169.28.214 DST=172.20.0.9 LEN=60 ... PROTO=TCP
   либо root, либо членство в группе `systemd-journal` для чтения
   `journalctl -k`.
 
-## Запуск как systemd-сервис
+## Запуск как systemd-сервис (продакшен)
 
 См. файл `skipa-watchdog.service`. Скопируйте его в `/etc/systemd/system/`,
 поправьте пути, затем:
@@ -276,7 +302,7 @@ sudo journalctl -u skipa-watchdog -f
 skipa_watchdog/
 ├── main.py                          # точка входа, команды бота, оркестрация job'ов
 ├── config.example.yaml              # шаблон конфига
-├── config.yaml                      # ваш конфиг
+├── config.yaml                      # ваш конфиг (создать самостоятельно, в .gitignore)
 ├── requirements.txt
 ├── install-logging-rules.sh         # ставит iptables-правила логирования (INPUT + DOCKER-USER)
 ├── skipa-watchdog-fw-rules.service  # systemd-юнит: применяет правила после старта Docker
@@ -286,7 +312,10 @@ skipa_watchdog/
 │   ├── ip_lists.py          # скачивание/кэш/еженедельное обновление базы IP
 │   ├── enrich.py            # ipinfo.io + RIPEstat + ipregistry.co
 │   ├── formatter.py         # сборка текста алерта в нужном стиле
-│   └── monitor.py           # мониторинг: psutil и/или чтение kernel-лога
+│   ├── monitor.py           # мониторинг: psutil и/или чтение kernel-лога
+│   └── fallback.py          # audit-лог + очередь на повтор при недоступности Telegram
 └── data/
-    └── ip_cache.json        # локальный кэш базы (создаётся автоматически)
+    ├── ip_cache.json            # локальный кэш базы (создаётся автоматически)
+    ├── alerts.log                # audit-журнал всех обнаружений (создаётся автоматически)
+    └── pending_telegram.jsonl    # очередь неотправленных алертов (создаётся автоматически)
 ```

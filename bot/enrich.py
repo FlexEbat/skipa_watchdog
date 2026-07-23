@@ -1,3 +1,13 @@
+"""
+Обогащение IP-адреса информацией для алерта:
+- гео + ASN + организация -> ipinfo.io (MaxMind/IPinfo/Cloudflare данные под капотом)
+- регистрационные данные -> RIPEstat API (RIPE NCC, публичный, без ключа)
+- приватность (proxy/abuser/server) -> ipregistry.co (нужен бесплатный ключ)
+
+Все запросы асинхронные, с таймаутами и мягкой деградацией: если какой-то
+сервис недоступен или не настроен ключ - соответствующий блок просто не
+включается в сообщение, вместо падения бота.
+"""
 from __future__ import annotations
 
 import logging
@@ -104,7 +114,7 @@ async def enrich_ip(ip: str, ipinfo_token: str = "", ipregistry_key: str = "") -
             result.country_name = _COUNTRY_NAMES.get(result.country_code, result.country_code)
             result.region = ipinfo_data.get("region")
             result.city = ipinfo_data.get("city")
-            org = ipinfo_data.get("org", "")  # формат "AS57494 Adman LLC"
+            org = ipinfo_data.get("org", "")  # формат "AS64500 Example Hosting GmbH"
             if org:
                 parts = org.split(" ", 1)
                 result.asn = parts[0]
@@ -146,7 +156,7 @@ def _parse_ripe_as_overview(result: EnrichedIP, as_overview: dict) -> None:
         data = as_overview["data"]
     except (KeyError, TypeError):
         return
-    holder = data.get("holder", "")  # обычно вида "ADMAN-AS, RU" или "ADMAN-AS Adman.com"
+    holder = data.get("holder", "")  # обычно вида "EXAMPLE-AS, DE" или "EXAMPLE-AS example-hosting.example"
     if holder:
         result.ripe_as_name = holder
     # страна AS иногда можно вытащить из holder (последние 2 буквы после запятой)

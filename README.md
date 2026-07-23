@@ -285,7 +285,7 @@ CONN: IN=eth0 OUT= MAC=... SRC=203.0.113.42 DST=172.20.0.9 LEN=60 ... PROTO=TCP 
   либо root, либо членство в группе `systemd-journal` для чтения
   `journalctl -k`.
 
-## Запуск как systemd-сервис (продакшен)
+## Запуск как systemd-сервис
 
 См. файл `skipa-watchdog.service`. Скопируйте его в `/etc/systemd/system/`,
 поправьте пути, затем:
@@ -302,7 +302,7 @@ sudo journalctl -u skipa-watchdog -f
 skipa_watchdog/
 ├── main.py                          # точка входа, команды бота, оркестрация job'ов
 ├── config.example.yaml              # шаблон конфига
-├── config.yaml                      # ваш конфиг (создать самостоятельно, в .gitignore)
+├── config.yaml                      # ваш конфиг
 ├── requirements.txt
 ├── install-logging-rules.sh         # ставит iptables-правила логирования (INPUT + DOCKER-USER)
 ├── skipa-watchdog-fw-rules.service  # systemd-юнит: применяет правила после старта Docker

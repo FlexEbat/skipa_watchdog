@@ -47,10 +47,12 @@ def append_audit_log(ip: str, matched_source: str, html_text: str) -> None:
         log.error("Не удалось записать audit-лог %s: %s", AUDIT_LOG, e)
 
 
-def queue_pending_alert(chat_id: int, html_text: str) -> None:
-    """Кладёт неотправленный алерт в очередь на диске для повторной отправки."""
+def queue_pending_alert(chat_id: int, html_text: str, reply_markup_json: dict | None = None) -> None:
+    """Кладёт неотправленный алерт в очередь на диске для повторной отправки.
+    reply_markup_json - сериализованная (через .to_dict()) инлайн-клавиатура
+    с кнопкой "Забанить", если она была на исходном сообщении."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    record = {"ts": time.time(), "chat_id": chat_id, "text": html_text}
+    record = {"ts": time.time(), "chat_id": chat_id, "text": html_text, "reply_markup": reply_markup_json}
     try:
         with PENDING_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")

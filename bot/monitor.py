@@ -11,7 +11,7 @@
    iptables (правило с `log prefix "CONN: "`), парсит SRC=/DPT= из каждой
    записи. Ловит вообще любой входящий SYN, независимо от того, успело ли
    соединение дойти до ESTABLISHED. Требует настройки nftables/iptables -
-   см. README.md, раздел "Расширенный мониторинг через nftables".
+   см. README.md, раздел "Расширенный мониторинг через nftables/iptables".
 
 3. "both" - оба метода одновременно (два независимых asyncio-таска),
    антиспам-кулдаун общий на IP, так что дублей алертов не будет.
@@ -19,6 +19,10 @@
 Оба метода в итоге вызывают один и тот же on_hit(Hit) callback, поэтому
 вся остальная цепочка (обогащение -> форматирование -> отправка в Telegram)
 не зависит от источника события.
+
+Каждый цикл на каждой итерации отмечается через bot.healthcheck.heartbeat(),
+чтобы отдельная задача (см. main.py -> job_healthcheck) могла заметить, если
+монитор вдруг завис или упал без явной ошибки в логах.
 """
 from __future__ import annotations
 
@@ -31,6 +35,7 @@ from dataclasses import dataclass
 
 import psutil
 
+from .healthcheck import heartbeat
 from .ip_lists import ThreatDB
 
 log = logging.getLogger("skipa_watchdog.monitor")
@@ -45,7 +50,8 @@ _DPT_RE = re.compile(r"DPT=(\d+)")
 @dataclass
 class Hit:
     ip: str
-    matched_source: str
+    matched_source: str      # конкретный CIDR/диапазон, по которому совпало
+    source_name: str         # имя базы-источника (Skipa, Spamhaus DROP, ...)
     local_port: int | None
     method: str = "psutil"
 
@@ -92,9 +98,10 @@ async def poll_connections_loop(
     log.info("Мониторинг соединений (psutil) запущен, интервал опроса: %ss", poll_interval)
 
     while True:
+        heartbeat("psutil")
         try:
             db: ThreatDB = get_db()
-            if db is not None and (db.networks or db.ranges):
+            if db is not None and db.sources:
                 seen_this_round = set()
                 for conn in psutil.net_connections(kind="inet"):
                     if not conn.raddr:
@@ -106,16 +113,20 @@ async def poll_connections_loop(
                     matched = db.match(remote_ip)
                     if not matched:
                         continue
+                    source_name, matched_source = matched
                     seen_this_round.add(remote_ip)
 
                     if not dedup.should_alert(remote_ip):
                         continue
 
                     local_port = conn.laddr.port if conn.laddr else None
-                    hit = Hit(ip=remote_ip, matched_source=matched, local_port=local_port, method="psutil")
+                    hit = Hit(
+                        ip=remote_ip, matched_source=matched_source, source_name=source_name,
+                        local_port=local_port, method="psutil",
+                    )
                     log.warning(
-                        "[psutil] Подключение от известного сканера: %s (совпадение: %s, порт: %s)",
-                        remote_ip, matched, local_port,
+                        "[psutil] Подключение от известного сканера: %s (база: %s, совпадение: %s, порт: %s)",
+                        remote_ip, source_name, matched_source, local_port,
                     )
                     await on_hit(hit)
         except psutil.AccessDenied:
@@ -156,6 +167,7 @@ async def tail_kernel_log_loop(
     log.info("Мониторинг соединений (kernel_log) запущен: %s", " ".join(command))
 
     while True:
+        heartbeat("kernel_log")
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -165,7 +177,15 @@ async def tail_kernel_log_loop(
             )
 
             while True:
-                line_bytes = await proc.stdout.readline()
+                try:
+                    line_bytes = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
+                except asyncio.TimeoutError:
+                    # 30с без единой строки в логе ядра - нормально в тихие периоды,
+                    # просто обновляем heartbeat и продолжаем читать тот же подпроцесс
+                    heartbeat("kernel_log")
+                    continue
+
+                heartbeat("kernel_log")
                 if not line_bytes:
                     # процесс завершился (например journald перезапустился) - выходим
                     # из внутреннего цикла, чтобы пересоздать подпроцесс
@@ -185,12 +205,13 @@ async def tail_kernel_log_loop(
                     continue
 
                 db: ThreatDB = get_db()
-                if db is None or not (db.networks or db.ranges):
+                if db is None or not db.sources:
                     continue
 
                 matched = db.match(remote_ip)
                 if not matched:
                     continue
+                source_name, matched_source = matched
 
                 if not dedup.should_alert(remote_ip):
                     continue
@@ -198,10 +219,13 @@ async def tail_kernel_log_loop(
                 dpt_match = _DPT_RE.search(line)
                 local_port = int(dpt_match.group(1)) if dpt_match else None
 
-                hit = Hit(ip=remote_ip, matched_source=matched, local_port=local_port, method="kernel_log")
+                hit = Hit(
+                    ip=remote_ip, matched_source=matched_source, source_name=source_name,
+                    local_port=local_port, method="kernel_log",
+                )
                 log.warning(
-                    "[kernel_log] SYN от известного сканера: %s (совпадение: %s, порт: %s)",
-                    remote_ip, matched, local_port,
+                    "[kernel_log] SYN от известного сканера: %s (база: %s, совпадение: %s, порт: %s)",
+                    remote_ip, source_name, matched_source, local_port,
                 )
                 await on_hit(hit)
 

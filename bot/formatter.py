@@ -39,7 +39,7 @@ def _bool_icon(value: bool | None) -> str:
     return "✅" if value else "❌"
 
 
-def build_alert_message(ip: str, matched_source: str, data: EnrichedIP) -> str:
+def build_alert_message(ip: str, matched_source: str, source_name: str, data: EnrichedIP) -> str:
     lines = []
     lines.append("🚨 <b>УГРОЗА. СКАНЕР ОБНАРУЖЕН - IP</b>")
     lines.append("")
@@ -82,6 +82,6 @@ def build_alert_message(ip: str, matched_source: str, data: EnrichedIP) -> str:
         )
 
     lines.append("")
-    lines.append(f"<i>Совпадение по базе: {escape(matched_source)}</i>")
+    lines.append(f"<i>База: {escape(source_name)} | Совпадение: {escape(matched_source)}</i>")
 
     return "\n".join(lines)

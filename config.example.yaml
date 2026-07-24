@@ -11,19 +11,49 @@ telegram:
   admin_ids: []
 
 sources:
-  # Откуда брать списки IP (raw-ссылки на репозиторий tread-lightly/CyberOK_Skipa_ips)
+  # Откуда брать основной список IP (raw-ссылки на репозиторий tread-lightly/CyberOK_Skipa_ips)
   cidr_list_url: "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
   range_list_url: "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_range.txt"
   # Как часто обновлять базу IP (в днях). По заданию — раз в неделю.
   update_interval_days: 7
+
+  # Дополнительные источники (кроме встроенного Skipa) - Spamhaus DROP, FireHOL,
+  # AbuseIPDB blacklist или любой другой список IP/CIDR. Каждый показывается в
+  # алерте отдельно ("База: Spamhaus DROP"), матчится тем же движком.
+  #
+  # type: "cidr_list" - простой текстовый список (CIDR или IP на строку,
+  #                     опциональные комментарии после '#' или ';'). Подходит
+  #                     для Spamhaus DROP, FireHOL и подобных списков.
+  # type: "abuseipdb"  - JSON blacklist API AbuseIPDB (нужен свой api_key).
+  extra:
+    - name: "spamhaus_drop"
+      display_name: "Spamhaus DROP"
+      type: "cidr_list"
+      url: "https://www.spamhaus.org/drop/drop.txt"
+      enabled: false
+
+    - name: "firehol_level1"
+      display_name: "FireHOL Level 1"
+      type: "cidr_list"
+      url: "https://iplists.firehol.org/files/firehol_level1.netset"
+      enabled: false
+
+    - name: "abuseipdb"
+      display_name: "AbuseIPDB Blacklist"
+      type: "abuseipdb"
+      # Бесплатный ключ: https://www.abuseipdb.com/register
+      api_key: ""
+      # Минимальный confidence score для включения IP в базу (0-100)
+      min_confidence: 90
+      enabled: false
 
 monitoring:
   # Как обнаруживать подключения известных сканеров:
   # "psutil"     - опрос активных сокетов через psutil (просто, но может пропускать
   #                очень короткие TCP-сессии вроде одиночного SYN от zmap/zgrab)
   # "kernel_log" - хвостование journalctl -k -f по логам nftables/iptables,
-  #                ловит любой входящий SYN (нужно один раз настроить nftables,
-  #                см. README.md -> "Расширенный мониторинг через nftables")
+  #                ловит любой входящий SYN (нужно один раз настроить nftables/iptables,
+  #                см. README.md -> "Расширенный мониторинг через nftables/iptables")
   # "both"       - оба метода сразу, дедупликация алертов общая
   method: "psutil"
   # Префикс, который вы указали в правиле `log prefix "..."` (для method: kernel_log/both)
@@ -52,8 +82,61 @@ alerting:
   # пытается доотправить его каждые retry_interval_seconds секунд, пока не
   # получится. Проверить очередь можно командой /pending или /status.
   # Кроме того, КАЖДЫЙ обнаруженный скан всегда пишется в data/alerts.log
-  # (человекочитаемый журнал), независимо от результата отправки в Telegram.
+  # (человекочитаемый журнал) и data/events.jsonl (структурированный, для
+  # /stats, /export и дашборда), независимо от результата отправки в Telegram.
   retry_interval_seconds: 300
+
+banning:
+  # Включает возможность банить: кнопку "🚫 Забанить" под каждым алертом,
+  # команды /banlist, /unban и (если включено ниже) автобан.
+  # Требует предварительной настройки: sudo bash install-logging-rules.sh
+  # (создаёт ipset-набор и DROP-правило в iptables).
+  enabled: false
+  ipset_name: "skipa_watchdog_ban"
+  # Автоматически банить КАЖДЫЙ обнаруженный IP из любой базы, без нажатия
+  # кнопки. РИСК: ложные срабатывания (например, легитимный сканер безопасности
+  # вроде Shodan/Censys, который вы сами используете) забанятся тоже. Если не
+  # уверены - оставьте false и банте вручную кнопкой.
+  auto_ban_new_hits: false
+  # Длительность автобана в минутах, 0 = навсегда
+  auto_ban_duration_minutes: 60
+  # Длительность бана по кнопке "Забанить" в минутах, 0 = навсегда
+  manual_ban_duration_minutes: 1440
+  # Если указать имя существующего jail в fail2ban (например "sshd" или свой
+  # кастомный, см. fail2ban/ в этом репозитории) - бот будет ДОПОЛНИТЕЛЬНО
+  # регистрировать бан там же (`fail2ban-client set <jail> banip <ip>`), чтобы
+  # он был виден в общей картине `fail2ban-client status`. Необязательно.
+  fail2ban_jail: ""
+
+healthcheck:
+  # "Watchdog для watchdog'а": следит, что сами циклы мониторинга (psutil-опрос,
+  # чтение kernel-лога) не зависли молча. Если монитор не подавал признаков
+  # жизни дольше stale_after_minutes - в чат придёт предупреждение.
+  enabled: true
+  stale_after_minutes: 15
+  check_interval_minutes: 5
+
+dashboard:
+  # Простой веб-дашборд (FastAPI) со статусом базы, последними событиями,
+  # списком банов и состоянием мониторов. По умолчанию слушает только
+  # localhost - откройте через SSH-туннель (ssh -L 8080:localhost:8080 ...)
+  # либо смените host на 0.0.0.0 и обязательно задайте username/password ниже.
+  enabled: false
+  host: "127.0.0.1"
+  port: 8080
+  # Если оба поля не пустые - дашборд будет спрашивать HTTP Basic Auth
+  username: ""
+  password: ""
+
+digest:
+  # Автоматический еженедельный дайджест (статистика + график) в чат,
+  # не дожидаясь команды /stats.
+  enabled: true
+  # День недели: 0=понедельник, 1=вторник, ..., 6=воскресенье
+  weekday: 0
+  # Время отправки (по времени сервера, где крутится бот)
+  hour: 9
+  minute: 0
 
 logging:
   level: "INFO"

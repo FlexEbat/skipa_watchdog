@@ -1,0 +1,21 @@
+# Пример jail для fail2ban, использующего фильтр skipa-watchdog.conf.
+# Поправьте logpath на реальный путь до data/alerts.log вашей установки.
+#
+# Установка:
+#   sudo cp skipa-watchdog.conf /etc/fail2ban/filter.d/
+#   sudo cp jail-skipa-watchdog.local /etc/fail2ban/jail.d/
+#   sudo nano /etc/fail2ban/jail.d/jail-skipa-watchdog.local   # поправить logpath
+#   sudo systemctl restart fail2ban
+#   sudo fail2ban-client status skipa-watchdog
+
+[skipa-watchdog]
+enabled = true
+filter = skipa-watchdog
+logpath = /opt/skipa_watchdog/data/alerts.log
+# у нас уже своя логика повторов/антиспама в самом боте (alert_cooldown_minutes),
+# поэтому banим сразу с первого срабатывания в этом логе
+maxretry = 1
+findtime = 3600
+# 1 день бана, поставьте -1 для бана навсегда
+bantime = 86400
+action = %(action_)s

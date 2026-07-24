@@ -18,10 +18,11 @@ class Config:
     cidr_list_url: str
     range_list_url: str
     update_interval_days: int
+    extra_sources: list[dict] = field(default_factory=list)
 
-    poll_interval_seconds: int
-    alert_cooldown_minutes: int
-    ignore_networks: list[ipaddress._BaseNetwork] = field(default_factory=list)
+    poll_interval_seconds: int = 5
+    alert_cooldown_minutes: int = 60
+    ignore_networks: list = field(default_factory=list)
 
     method: str = "psutil"
     kernel_log_prefix: str = "CONN: "
@@ -31,6 +32,32 @@ class Config:
     ipregistry_key: str = ""
 
     retry_interval_seconds: int = 300
+
+    # --- бан ---
+    ban_enabled: bool = False
+    ban_ipset_name: str = "skipa_watchdog_ban"
+    auto_ban_new_hits: bool = False
+    auto_ban_duration_minutes: int = 60
+    manual_ban_duration_minutes: int = 1440
+    fail2ban_jail: str = ""
+
+    # --- health-check ---
+    healthcheck_enabled: bool = True
+    healthcheck_stale_after_minutes: int = 15
+    healthcheck_check_interval_minutes: int = 5
+
+    # --- дашборд ---
+    dashboard_enabled: bool = False
+    dashboard_host: str = "127.0.0.1"
+    dashboard_port: int = 8080
+    dashboard_username: str = ""
+    dashboard_password: str = ""
+
+    # --- дайджест ---
+    digest_enabled: bool = True
+    digest_weekday: int = 0   # 0=понедельник ... 6=воскресенье
+    digest_hour: int = 9
+    digest_minute: int = 0
 
     log_level: str = "INFO"
 
@@ -49,6 +76,11 @@ class Config:
         src = raw.get("sources", {})
         mon = raw.get("monitoring", {})
         enr = raw.get("enrichment", {})
+        alerting = raw.get("alerting", {})
+        banning = raw.get("banning", {})
+        healthcheck = raw.get("healthcheck", {})
+        dashboard = raw.get("dashboard", {})
+        digest = raw.get("digest", {})
         log = raw.get("logging", {})
 
         ignore_nets = []
@@ -79,6 +111,7 @@ class Config:
                 "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_range.txt",
             ),
             update_interval_days=int(src.get("update_interval_days", 7)),
+            extra_sources=list(src.get("extra") or []),
             poll_interval_seconds=int(mon.get("poll_interval_seconds", 5)),
             alert_cooldown_minutes=int(mon.get("alert_cooldown_minutes", 60)),
             ignore_networks=ignore_nets,
@@ -87,6 +120,24 @@ class Config:
             kernel_log_command=list(mon.get("kernel_log_command") or []),
             ipinfo_token=enr.get("ipinfo_token", "") or "",
             ipregistry_key=enr.get("ipregistry_key", "") or "",
-            retry_interval_seconds=int(raw.get("alerting", {}).get("retry_interval_seconds", 300)),
+            retry_interval_seconds=int(alerting.get("retry_interval_seconds", 300)),
+            ban_enabled=bool(banning.get("enabled", False)),
+            ban_ipset_name=banning.get("ipset_name", "skipa_watchdog_ban"),
+            auto_ban_new_hits=bool(banning.get("auto_ban_new_hits", False)),
+            auto_ban_duration_minutes=int(banning.get("auto_ban_duration_minutes", 60)),
+            manual_ban_duration_minutes=int(banning.get("manual_ban_duration_minutes", 1440)),
+            fail2ban_jail=banning.get("fail2ban_jail", "") or "",
+            healthcheck_enabled=bool(healthcheck.get("enabled", True)),
+            healthcheck_stale_after_minutes=int(healthcheck.get("stale_after_minutes", 15)),
+            healthcheck_check_interval_minutes=int(healthcheck.get("check_interval_minutes", 5)),
+            dashboard_enabled=bool(dashboard.get("enabled", False)),
+            dashboard_host=dashboard.get("host", "127.0.0.1"),
+            dashboard_port=int(dashboard.get("port", 8080)),
+            dashboard_username=dashboard.get("username", "") or "",
+            dashboard_password=dashboard.get("password", "") or "",
+            digest_enabled=bool(digest.get("enabled", True)),
+            digest_weekday=int(digest.get("weekday", 0)),
+            digest_hour=int(digest.get("hour", 9)),
+            digest_minute=int(digest.get("minute", 0)),
             log_level=log.get("level", "INFO"),
         )

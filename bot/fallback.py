@@ -36,15 +36,21 @@ def _strip_html(text: str) -> str:
     return _TAG_RE.sub("", text)
 
 
-def append_audit_log(ip: str, matched_source: str, html_text: str) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+def append_audit_log(
+    ip: str, matched_source: str, html_text: str, log_path: Path | str | None = None
+) -> None:
+    """Пишет запись в audit-журнал. По умолчанию - data/alerts.log (режим
+    bot), но можно передать свой путь (используется watchdog_service.py,
+    чтобы писать в /var/log/skipa_watchdog/detections.log)."""
+    target = Path(log_path) if log_path else AUDIT_LOG
+    target.parent.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     plain = _strip_html(html_text)
     try:
-        with AUDIT_LOG.open("a", encoding="utf-8") as f:
+        with target.open("a", encoding="utf-8") as f:
             f.write(f"===== {ts} | IP={ip} | match={matched_source} =====\n{plain}\n\n")
     except Exception as e:  # noqa: BLE001
-        log.error("Не удалось записать audit-лог %s: %s", AUDIT_LOG, e)
+        log.error("Не удалось записать audit-лог %s: %s", target, e)
 
 
 def queue_pending_alert(chat_id: int, html_text: str) -> None:

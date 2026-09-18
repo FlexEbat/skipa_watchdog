@@ -14,6 +14,11 @@ sources:
   # Откуда брать списки IP (raw-ссылки на репозиторий tread-lightly/CyberOK_Skipa_ips)
   cidr_list_url: "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
   range_list_url: "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_range.txt"
+  # Дополнительный список (смешанный формат: CIDR / диапазоны / одиночные IP,
+  # автоопределяется построчно). Оставьте пустой строкой, чтобы отключить.
+  blacklist_url: "https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/37cde2b27a560c647d0e8eb9d274e3409082d3e7/blacklist.txt"
+  # Как этот источник будет подписан в алертах и /status (например "blacklist: 1.2.3.0/24")
+  blacklist_name: "blacklist"
   # Как часто обновлять базу IP (в днях). По заданию — раз в неделю.
   update_interval_days: 7
 
@@ -54,6 +59,15 @@ alerting:
   # Кроме того, КАЖДЫЙ обнаруженный скан всегда пишется в data/alerts.log
   # (человекочитаемый журнал), независимо от результата отправки в Telegram.
   retry_interval_seconds: 300
+
+environment:
+  # При старте бот один раз проверяет наличие Docker/Kubernetes и пишет
+  # заметку в лог (плюс доступно по команде /env в любой момент). Само
+  # логирование сканов на DOCKER-USER/KUBE-* цепочки ставится через
+  # install.sh / install-logging-rules.sh, эти флаги влияют только на
+  # то, показывать ли эту информацию.
+  docker_scan: true
+  k8s_scan: true
 
 logging:
   level: "INFO"

@@ -13,16 +13,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from bot.config import Config
 from bot.enrich import enrich_ip
+from bot.env_detect import format_summary_text, summarize_environment
 from bot.fallback import append_audit_log, load_pending, pending_count, queue_pending_alert, save_pending
 from bot.formatter import build_alert_message
 from bot.ip_lists import fetch_threat_db, load_cache, needs_update, save_cache
 from bot.monitor import Deduper, poll_connections_loop, tail_kernel_log_loop
+
+VERSION_FILE = "VERSION"
 
 CONFIG_PATH = "config.yaml"
 
@@ -45,7 +49,9 @@ async def job_update_threat_db(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     log.info("Запускаю плановое обновление базы IP (раз в %s дн.)...", config.update_interval_days)
-    new_db = await fetch_threat_db(config.cidr_list_url, config.range_list_url)
+    new_db = await fetch_threat_db(
+        config.cidr_list_url, config.range_list_url, config.blacklist_url, config.blacklist_name
+    )
     if new_db.networks or new_db.ranges:
         context.bot_data["db"] = new_db
         save_cache(new_db)
@@ -131,9 +137,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     import datetime
 
     last_update = datetime.datetime.fromtimestamp(db.last_update_ts).strftime("%Y-%m-%d %H:%M:%S")
+    per_source = ", ".join(f"{k}={v}" for k, v in db.per_source_counts.items()) or "-"
     await update.message.reply_text(
         "📊 Статус Skipa Watchdog\n"
-        f"Записей в базе: {db.source_line_count}\n"
+        f"Версия: {_read_version()}\n"
+        f"Записей в базе: {db.source_line_count} ({per_source})\n"
         f"Последнее обновление: {last_update}\n"
         f"Метод мониторинга: {config.method}\n"
         f"Интервал опроса соединений: {config.poll_interval_seconds} сек.\n"
@@ -147,7 +155,9 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not _is_admin(config, update.effective_user.id):
         return
     await update.message.reply_text("Обновляю базу IP-адресов...")
-    new_db = await fetch_threat_db(config.cidr_list_url, config.range_list_url)
+    new_db = await fetch_threat_db(
+        config.cidr_list_url, config.range_list_url, config.blacklist_url, config.blacklist_name
+    )
     if new_db.networks or new_db.ranges:
         context.bot_data["db"] = new_db
         save_cache(new_db)
@@ -184,8 +194,96 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Skipa Watchdog запущен и следит за подключениями известных сканеров "
-        "(CyberOK/Skipa, ГРЧЦ, НКЦКИ). Команды: /status, /update, /testalert [ip], /pending"
+        "(CyberOK/Skipa, ГРЧЦ, НКЦКИ + доп. списки). Команды: /menu, /status, /update, "
+        "/testalert [ip], /pending, /env"
     )
+
+
+def _read_version() -> str:
+    try:
+        return Path(VERSION_FILE).read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+async def cmd_env(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает, обнаружены ли Docker/Kubernetes и стоит ли на их цепочках
+    логирование сканов (см. bot/env_detect.py, install-logging-rules.sh)."""
+    config: Config = context.bot_data["config"]
+    if not _is_admin(config, update.effective_user.id):
+        return
+    await update.message.reply_text("Анализирую окружение (docker/k8s)...")
+    summary = summarize_environment(config.kernel_log_prefix)
+    await update.message.reply_text(format_summary_text(summary))
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Статус", callback_data="status"),
+            InlineKeyboardButton("🔄 Обновить базу", callback_data="update"),
+        ],
+        [
+            InlineKeyboardButton("⏳ Очередь", callback_data="pending"),
+            InlineKeyboardButton("🐳 Docker/K8s", callback_data="env"),
+        ],
+        [InlineKeyboardButton("❓ Помощь", callback_data="help")],
+    ]
+    await update.message.reply_text(
+        "Меню Skipa Watchdog:", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def cmd_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатия кнопок из /menu, переиспользуя логику существующих команд."""
+    query = update.callback_query
+    config: Config = context.bot_data["config"]
+    if not _is_admin(config, query.from_user.id):
+        await query.answer()
+        return
+    await query.answer()
+
+    if query.data == "status":
+        db = context.bot_data.get("db")
+        if db is None:
+            await query.message.reply_text("База ещё не загружена.")
+            return
+        import datetime
+
+        last_update = datetime.datetime.fromtimestamp(db.last_update_ts).strftime("%Y-%m-%d %H:%M:%S")
+        per_source = ", ".join(f"{k}={v}" for k, v in db.per_source_counts.items()) or "-"
+        await query.message.reply_text(
+            "📊 Статус Skipa Watchdog\n"
+            f"Версия: {_read_version()}\n"
+            f"Записей в базе: {db.source_line_count} ({per_source})\n"
+            f"Последнее обновление: {last_update}\n"
+            f"Отложенных алертов в очереди: {pending_count()}"
+        )
+    elif query.data == "update":
+        await query.message.reply_text("Обновляю базу IP-адресов...")
+        new_db = await fetch_threat_db(
+            config.cidr_list_url, config.range_list_url, config.blacklist_url, config.blacklist_name
+        )
+        if new_db.networks or new_db.ranges:
+            context.bot_data["db"] = new_db
+            save_cache(new_db)
+            await query.message.reply_text(f"Готово: {new_db.source_line_count} записей.")
+        else:
+            await query.message.reply_text("Не удалось получить свежую базу, оставил старую версию.")
+    elif query.data == "pending":
+        count = pending_count()
+        if count == 0:
+            await query.message.reply_text("Очередь отложенных алертов пуста, всё доставлено.")
+        else:
+            await query.message.reply_text(f"⏳ В очереди {count} алертов.")
+    elif query.data == "env":
+        await query.message.reply_text("Анализирую окружение (docker/k8s)...")
+        summary = summarize_environment(config.kernel_log_prefix)
+        await query.message.reply_text(format_summary_text(summary))
+    elif query.data == "help":
+        await query.message.reply_text(
+            "/status, /update, /testalert [ip], /pending, /env - подробности в README."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -198,9 +296,17 @@ async def post_init(app: Application) -> None:
     db = load_cache()
     if needs_update(db, config.update_interval_days):
         log.info("Локального кэша нет или он устарел, качаю базу впервые...")
-        db = await fetch_threat_db(config.cidr_list_url, config.range_list_url)
+        db = await fetch_threat_db(
+            config.cidr_list_url, config.range_list_url, config.blacklist_url, config.blacklist_name
+        )
         save_cache(db)
     app.bot_data["db"] = db
+
+    if config.docker_scan_enabled or config.k8s_scan_enabled:
+        summary = summarize_environment(config.kernel_log_prefix)
+        if summary.any_container_platform():
+            for line in format_summary_text(summary).splitlines():
+                log.info("[environment] %s", line)
 
     on_hit = make_hit_handler(app, config)
     dedup = Deduper(config.alert_cooldown_minutes)
@@ -256,10 +362,13 @@ def main() -> None:
     application.bot_data["config"] = config
 
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("menu", cmd_menu))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("update", cmd_update))
     application.add_handler(CommandHandler("testalert", cmd_testalert))
     application.add_handler(CommandHandler("pending", cmd_pending))
+    application.add_handler(CommandHandler("env", cmd_env))
+    application.add_handler(CallbackQueryHandler(cmd_menu_callback))
 
     log.info("Skipa Watchdog запускается...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -1,7 +1,10 @@
 [Unit]
-Description=Install skipa-watchdog CONN logging rules (INPUT + DOCKER-USER)
+Description=Install skipa-watchdog CONN logging rules (INPUT + DOCKER-USER + KUBE-*)
 After=docker.service
 Requires=docker.service
+# Если на узле есть ещё и kubelet, тоже дождёмся его (юнит должен существовать -
+# на серверах без k8s этот After просто ни на что не влияет)
+After=kubelet.service
 
 [Service]
 Type=oneshot

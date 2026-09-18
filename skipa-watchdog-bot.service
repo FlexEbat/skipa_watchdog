@@ -1,13 +1,13 @@
 [Unit]
-Description=Skipa Watchdog - Telegram bot for CyberOK/Skipa scanner alerts
+Description=Skipa Watchdog (bot mode) - Telegram bot for CyberOK/Skipa scanner alerts
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Поправьте путь на реальное расположение проекта
+# Ставится/обновляется install.sh; поправьте путь, если разместили проект вручную
 WorkingDirectory=/opt/skipa_watchdog
-ExecStart=/opt/skipa_watchdog/venv/bin/python /opt/skipa_watchdog/main.py
+ExecStart=/opt/skipa_watchdog/venv-bot/bin/python /opt/skipa_watchdog/main.py
 Restart=always
 RestartSec=10
 

@@ -131,6 +131,8 @@ sudo bash install.sh check-lists    # проверить обновления с
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+# только если нужен Telegram (без него можно не ставить - меньше зависимостей):
+pip install -r requirements-telegram.txt
 
 cp config.example.yaml config.yaml
 nano config.yaml   # Telegram по желанию; остальное уже рабочее по умолчанию
@@ -315,7 +317,8 @@ skipa_watchdog/
 ├── install.sh                       # установщик/менеджер: первый запуск = установка, дальше - меню
 ├── config.example.yaml              # шаблон конфига
 ├── config.yaml                      # ваш конфиг
-├── requirements.txt                 # все зависимости (включая python-telegram-bot)
+├── requirements.txt                 # базовые зависимости (мониторинг/блокировка/лог, без Telegram)
+├── requirements-telegram.txt        # доп. пакет python-telegram-bot - только если нужен Telegram
 ├── VERSION                          # версия проекта (читается меню install.sh)
 ├── install-firewall-rules.sh        # ставит SKIPA-BLOCK + переходы + CONN-логирование (INPUT/DOCKER-USER/KUBE-*)
 ├── skipa-watchdog-fw-rules.service  # systemd-юнит: применяет правила после старта Docker/kubelet

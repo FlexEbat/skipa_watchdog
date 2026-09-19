@@ -1,0 +1,5 @@
+# Ставится ДОПОЛНИТЕЛЬНО к requirements.txt, только если нужен Telegram-слой
+# (уведомления + команды в чате). Без него watchdog.py прекрасно работает
+# в одиночку - см. bot/telegram_layer.py, который импортируется лениво,
+# только когда telegram.bot_token заполнен в config.yaml.
+python-telegram-bot[job-queue]>=21.4

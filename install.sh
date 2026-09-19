@@ -231,30 +231,51 @@ _try_install_venv_pkg() {
 }
 
 ensure_venv() {
-    if [ -x "$INSTALL_DIR/venv/bin/python" ]; then
+    if [ -x "$INSTALL_DIR/venv/bin/python" ] && [ -x "$INSTALL_DIR/venv/bin/pip" ]; then
         return 0
+    fi
+    if [ -d "$INSTALL_DIR/venv" ]; then
+        warn "Обнаружен неполный/битый venv (например, от прошлой неудачной попытки) - пересоздаю."
+        rm -rf "$INSTALL_DIR/venv"
     fi
     local err_log
     err_log="$(mktemp)"
-    if python3 -m venv "$INSTALL_DIR/venv" 2>"$err_log"; then
+    if python3 -m venv "$INSTALL_DIR/venv" 2>"$err_log" && [ -x "$INSTALL_DIR/venv/bin/pip" ]; then
         rm -f "$err_log"
         return 0
     fi
-    if grep -qiE "ensurepip|No module named venv|python3-venv|python3-full" "$err_log"; then
-        warn "На сервере не установлен python3-venv - пробую поставить автоматически..."
+    if grep -qiE "ensurepip|No module named venv|python3-venv|python3-full" "$err_log" \
+        || [ ! -x "$INSTALL_DIR/venv/bin/pip" ]; then
+        warn "На сервере не установлен python3-venv (или ensurepip недоступен) - пробую поставить автоматически..."
         rm -rf "$INSTALL_DIR/venv"
         _try_install_venv_pkg
-        if python3 -m venv "$INSTALL_DIR/venv" 2>"$err_log"; then
+        if python3 -m venv "$INSTALL_DIR/venv" 2>"$err_log" && [ -x "$INSTALL_DIR/venv/bin/pip" ]; then
             ok "python3-venv поставлен, venv создан."
             rm -f "$err_log"
             return 0
         fi
     fi
-    err "Не удалось создать venv. Поставьте пакет python3-venv вручную (например:" \
-        "sudo apt install python3-venv) и запустите установку снова."
+    err "Не удалось создать рабочий venv (с pip). Поставьте пакет python3-venv вручную" \
+        "(например: sudo apt install python3-venv) и запустите установку снова."
     cat "$err_log" >&2
+    rm -rf "$INSTALL_DIR/venv"
     rm -f "$err_log"
     return 1
+}
+
+install_telegram_deps() {
+    if [ ! -x "$INSTALL_DIR/venv/bin/pip" ]; then
+        err "venv не найден - сначала выполните установку."
+        return 1
+    fi
+    if "$INSTALL_DIR/venv/bin/python" -c "import telegram" >/dev/null 2>&1; then
+        return 0
+    fi
+    [ -f "$INSTALL_DIR/requirements-telegram.txt" ] || { err "requirements-telegram.txt не найден."; return 1; }
+    info "Ставлю python-telegram-bot..."
+    "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements-telegram.txt" \
+        || { err "Не удалось поставить python-telegram-bot."; return 1; }
+    ok "python-telegram-bot установлен."
 }
 
 do_install() {
@@ -266,26 +287,37 @@ do_install() {
     [ -f "$INSTALL_DIR/requirements.txt" ] || { err "requirements.txt не найден в $INSTALL_DIR - установка прервана."; return 1; }
     mkdir -p "$LOG_DIR"
 
-    info "Создаю venv и ставлю зависимости..."
+    info "Создаю venv и ставлю базовые зависимости (мониторинг, блокировка, локальный лог)..."
     ensure_venv || return 1
     "$INSTALL_DIR/venv/bin/pip" install -q --upgrade pip
     "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt" \
         || { err "Не удалось поставить зависимости из requirements.txt."; return 1; }
 
+    local want_telegram=""
     if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
         cp "$INSTALL_DIR/config.example.yaml" "$INSTALL_DIR/config.yaml" \
             || { err "Не удалось создать config.yaml (нет config.example.yaml?)."; return 1; }
         info "Создан $INSTALL_DIR/config.yaml из шаблона."
         echo
-        echo "Подключить Telegram сейчас (уведомления + команды в чате)? [y/N]"
-        echo "(можно пропустить и настроить позже из меню - Skipa Watchdog и без"
-        echo " этого мониторит/блокирует, просто без уведомлений в Telegram)"
-        read -rp "> " a
-        if [[ "$a" =~ ^[Yy] ]]; then
+        echo "Подключить Telegram (уведомления + команды в чате)? Это отдельный пакет"
+        echo "python-telegram-bot - если не нужен, просто нажмите Enter/N: Skipa Watchdog"
+        echo "и без него мониторит/блокирует через локальные логи в $LOG_DIR. [y/N]"
+        read -rp "> " want_telegram
+    else
+        info "config.yaml уже существует, не трогаю."
+        if ! grep -q '^\s*bot_token: ""' "$INSTALL_DIR/config.yaml" 2>/dev/null; then
+            want_telegram="y"  # telegram уже настроен раньше - пакет должен быть на месте
+        fi
+    fi
+
+    if [[ "$want_telegram" =~ ^[Yy] ]]; then
+        install_telegram_deps || return 1
+        if grep -q '^\s*bot_token: ""' "$INSTALL_DIR/config.yaml" 2>/dev/null; then
             configure_telegram
         fi
     else
-        info "config.yaml уже существует, не трогаю."
+        info "Ставлю без Telegram (без python-telegram-bot) - легче. Подключить можно" \
+             "в любой момент из меню (пункт 4), тогда пакет доустановится сам."
     fi
 
     [ -f "$INSTALL_DIR/skipa-watchdog.service" ] || { err "skipa-watchdog.service не найден в репозитории."; return 1; }
@@ -494,6 +526,7 @@ configure_telegram() {
     if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
         warn "Сначала установите Skipa Watchdog."; pause; return
     fi
+    install_telegram_deps || return 1
     echo
     read -rp "Telegram bot_token (от @BotFather): " token
     read -rp "chat_id (куда слать уведомления): " chat_id

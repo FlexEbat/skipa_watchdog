@@ -1,4 +1,6 @@
-python-telegram-bot[job-queue]>=21.4
+# Базовые зависимости - нужны всегда (мониторинг, блокировка, локальный лог).
+# НЕ включают python-telegram-bot: он ставится отдельно (requirements-telegram.txt),
+# только если вы подключаете Telegram - см. install.sh.
 aiohttp>=3.9
 psutil>=5.9
 PyYAML>=6.0

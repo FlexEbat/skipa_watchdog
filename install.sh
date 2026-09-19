@@ -218,6 +218,45 @@ EOF
     chmod +x "$CLI_LINK"
 }
 
+_try_install_venv_pkg() {
+    command -v apt-get >/dev/null 2>&1 || return 1
+    info "Пробую автоматически поставить python3-venv через apt..."
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y python3-venv >/tmp/skipa_apt_venv.log 2>&1
+    local pyver
+    pyver="$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null)"
+    if [ -n "$pyver" ]; then
+        apt-get install -y "python${pyver}-venv" >>/tmp/skipa_apt_venv.log 2>&1
+    fi
+}
+
+ensure_venv() {
+    if [ -x "$INSTALL_DIR/venv/bin/python" ]; then
+        return 0
+    fi
+    local err_log
+    err_log="$(mktemp)"
+    if python3 -m venv "$INSTALL_DIR/venv" 2>"$err_log"; then
+        rm -f "$err_log"
+        return 0
+    fi
+    if grep -qiE "ensurepip|No module named venv|python3-venv|python3-full" "$err_log"; then
+        warn "На сервере не установлен python3-venv - пробую поставить автоматически..."
+        rm -rf "$INSTALL_DIR/venv"
+        _try_install_venv_pkg
+        if python3 -m venv "$INSTALL_DIR/venv" 2>"$err_log"; then
+            ok "python3-venv поставлен, venv создан."
+            rm -f "$err_log"
+            return 0
+        fi
+    fi
+    err "Не удалось создать venv. Поставьте пакет python3-venv вручную (например:" \
+        "sudo apt install python3-venv) и запустите установку снова."
+    cat "$err_log" >&2
+    rm -f "$err_log"
+    return 1
+}
+
 do_install() {
     require_root
     command -v git >/dev/null 2>&1 || { err "Нужен git"; return 1; }
@@ -228,7 +267,7 @@ do_install() {
     mkdir -p "$LOG_DIR"
 
     info "Создаю venv и ставлю зависимости..."
-    python3 -m venv "$INSTALL_DIR/venv" || { err "Не удалось создать venv."; return 1; }
+    ensure_venv || return 1
     "$INSTALL_DIR/venv/bin/pip" install -q --upgrade pip
     "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt" \
         || { err "Не удалось поставить зависимости из requirements.txt."; return 1; }
@@ -639,9 +678,14 @@ first_run_flow() {
     read -rp "Установить Skipa Watchdog сейчас? [Y/n] " a
     a="${a:-y}"
     if [[ "$a" =~ ^[Yy] ]]; then
-        do_install
-        env_check_and_offer
-        check_list_updates
+        if do_install; then
+            # Docker/Kubernetes проверяются и донастраиваются только один раз,
+            # при первичной установке. Дальше это можно повторить вручную из
+            # меню (пункт "Docker/Kubernetes"), само по себе больше не
+            # спрашивается при каждом запуске.
+            env_check_and_offer
+            check_list_updates
+        fi
     else
         info "Ок, ничего не меняю. Запустите install.sh снова, когда будете готовы."
     fi
@@ -681,7 +725,10 @@ main() {
         exit 0
     fi
 
-    env_check_and_offer
+    # Docker/Kubernetes проверяются один раз, при первичной установке (см.
+    # first_run_flow) - здесь, при обычном запуске уже установленного
+    # Skipa Watchdog, это не повторяется. Донастроить вручную можно из
+    # меню (пункт "Docker/Kubernetes") или командой `install.sh fw-rules`.
     check_list_updates
     main_menu
 }

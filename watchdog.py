@@ -3,7 +3,7 @@ Skipa Watchdog — единая точка входа.
 
 Это НЕ "бот" в смысле отдельного режима - это один процесс, который:
 
-1. Постоянно мониторит сетевые соединения к серверу (psutil и/или чтение
+1. Постоянно мониторит сетевые соединения к серверу (/proc/net/tcp и/или чтение
    kernel-лога) и сверяет источник с базой IP-адресов сканеров
    (CyberOK/Skipa, ГРЧЦ, НКЦКИ + доп. списки, см. bot/ip_lists.py).
 2. При обнаружении, в зависимости от action.mode в config.yaml:
@@ -242,11 +242,15 @@ async def async_main() -> None:
     dedup = Deduper(config.alert_cooldown_minutes)
 
     method = config.method
-    if method not in ("psutil", "kernel_log", "both"):
-        log.warning("Неизвестный monitoring.method=%r, использую 'psutil'", method)
-        method = "psutil"
+    if method == "psutil":
+        # старое имя метода (до отказа от psutil в пользу /proc/net/tcp) - молча
+        # принимаем как алиас "poll", чтобы не ломать уже развёрнутые конфиги
+        method = "poll"
+    if method not in ("poll", "kernel_log", "both"):
+        log.warning("Неизвестный monitoring.method=%r, использую 'poll'", method)
+        method = "poll"
 
-    if method in ("psutil", "both"):
+    if method in ("poll", "both"):
         tasks.append(
             poll_connections_loop(
                 get_db=lambda: state.get("db"),

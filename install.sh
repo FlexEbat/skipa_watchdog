@@ -292,6 +292,10 @@ do_install() {
     "$INSTALL_DIR/venv/bin/pip" install -q --upgrade pip
     "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt" \
         || { err "Не удалось поставить зависимости из requirements.txt."; return 1; }
+    # На старых установках могли остаться aiohttp/psutil (использовались до
+    # перехода на stdlib-only реализацию) - тихо подчищаем, если код их уже
+    # не использует, ради минимального веса установки.
+    "$INSTALL_DIR/venv/bin/pip" uninstall -y aiohttp psutil >/dev/null 2>&1 || true
 
     local want_telegram=""
     if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
@@ -299,10 +303,14 @@ do_install() {
             || { err "Не удалось создать config.yaml (нет config.example.yaml?)."; return 1; }
         info "Создан $INSTALL_DIR/config.yaml из шаблона."
         echo
-        echo "Подключить Telegram (уведомления + команды в чате)? Это отдельный пакет"
-        echo "python-telegram-bot - если не нужен, просто нажмите Enter/N: Skipa Watchdog"
-        echo "и без него мониторит/блокирует через локальные логи в $LOG_DIR. [y/N]"
-        read -rp "> " want_telegram
+        echo "Как установить?"
+        echo "  1) Только сервис - мониторинг + блокировка через iptables, всё пишется"
+        echo "     локально в $LOG_DIR. Ничего лишнего не ставится."
+        echo "  2) Сервис + Telegram-бот - то же самое, и дополнительно уведомления и"
+        echo "     команды/меню в чате (ставится доп. пакет python-telegram-bot)."
+        read -rp "> [1] " install_choice
+        install_choice="${install_choice:-1}"
+        [ "$install_choice" = "2" ] && want_telegram="y"
     else
         info "config.yaml уже существует, не трогаю."
         if ! grep -q '^\s*bot_token: ""' "$INSTALL_DIR/config.yaml" 2>/dev/null; then
@@ -316,7 +324,7 @@ do_install() {
             configure_telegram
         fi
     else
-        info "Ставлю без Telegram (без python-telegram-bot) - легче. Подключить можно" \
+        info "Ставлю только сервис (без python-telegram-bot). Подключить Telegram можно" \
              "в любой момент из меню (пункт 4), тогда пакет доустановится сам."
     fi
 

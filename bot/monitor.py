@@ -2,10 +2,12 @@
 Постоянный мониторинг подключений к серверу. Два метода на выбор
 (настраивается через monitoring.method в config.yaml):
 
-1. "psutil" - опрос активных сетевых соединений через psutil.net_connections().
-   Работает "из коробки" без дополнительной настройки, но может пропускать
-   очень короткие TCP-сессии (одиночный SYN от zmap/zgrab, который сразу
-   рвётся RST) - именно так часто ведёт себя Skipa.
+1. "poll" - периодический опрос активных TCP-соединений напрямую из
+   /proc/net/tcp и /proc/net/tcp6 (без сторонних библиотек вроде psutil -
+   это просто текстовые файлы, которые ядро Linux и так ведёт). Работает
+   "из коробки" без дополнительной настройки, но может пропускать очень
+   короткие TCP-сессии (одиночный SYN от zmap/zgrab, который сразу рвётся
+   RST) - именно так часто ведёт себя Skipa.
 
 2. "kernel_log" - хвостует `journalctl -k -f` и ищет строки лога nftables/
    iptables (правило с `log prefix "CONN: "`), парсит SRC=/DPT= из каждой
@@ -17,8 +19,8 @@
    антиспам-кулдаун общий на IP, так что дублей алертов не будет.
 
 Оба метода в итоге вызывают один и тот же on_hit(Hit) callback, поэтому
-вся остальная цепочка (обогащение -> форматирование -> отправка в Telegram)
-не зависит от источника события.
+вся остальная цепочка (обогащение -> блокировка -> уведомление) не
+зависит от источника события.
 """
 from __future__ import annotations
 
@@ -28,8 +30,6 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-
-import psutil
 
 from .ip_lists import ThreatDB
 
@@ -41,13 +41,17 @@ log = logging.getLogger("skipa_watchdog.monitor")
 _SRC_RE = re.compile(r"SRC=(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
 _DPT_RE = re.compile(r"DPT=(\d+)")
 
+# /proc/net/tcp(6): столбец state, интересуют реально живые соединения.
+# 01=ESTABLISHED, 02=SYN_SENT, 03=SYN_RECV - соединение уже видно по remote-адресу.
+_LIVE_TCP_STATES = {"01", "02", "03"}
+
 
 @dataclass
 class Hit:
     ip: str
     matched_source: str
     local_port: int | None
-    method: str = "psutil"
+    method: str = "poll"
 
 
 def _is_ignored(ip: str, ignore_networks) -> bool:
@@ -75,8 +79,56 @@ class Deduper:
 
 
 # ---------------------------------------------------------------------------
-# Метод 1: опрос через psutil
+# Метод 1: опрос /proc/net/tcp(4/6) - без сторонних зависимостей
 # ---------------------------------------------------------------------------
+
+def _hex_to_ip_port(hex_addr: str, ipv6: bool) -> tuple[str, int] | None:
+    """Разбирает поле вида 'ADDR:PORT' из /proc/net/tcp(6), где ADDR -
+    little-endian hex (по 32-битным словам для IPv6)."""
+    try:
+        ip_hex, port_hex = hex_addr.split(":")
+        port = int(port_hex, 16)
+        raw = bytes.fromhex(ip_hex)
+        if ipv6:
+            # 16 байт = 4 слова по 4 байта, каждое слово little-endian
+            packed = b"".join(raw[i : i + 4][::-1] for i in range(0, 16, 4))
+            ip = ipaddress.IPv6Address(packed).compressed
+        else:
+            packed = raw[::-1]
+            ip = ipaddress.IPv4Address(packed).compressed
+        return ip, port
+    except (ValueError, IndexError):
+        return None
+
+
+def _read_live_tcp_connections() -> list[tuple[str, int, int | None]]:
+    """Читает /proc/net/tcp и /proc/net/tcp6, возвращает список
+    (remote_ip, remote_port, local_port) для соединений с непустым удалённым
+    адресом. Не требует прав root - в отличие от опроса чужих сокетов через
+    psutil, /proc/net/tcp(6) и так виден любому процессу в том же network
+    namespace."""
+    results: list[tuple[str, int, int | None]] = []
+    for path, ipv6 in (("/proc/net/tcp", False), ("/proc/net/tcp6", True)):
+        try:
+            with open(path, encoding="ascii", errors="replace") as f:
+                next(f, None)  # пропускаем заголовок
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    if parts[3] not in _LIVE_TCP_STATES:
+                        continue
+                    remote = _hex_to_ip_port(parts[2], ipv6)
+                    if remote is None or remote[1] == 0:
+                        continue
+                    local = _hex_to_ip_port(parts[1], ipv6)
+                    results.append((remote[0], remote[1], local[1] if local else None))
+        except FileNotFoundError:
+            continue  # система без IPv6 (или без tcp вовсе) - не ошибка
+        except OSError as e:
+            log.debug("Не удалось прочитать %s: %s", path, e)
+    return results
+
 
 async def poll_connections_loop(
     get_db,
@@ -85,21 +137,21 @@ async def poll_connections_loop(
     dedup: Deduper,
     on_hit,
 ):
-    """Каждые poll_interval секунд смотрит активные inet-соединения и сверяет
+    """Каждые poll_interval секунд смотрит активные TCP-соединения и сверяет
     удалённые IP с базой угроз. get_db() возвращает текущий ThreatDB (чтобы
-    подхватывать еженедельные обновления на лету)."""
+    подхватывать обновления базы на лету)."""
 
-    log.info("Мониторинг соединений (psutil) запущен, интервал опроса: %ss", poll_interval)
+    log.info("Мониторинг соединений (poll /proc/net/tcp) запущен, интервал опроса: %ss", poll_interval)
 
     while True:
         try:
             db: ThreatDB = get_db()
             if db is not None and (db.networks or db.ranges):
                 seen_this_round = set()
-                for conn in psutil.net_connections(kind="inet"):
-                    if not conn.raddr:
-                        continue
-                    remote_ip = conn.raddr.ip
+                # чтение /proc - блокирующий файловый ввод-вывод, но по факту это
+                # быстрая операция с виртуальной файловой системой, отдельный
+                # поток ради неё не нужен
+                for remote_ip, _remote_port, local_port in _read_live_tcp_connections():
                     if remote_ip in seen_this_round or _is_ignored(remote_ip, ignore_networks):
                         continue
 
@@ -111,20 +163,14 @@ async def poll_connections_loop(
                     if not dedup.should_alert(remote_ip):
                         continue
 
-                    local_port = conn.laddr.port if conn.laddr else None
-                    hit = Hit(ip=remote_ip, matched_source=matched, local_port=local_port, method="psutil")
+                    hit = Hit(ip=remote_ip, matched_source=matched, local_port=local_port, method="poll")
                     log.warning(
-                        "[psutil] Подключение от известного сканера: %s (совпадение: %s, порт: %s)",
+                        "[poll] Подключение от известного сканера: %s (совпадение: %s, порт: %s)",
                         remote_ip, matched, local_port,
                     )
                     await on_hit(hit)
-        except psutil.AccessDenied:
-            log.error(
-                "Недостаточно прав для чтения сетевых соединений (psutil.AccessDenied). "
-                "Запустите бота от root либо через systemd с нужными capabilities."
-            )
         except Exception as e:  # noqa: BLE001
-            log.exception("Ошибка в цикле мониторинга (psutil): %s", e)
+            log.exception("Ошибка в цикле мониторинга (poll): %s", e)
 
         await asyncio.sleep(poll_interval)
 

@@ -50,17 +50,29 @@ def build_status_text(config: Config, state: dict) -> str:
     last_update = datetime.datetime.fromtimestamp(db.last_update_ts).strftime("%Y-%m-%d %H:%M:%S")
     per_source = ", ".join(f"{k}={v}" for k, v in db.per_source_counts.items()) or "-"
     blocked = len(blocker.list_blocked_ips())
-    return (
-        "📊 Статус Skipa Watchdog\n"
-        f"Версия: {_read_version()}\n"
-        f"Режим действия: {config.action_mode}\n"
-        f"Активный список: {config.active_list}\n"
-        f"Записей в базе: {db.source_line_count} ({per_source})\n"
-        f"Последнее обновление: {last_update}\n"
-        f"Метод мониторинга: {config.method}\n"
-        f"Заблокировано IP: {blocked}\n"
-        f"Отложенных алертов в очереди: {pending_count()}"
-    )
+
+    block_status = ""
+    if config.action_mode in ("block", "block_notify"):
+        block_status = (
+            "✅ активна (INPUT подключён к SKIPA-BLOCK)"
+            if blocker.is_wired_into_input()
+            else "⚠️ не подключена к INPUT - см. \"Docker/Kubernetes\" в меню install.sh"
+        )
+
+    lines = [
+        "📊 Статус Skipa Watchdog",
+        f"Версия: {_read_version()}",
+        f"Режим действия: {config.action_mode}",
+        f"Активный список: {config.active_list}",
+        f"Записей в базе: {db.source_line_count} ({per_source})",
+        f"Последнее обновление: {last_update}",
+        f"Метод мониторинга: {config.method}",
+    ]
+    if block_status:
+        lines.append(f"Блокировка: {block_status}")
+    lines.append(f"Заблокировано IP: {blocked}")
+    lines.append(f"Отложенных алертов в очереди: {pending_count()}")
+    return "\n".join(lines)
 
 
 async def _do_update_db(config: Config, state: dict) -> str:

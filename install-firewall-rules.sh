@@ -12,7 +12,7 @@
 #      та же для INPUT/DOCKER-USER/KUBE-*, одна блокировка сразу закрывает
 #      IP и на хосте, и в Docker, и в Kubernetes.
 #   2) правило логирования "CONN: " сразу после перехода - нужно для
-#      monitoring.method = kernel_log/both (без него psutil-режим работает
+#      monitoring.method = kernel_log/both (без него режим poll работает
 #      и без этих правил).
 #
 # Идемпотентно: повторный запуск ничего не дублирует.

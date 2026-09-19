@@ -4,20 +4,20 @@
 - регистрационные данные -> RIPEstat API (RIPE NCC, публичный, без ключа)
 - приватность (proxy/abuser/server) -> ipregistry.co (нужен бесплатный ключ)
 
-Все запросы асинхронные, с таймаутами и мягкой деградацией: если какой-то
-сервис недоступен или не настроен ключ - соответствующий блок просто не
-включается в сообщение, вместо падения бота.
+Все запросы - через bot/http_client.py (stdlib urllib в отдельном потоке,
+без aiohttp), с мягкой деградацией: если какой-то сервис недоступен или не
+настроен ключ - соответствующий блок просто не включается в сообщение,
+вместо падения процесса.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
-import aiohttp
+from . import http_client
 
 log = logging.getLogger("skipa_watchdog.enrich")
-
-REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
 @dataclass
@@ -61,77 +61,64 @@ def country_flag(cc: str | None) -> str:
     return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc)
 
 
-async def _get_json(session: aiohttp.ClientSession, url: str, **kwargs):
-    try:
-        async with session.get(url, timeout=REQUEST_TIMEOUT, **kwargs) as resp:
-            if resp.status != 200:
-                log.debug("GET %s -> HTTP %s", url, resp.status)
-                return None
-            return await resp.json(content_type=None)
-    except Exception as e:  # noqa: BLE001
-        log.debug("GET %s не удался: %s", url, e)
-        return None
-
-
-async def _fetch_ipinfo(session: aiohttp.ClientSession, ip: str, token: str) -> dict | None:
+async def _fetch_ipinfo(ip: str, token: str) -> dict | None:
     url = f"https://ipinfo.io/{ip}/json"
     if token:
         url += f"?token={token}"
-    return await _get_json(session, url)
+    return await http_client.get_json(url)
 
 
-async def _fetch_ripe_whois(session: aiohttp.ClientSession, ip: str) -> dict | None:
+async def _fetch_ripe_whois(ip: str) -> dict | None:
     # RIPEstat: публичный API, ключ не нужен
-    url = f"https://stat.ripe.net/data/whois/data.json?resource={ip}"
-    return await _get_json(session, url)
+    return await http_client.get_json(f"https://stat.ripe.net/data/whois/data.json?resource={ip}")
 
 
-async def _fetch_ripe_prefix_overview(session: aiohttp.ClientSession, ip: str) -> dict | None:
-    url = f"https://stat.ripe.net/data/prefix-overview/data.json?resource={ip}"
-    return await _get_json(session, url)
-
-
-async def _fetch_ripe_as_overview(session: aiohttp.ClientSession, asn: str) -> dict | None:
+async def _fetch_ripe_as_overview(asn: str) -> dict | None:
     asn_num = asn.lstrip("ASas")
-    url = f"https://stat.ripe.net/data/as-overview/data.json?resource=AS{asn_num}"
-    return await _get_json(session, url)
+    return await http_client.get_json(
+        f"https://stat.ripe.net/data/as-overview/data.json?resource=AS{asn_num}"
+    )
 
 
-async def _fetch_ipregistry(session: aiohttp.ClientSession, ip: str, key: str) -> dict | None:
+async def _fetch_ipregistry(ip: str, key: str) -> dict | None:
     if not key:
         return None
-    url = f"https://api.ipregistry.co/{ip}?key={key}"
-    return await _get_json(session, url)
+    return await http_client.get_json(f"https://api.ipregistry.co/{ip}?key={key}")
 
 
 async def enrich_ip(ip: str, ipinfo_token: str = "", ipregistry_key: str = "") -> EnrichedIP:
     result = EnrichedIP(ip=ip)
 
-    async with aiohttp.ClientSession() as session:
-        ipinfo_data = await _fetch_ipinfo(session, ip, ipinfo_token)
-        if ipinfo_data:
-            result.country_code = ipinfo_data.get("country")
-            result.country_name = _COUNTRY_NAMES.get(result.country_code, result.country_code)
-            result.region = ipinfo_data.get("region")
-            result.city = ipinfo_data.get("city")
-            org = ipinfo_data.get("org", "")  # формат "AS64500 Example Hosting GmbH"
-            if org:
-                parts = org.split(" ", 1)
-                result.asn = parts[0]
-                result.org_name = parts[1] if len(parts) > 1 else None
+    # ipinfo и ipregistry не зависят друг от друга - запускаем параллельно.
+    # RIPE whois идёт следом, а AS-overview - только после него (нужен ASN
+    # из ipinfo/whois), поэтому остаётся последовательным.
+    ipinfo_data, ipreg_data = await asyncio.gather(
+        _fetch_ipinfo(ip, ipinfo_token),
+        _fetch_ipregistry(ip, ipregistry_key),
+    )
 
-        whois_data = await _fetch_ripe_whois(session, ip)
-        if whois_data:
-            _parse_ripe_whois(result, whois_data)
+    if ipinfo_data:
+        result.country_code = ipinfo_data.get("country")
+        result.country_name = _COUNTRY_NAMES.get(result.country_code, result.country_code)
+        result.region = ipinfo_data.get("region")
+        result.city = ipinfo_data.get("city")
+        org = ipinfo_data.get("org", "")  # формат "AS64500 Example Hosting GmbH"
+        if org:
+            parts = org.split(" ", 1)
+            result.asn = parts[0]
+            result.org_name = parts[1] if len(parts) > 1 else None
 
-        if result.asn:
-            as_overview = await _fetch_ripe_as_overview(session, result.asn)
-            if as_overview:
-                _parse_ripe_as_overview(result, as_overview)
+    if ipreg_data:
+        _parse_ipregistry(result, ipreg_data)
 
-        ipreg_data = await _fetch_ipregistry(session, ip, ipregistry_key)
-        if ipreg_data:
-            _parse_ipregistry(result, ipreg_data)
+    whois_data = await _fetch_ripe_whois(ip)
+    if whois_data:
+        _parse_ripe_whois(result, whois_data)
+
+    if result.asn:
+        as_overview = await _fetch_ripe_as_overview(result.asn)
+        if as_overview:
+            _parse_ripe_as_overview(result, as_overview)
 
     return result
 

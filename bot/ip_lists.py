@@ -26,6 +26,7 @@ sources.active_list управляет тем, что реально испол�
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import logging
@@ -33,7 +34,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import aiohttp
+from . import http_client
 
 log = logging.getLogger("skipa_watchdog.ip_lists")
 
@@ -161,6 +162,12 @@ def _parse_mixed_list(text: str, label: str) -> tuple[list[NetEntry], list[IPRan
     return nets, ranges
 
 
+async def _empty() -> str:
+    """Заглушка для asyncio.gather, когда источник отключён/пуст - чтобы
+    не городить отдельную ветку кода для «скачать» и «не скачивать»."""
+    return ""
+
+
 async def fetch_threat_db(
     primary_url: str,
     blacklist_url: str = "",
@@ -183,12 +190,10 @@ async def fetch_threat_db(
     use_list1 = active_list in ("list1", "merged")
     use_list2 = active_list in ("list2", "merged")
 
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        primary_text = await _fetch_text(session, primary_url) if (use_list1 and primary_url) else ""
-        blacklist_text = (
-            await _fetch_text(session, blacklist_url) if (use_list2 and blacklist_url) else ""
-        )
+    primary_text, blacklist_text = await asyncio.gather(
+        http_client.get_text(primary_url) if (use_list1 and primary_url) else _empty(),
+        http_client.get_text(blacklist_url) if (use_list2 and blacklist_url) else _empty(),
+    )
 
     networks = _parse_cidr_list(primary_text) if primary_text else []
     ranges: list[IPRange] = []
@@ -248,16 +253,6 @@ def _dedup_ranges(entries: list[IPRange]) -> list[IPRange]:
     return list(seen.values())
 
 
-async def _fetch_text(session: aiohttp.ClientSession, url: str) -> str:
-    try:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            return await resp.text()
-    except Exception as e:  # noqa: BLE001
-        log.error("Не удалось скачать %s: %s", url, e)
-        return ""
-
-
 def load_cache() -> ThreatDB | None:
     if not CACHE_FILE.exists():
         return None
@@ -311,20 +306,18 @@ async def check_list_versions(
         except Exception:  # noqa: BLE001
             old_state = {}
 
-    timeout = aiohttp.ClientTimeout(total=20)
     new_state: dict[str, str] = {}
     changed: dict[str, bool] = {}
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for label, url in urls.items():
-            if not url:
-                continue
-            text = await _fetch_text(session, url)
-            if not text:
-                continue
-            h = _hash_text(text)
-            new_state[label] = h
-            if label in old_state and old_state[label] != h:
-                changed[label] = True
+    for label, url in urls.items():
+        if not url:
+            continue
+        text = await http_client.get_text(url)
+        if not text:
+            continue
+        h = _hash_text(text)
+        new_state[label] = h
+        if label in old_state and old_state[label] != h:
+            changed[label] = True
 
     if new_state:
         VERSION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)

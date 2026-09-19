@@ -1,73 +1,87 @@
-# Скопируйте этот файл в config.yaml и заполните своими значениями.
+# Конфиг Skipa Watchdog. Скопируйте этот файл в config.yaml (обычно это
+# делает install.sh) и при необходимости отредактируйте.
+#
+# Skipa Watchdog - ОДИН процесс (watchdog.py): он всегда мониторит соединения,
+# логирует в /var/log/skipa_watchdog/ и (в зависимости от action.mode ниже)
+# блокирует сканеров через iptables. Telegram - НЕ отдельный режим, а
+# необязательная надстройка: заполните telegram.bot_token/chat_id, если
+# хотите ещё и получать уведомления и пользоваться командами в чате. Если
+# оставить bot_token пустым - всё остальное работает точно так же, просто
+# без Telegram.
 
 telegram:
-  # Токен бота, полученный у @BotFather
-  bot_token: "123456789:AAAA-your-bot-token-here"
-  # ID чата/канала, куда слать уведомления (можно узнать через @userinfobot
-  # или @getmyid_bot; для канала — это отрицательное число вида -100XXXXXXXXXX)
-  chat_id: -1001234567890
-  # ID пользователей, которым разрешено дергать команды бота (/status, /update, ...)
-  # Если список пуст — команды разрешены всем, кто пишет боту в личку.
+  # Оставьте пустым, чтобы работать без Telegram (только локальный лог/блокировка)
+  bot_token: ""
+  chat_id: 0
+  # Если список пуст - команды бота доступны всем, кто напишет боту.
+  # Рекомендуется указать хотя бы свой Telegram user id.
   admin_ids: []
 
 sources:
-  # Откуда брать списки IP (raw-ссылки на репозиторий tread-lightly/CyberOK_Skipa_ips)
-  cidr_list_url: "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
-  range_list_url: "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_range.txt"
+  # Основной список: CIDR-блоки сканеров CyberOK/Skipa, ГРЧЦ, НКЦКИ
+  # (репозиторий tread-lightly/CyberOK_Skipa_ips). Раньше дополнительно
+  # подключался ещё и skipa_range.txt - тот же набор IP в другой нотации,
+  # от него отказались как от чистого дублирования.
+  primary_list_url: "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
   # Дополнительный список (смешанный формат: CIDR / диапазоны / одиночные IP,
   # автоопределяется построчно). Оставьте пустой строкой, чтобы отключить.
   blacklist_url: "https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/37cde2b27a560c647d0e8eb9d274e3409082d3e7/blacklist.txt"
-  # Как этот источник будет подписан в алертах и /status (например "blacklist: 1.2.3.0/24")
+  # Как этот источник будет подписан в алертах и /status
   blacklist_name: "blacklist"
-  # Как часто обновлять базу IP (в днях). По заданию — раз в неделю.
+  # Какой список реально использовать:
+  #   "list1"  - только primary_list_url
+  #   "list2"  - только blacklist_url
+  #   "merged" - оба вместе, без повторов (по умолчанию)
+  active_list: "merged"
+  # Как часто обновлять базу IP (в днях)
   update_interval_days: 7
 
+action:
+  # Что делать при обнаружении скана:
+  #   "notify"       - только уведомление (лог + Telegram, если настроен)
+  #   "block"        - только блокировка через iptables (без уведомлений)
+  #   "block_notify" - блокировка И уведомление (по умолчанию, рекомендуется)
+  #
+  # Блокировка работает через отдельную цепочку iptables SKIPA-BLOCK,
+  # подключённую и к хосту (INPUT), и к Docker (DOCKER-USER), и к
+  # Kubernetes (KUBE-*) - см. install-firewall-rules.sh. Без него сама
+  # блокировка технически создаётся, но трафик до неё не доходит.
+  mode: "block_notify"
+
 monitoring:
-  # Как обнаруживать подключения известных сканеров:
-  # "psutil"     - опрос активных сокетов через psutil (просто, но может пропускать
-  #                очень короткие TCP-сессии вроде одиночного SYN от zmap/zgrab)
-  # "kernel_log" - хвостование journalctl -k -f по логам nftables/iptables,
-  #                ловит любой входящий SYN (нужно один раз настроить nftables,
-  #                см. README.md -> "Расширенный мониторинг через nftables")
-  # "both"       - оба метода сразу, дедупликация алертов общая
+  # "psutil" (соединения через psutil) / "kernel_log" (чтение "CONN: " из
+  # dmesg/journalctl -k) / "both"
   method: "psutil"
-  # Префикс, который вы указали в правиле `log prefix "..."` (для method: kernel_log/both)
   kernel_log_prefix: "CONN: "
-  # Необязательно: своя команда для чтения kernel-лога вместо journalctl -k -f,
-  # например ["tail", "-F", "/var/log/kern.log"] на системах с rsyslog вместо journald
   kernel_log_command: []
-  # Как часто (в секундах) опрашивать активные сетевые соединения сервера (для method: psutil)
   poll_interval_seconds: 5
-  # Через сколько минут можно снова слать алерт по тому же IP (антиспам)
+  # Не слать повторный алерт с одного и того же IP чаще, чем раз в N минут
   alert_cooldown_minutes: 60
-  # Свои IP/подсети, которые никогда не должны триггерить алерт (например, ваш VPN/офис)
+  # IP/подсети, которые никогда не считаются сканом (свои IP, мониторинг и т.п.)
   ignore_ips: []
 
 enrichment:
-  # Токен ipinfo.io (необязателен, без него тоже работает, но с меньшим лимитом запросов)
-  # Получить бесплатно: https://ipinfo.io/signup
+  # Обогащать алерт гео/ASN-данными (ipinfo.io + RIPEstat + ipregistry.co).
+  # Каждое обогащение - лишний сетевой запрос, при большом потоке сканов
+  # можно выключить.
+  enabled: true
   ipinfo_token: ""
-  # Ключ ipregistry.co для блока "Privacy info" (Proxy/Abuser/Server)
-  # Бесплатный тариф: https://ipregistry.co
   ipregistry_key: ""
 
-alerting:
-  # Если отправка в Telegram не удалась (нет сети, Telegram недоступен и т.п.),
-  # алерт не теряется: он складывается в data/pending_telegram.jsonl и бот
-  # пытается доотправить его каждые retry_interval_seconds секунд, пока не
-  # получится. Проверить очередь можно командой /pending или /status.
-  # Кроме того, КАЖДЫЙ обнаруженный скан всегда пишется в data/alerts.log
-  # (человекочитаемый журнал), независимо от результата отправки в Telegram.
-  retry_interval_seconds: 300
-
 environment:
-  # При старте бот один раз проверяет наличие Docker/Kubernetes и пишет
-  # заметку в лог (плюс доступно по команде /env в любой момент). Само
-  # логирование сканов на DOCKER-USER/KUBE-* цепочки ставится через
-  # install.sh / install-logging-rules.sh, эти флаги влияют только на
-  # то, показывать ли эту информацию.
+  # При старте процесс один раз проверяет наличие Docker/Kubernetes и пишет
+  # заметку в лог (плюс доступно по команде /env в Telegram, если он
+  # подключён). Само логирование/блокировка сканов на DOCKER-USER/KUBE-*
+  # цепочках ставится через install.sh / install-firewall-rules.sh.
   docker_scan: true
   k8s_scan: true
 
 logging:
   level: "INFO"
+  # Куда пишутся skipa-watchdog.log и detections.log
+  log_dir: "/var/log/skipa_watchdog"
+
+alerting:
+  # Как часто повторять попытку отправки алертов, которые не ушли в
+  # Telegram из-за временной недоступности связи (сек.)
+  retry_interval_seconds: 300

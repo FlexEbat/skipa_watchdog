@@ -9,7 +9,7 @@
 2. Очередь на повтор: если отправка в Telegram упала с ошибкой (сеть легла,
    Telegram недоступен, невалидный chat_id и т.п.), сообщение не теряется -
    оно складывается в data/pending_telegram.jsonl и периодически (см.
-   job_flush_pending_alerts в main.py) пытается отправиться заново, пока
+   _flush_pending_alerts в watchdog.py) пытается отправиться заново, пока
    не уйдёт успешно.
 """
 from __future__ import annotations
@@ -39,9 +39,8 @@ def _strip_html(text: str) -> str:
 def append_audit_log(
     ip: str, matched_source: str, html_text: str, log_path: Path | str | None = None
 ) -> None:
-    """Пишет запись в audit-журнал. По умолчанию - data/alerts.log (режим
-    bot), но можно передать свой путь (используется watchdog_service.py,
-    чтобы писать в /var/log/skipa_watchdog/detections.log)."""
+    """Пишет запись в audit-журнал. По умолчанию - data/alerts.log, но
+    watchdog.py всегда передаёт свой путь (/var/log/skipa_watchdog/detections.log)."""
     target = Path(log_path) if log_path else AUDIT_LOG
     target.parent.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y-%m-%d %H:%M:%S")

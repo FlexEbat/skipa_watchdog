@@ -1,13 +1,44 @@
 # Skipa Watchdog
 
-Telegram-бот, который **постоянно** мониторит сетевые подключения к вашему
-серверу и присылает уведомление, если источник входит в базу IP-адресов
-сканеров CyberOK/Skipa, ГРЧЦ и НКЦКИ из репозитория
-[tread-lightly/CyberOK_Skipa_ips](https://github.com/tread-lightly/CyberOK_Skipa_ips).
+Skipa Watchdog — это **один процесс**, который постоянно мониторит сетевые
+подключения к вашему серверу, сверяет источник с базой IP-адресов сканеров
+CyberOK/Skipa, ГРЧЦ и НКЦКИ (+ дополнительные списки), и при обнаружении
+**блокирует** такой IP через iptables и/или присылает **уведомление** —
+режим настраивается. Блокировка работает не только для самого хоста, но и
+для сервисов, опубликованных через **Docker и Kubernetes**.
 
-База IP (`lists/skipa_cidr.txt` и `lists/skipa_range.txt`) обновляется
-**раз в неделю** (настраивается), мониторинг соединений идёт непрерывно
-(по умолчанию опрос раз в 5 секунд).
+Telegram — это **не отдельный режим**, а необязательная надстройка поверх
+того же процесса: если указать `telegram.bot_token`, тот же процесс
+дополнительно шлёт уведомления в чат и даёт команды/инлайн-меню. Без
+Telegram всё работает точно так же, просто локально — через
+`/var/log/skipa_watchdog/`.
+
+Основной список IP берётся из репозитория
+[tread-lightly/CyberOK_Skipa_ips](https://github.com/tread-lightly/CyberOK_Skipa_ips)
+(`lists/skipa_cidr.txt`) и обновляется **раз в неделю** (настраивается).
+Дополнительно можно подключить ещё один произвольный список (по умолчанию —
+публичный [blacklist-gist](https://gist.github.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8))
+и выбрать, использовать основной список, дополнительный, или оба сразу без
+повторов. Мониторинг соединений идёт непрерывно (по умолчанию опрос раз в
+5 секунд), а раз в сутки процесс дополнительно проверяет, не вышла ли новая
+версия одного из списков, и пишет об этом в лог.
+
+## Что делает при обнаружении
+
+Поведение задаётся `action.mode` в конфиге (и меняется прямо из меню
+`install.sh`, без правки YAML руками):
+
+| Режим | Что происходит |
+|---|---|
+| `block_notify` (по умолчанию) | IP блокируется через iptables **и** отправляется уведомление |
+| `block` | Только блокировка, без уведомлений |
+| `notify` | Только уведомление, IP не блокируется |
+
+Блокировка идёт через отдельную цепочку iptables `SKIPA-BLOCK`, на которую
+настроен переход из `INPUT` (хост), `DOCKER-USER` (Docker) и
+`KUBE-EXTERNAL-SERVICES`/`KUBE-NODEPORTS` (Kubernetes) — то есть **одна**
+блокировка сразу закрывает IP везде, а не только на хосте. Подробности — в
+разделе про Docker/Kubernetes ниже.
 
 ## Пример уведомления
 
@@ -26,6 +57,8 @@ DE-EXAMPLE-20200101
 EXAMPLE-AS / example-hosting.example
 ▢ Privacy info (ipregistry.co):
 Proxy ❌ | Abuser ❌ | Server ✅
+
+🚫 IP заблокирован.
 ```
 
 *(в примере выше используются зарезервированные для документации значения —
@@ -35,12 +68,9 @@ Proxy ❌ | Abuser ❌ | Server ✅
 
 ## Установка
 
-### Быстрая установка через install.sh (рекомендуется)
-
-Единый установщик и менеджер: ставит бота и/или лёгкий service-режим,
-разворачивает systemd-юниты, при каждом запуске проверяет систему на
-Docker/Kubernetes и предлагает донастроить логирование сканов на их
-цепочки (DOCKER-USER / KUBE-*).
+Единственный поддерживаемый способ — `install.sh`. Первый запуск показывает
+только описание и предложение установить (без меню — устанавливать пока
+нечего):
 
 ```bash
 git clone https://github.com/FlexEbat/skipa_watchdog.git
@@ -48,106 +78,106 @@ cd skipa_watchdog
 sudo bash install.sh
 ```
 
-Откроется интерактивное меню:
+Установщик клонирует актуальную версию в `/opt/skipa_watchdog`, ставит venv
+и зависимости, создаёт `config.yaml` из шаблона, предложит сразу же
+подключить Telegram (можно пропустить и сделать позже), поставит
+systemd-юнит `skipa-watchdog` и запустит его. В конце регистрируется
+команда `skipa-watchdog` — **дальше для управления используйте именно её**,
+а не полный путь до `install.sh`:
+
+```bash
+sudo skipa-watchdog
+```
+
+Повторный запуск (когда всё уже установлено) сразу показывает меню:
 
 ```
- 1) Версия
- 2) Проверка работоспособности
- 3) Управление сервисами (start/stop/restart)
- 4) Установка/удаление бота (Telegram)
- 5) Установка/удаление сервиса (лёгкий режим, без Telegram)
- 6) Логирование Docker/Kubernetes (DOCKER-USER / KUBE-*)
+======================================
+ Skipa Watchdog
+ Версия: 3.0.0
+======================================
+ 1) Проверка работоспособности
+ 2) Управление сервисом (start/stop/restart/статус)
+ 3) Настройки обнаружения (список IP / режим действия)
+ 4) Telegram (подключить/отключить)
+ 5) Docker/Kubernetes (логирование + блокировка)
+ 6) Заблокированные IP
  7) Принудительно обновить базу IP
  8) Просмотр логов
- 9) Редактировать конфиг
-10) Полное удаление (бот + сервис + конфиги)
+ 9) Редактировать конфиг вручную
+10) Обновить Skipa Watchdog
+11) Удалить полностью
  0) Выход
 ```
+
+При каждом запуске (первом и последующих) `install.sh`/`skipa-watchdog`
+также автоматически проверяет систему на Docker/Kubernetes (и предлагает
+донастроить правила, если чего-то не хватает) и проверяет, не вышли ли
+новые версии подключённых списков IP.
 
 Есть и неинтерактивный режим для автоматизации:
 
 ```bash
-sudo bash install.sh install-bot     # поставить/обновить Telegram-бота
-sudo bash install.sh install-svc     # поставить/обновить лёгкий сервис
-sudo bash install.sh status          # краткий статус без меню
-sudo bash install.sh fw-rules        # поставить правила логирования docker/k8s
+sudo bash install.sh install        # установить/обновить (git pull + зависимости)
+sudo bash install.sh uninstall      # удалить полностью
+sudo bash install.sh status         # краткий статус без меню
+sudo bash install.sh fw-rules       # поставить правила логирования/блокировки docker/k8s
+sudo bash install.sh check-lists    # проверить обновления списков прямо сейчас
 ```
-
-**Бот и сервис - два независимых режима, которые могут стоять на одном
-сервере одновременно** (разные venv, разные systemd-юниты, разные
-конфиги: `config.yaml` у бота и `service.yaml` у сервиса):
-
-- **bot** (`skipa-watchdog-bot.service`, `main.py`) - полноценный
-  Telegram-бот со всеми командами (см. ниже), качается через `git clone`
-  в `venv-bot` вместе с `python-telegram-bot`.
-- **service** (`skipa-watchdog-svc.service`, `watchdog_service.py`) -
-  лёгкий режим без Telegram и без `python-telegram-bot`
-  (`requirements-service.txt`): просто пишет каждое обнаружение в
-  `/var/log/skipa_watchdog/detections.log` (+ обычный процесс-лог в
-  `skipa-watchdog-svc.log`). Годится, если Telegram-уведомления не нужны,
-  а нужен только факт детектирования для своей системы алертинга/SIEM.
-  Конфиг - `service.example.yaml` → `service.yaml`, в большинстве случаев
-  можно ничего не менять.
 
 ### Установка вручную (без install.sh)
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt          # для бота
-# или: pip install -r requirements-service.txt   # для лёгкого сервиса
+pip install -r requirements.txt
 
-cp config.example.yaml config.yaml       # для бота
-# или: cp service.example.yaml service.yaml       # для сервиса
-nano config.yaml   # заполнить bot_token, chat_id, по желанию ipinfo_token / ipregistry_key
+cp config.example.yaml config.yaml
+nano config.yaml   # Telegram по желанию; остальное уже рабочее по умолчанию
+python watchdog.py
 ```
-
-### Как получить нужные значения
-
-- **bot_token** — создать бота у [@BotFather](https://t.me/BotFather), команда `/newbot`.
-- **chat_id** — куда слать алерты. Проще всего: добавить бота в нужный чат/канал
-  (для канала — админом), написать туда что угодно и посмотреть `chat_id` через
-  `https://api.telegram.org/bot<TOKEN>/getUpdates`, либо через бота [@getmyid_bot](https://t.me/getmyid_bot).
-- **ipinfo_token** (необязательно) — бесплатная регистрация на [ipinfo.io](https://ipinfo.io/signup),
-  без токена тоже работает, но с более низким лимитом запросов в день.
-- **ipregistry_key** (необязательно, для блока Privacy info) — бесплатный ключ на
-  [ipregistry.co](https://ipregistry.co). Без ключа блок "Privacy info" просто не
-  добавляется в сообщение — бот не падает.
 
 ## Запуск
 
 ```bash
-python main.py               # режим bot
-# или
-python watchdog_service.py   # режим service (без Telegram)
+python watchdog.py               # или: python watchdog.py /путь/к/config.yaml
 ```
 
-При первом запуске бот сразу скачает базу IP и закэширует её в `data/ip_cache.json`,
-дальше будет обновлять её раз в неделю (`sources.update_interval_days` в конфиге).
+При первом запуске сразу скачает базу IP и закэширует её в `data/ip_cache.json`,
+дальше будет обновлять её раз в неделю (`sources.update_interval_days`).
+Если `telegram.bot_token` заполнен — в этом же процессе поднимется и
+Telegram-слой (см. `bot/telegram_layer.py`).
 
-## Дополнительные списки (blacklist)
+## Списки IP
 
-Помимо `skipa_cidr.txt`/`skipa_range.txt` из
-[tread-lightly/CyberOK_Skipa_ips](https://github.com/tread-lightly/CyberOK_Skipa_ips),
-по умолчанию подключён ещё один список (`sources.blacklist_url` в конфиге,
-можно оставить пустым, чтобы отключить). Формат смешанный и определяется
-построчно: CIDR (`1.2.3.0/24`), диапазон (`1.2.3.10-1.2.3.20`) или
-одиночный IP - всё принимается автоматически. В алерте и в `/status`
-видно, из какого именно источника пришло совпадение (`skipa_cidr: ...`,
-`skipa_range: ...` или `blacklist: ...` - имя настраивается через
-`sources.blacklist_name`).
+`sources.active_list` в конфиге выбирает, что реально используется:
 
-## Команды бота в Telegram
+- **`list1`** — только основной список (`primary_list_url`, по умолчанию
+  `skipa_cidr.txt` из tread-lightly/CyberOK_Skipa_ips). Раньше сюда же
+  подключался ещё и `skipa_range.txt` — тот же набор адресов, только в
+  нотации диапазонов вместо CIDR; от него отказались как от чистого
+  дублирования одних и тех же данных.
+- **`list2`** — только дополнительный список (`blacklist_url`, по умолчанию
+  публичный gist). Формат смешанный и определяется автоматически построчно:
+  CIDR (`1.2.3.0/24`), диапазон (`1.2.3.10-1.2.3.20`) или одиночный IP.
+- **`merged`** (по умолчанию) — оба вместе, точные дубликаты убираются.
 
-- `/menu` — меню с инлайн-кнопками (статус, обновить базу, очередь, Docker/K8s, помощь)
-- `/status` — сколько записей в базе (с разбивкой по источникам), когда было последнее обновление, сколько алертов в очереди на повтор
+Переключить можно прямо из меню (`skipa-watchdog` → пункт 3 → 1) — правка
+YAML руками не нужна. В алерте и в `/status` видно, из какого именно
+источника пришло совпадение (`skipa: ...` или `blacklist: ...`).
+
+## Команды в Telegram (если подключён)
+
+- `/menu` — меню с инлайн-кнопками (статус, обновить базу, очередь, Docker/K8s, блокировки, помощь)
+- `/status` — режим действия, активный список, сколько записей в базе, когда было
+  последнее обновление, сколько IP заблокировано, сколько алертов в очереди на повтор
 - `/update` — принудительно обновить базу IP прямо сейчас
 - `/testalert [ip]` — прислать тестовое уведомление в нужном формате (по умолчанию
   на примере `203.0.113.42`), удобно для проверки форматирования
-- `/pending` — показать, сколько алертов сейчас застряло в очереди на повтор
-  из-за недоступности Telegram (см. раздел "Если Telegram недоступен" ниже)
-- `/env` — показать, обнаружены ли Docker/Kubernetes и стоит ли на их
-  цепочках логирование сканов (см. следующий раздел)
+- `/pending` — сколько алертов сейчас в очереди на повтор из-за недоступности Telegram
+- `/env` — обнаружены ли Docker/Kubernetes и стоит ли на их цепочках логирование/блокировка
+- `/blocklist` — список заблокированных IP
+- `/block <ip>` / `/unblock <ip>` — заблокировать/разблокировать IP вручную
 - `/start` — краткая справка
 
 Если в `config.yaml` задан `telegram.admin_ids`, команды будут работать только
@@ -155,289 +185,157 @@ python watchdog_service.py   # режим service (без Telegram)
 
 ## Если Telegram недоступен
 
-Бот не теряет алерты, если временно не может достучаться до Telegram
-(нет сети, сам Telegram лежит, истёк/отозван токен и т.п.):
+Даже без Telegram (или при временной недоступности связи) ничего не
+теряется:
 
-- **Полный audit-журнал** — каждый обнаруженный скан всегда пишется в
-  `data/alerts.log` (простой читаемый текст с датой/временем), независимо
-  от того, ушло ли уведомление в Telegram. Это заодно и полная история всех
-  срабатываний, если захочется что-то найти постфактум.
-- **Очередь на повтор** — если сама отправка в Telegram упала с ошибкой,
-  сообщение кладётся в `data/pending_telegram.jsonl` и бот автоматически
-  пробует отправить его снова каждые `alerting.retry_interval_seconds`
-  секунд (по умолчанию 300 = 5 минут), пока не получится. Ничего вручную
-  переотправлять не нужно.
-- Проверить, что сейчас висит в очереди, можно командой `/pending` в
-  Telegram (сработает сразу после восстановления связи) либо посмотреть
-  файл напрямую: `cat data/pending_telegram.jsonl`.
-- Если нужен третий канал (email, webhook, локальный syslog и т.п.) —
-  добавляется в `bot/fallback.py`: там уже есть `queue_pending_alert()` /
-  `append_audit_log()`, туда можно дописать ещё один вызов рядом.
+1. **Локальный лог всегда пишется.** Каждое обнаружение попадает в
+   `/var/log/skipa_watchdog/detections.log` (полный текст алерта) и
+   `skipa-watchdog.log` (обычный процесс-лог), независимо от режима и от
+   того, настроен ли Telegram.
+2. **Очередь на повтор.** Если Telegram настроен, но отправка не удалась
+   (сеть легла, chat_id неверный и т.п.), сообщение складывается в очередь
+   на диске и переотправляется каждые `alerting.retry_interval_seconds`
+   (по умолчанию 5 минут), пока не уйдёт успешно.
 
 ## Важно про права доступа
 
-Мониторинг соединений использует `psutil.net_connections()`, который читает
-`/proc/net/tcp` и `/proc/net/udp`. На большинстве Linux-дистрибутивов для
-просмотра **чужих** сокетов (не только процессов текущего пользователя) нужны
-права root — поэтому рекомендуется запускать бота от root или через systemd
-с `AmbientCapabilities=CAP_NET_ADMIN` (см. `skipa-watchdog.service` ниже).
+Процесс обычно нужно запускать **от root** (или с capabilities
+`CAP_NET_ADMIN`/`CAP_NET_RAW`), потому что:
+
+- чтение чужих сокетов в `/proc/net` (или системного `journalctl -k`) требует
+  повышенных прав;
+- управление iptables (создание цепочки `SKIPA-BLOCK`, добавление/удаление
+  правил блокировки) требует `CAP_NET_ADMIN`.
+
+Все примеры systemd-юнитов в этом репозитории по умолчанию рассчитаны на
+root; вариант с ограниченными capabilities закомментирован в
+`skipa-watchdog.service`.
+
+## Docker и Kubernetes
+
+Трафик, который идёт на порты, опубликованные через Docker (`docker run -p`
+/ `ports:` в compose) или Kubernetes (`NodePort`/`LoadBalancer`), **не
+проходит через обычный `INPUT`** — он маршрутизируется через собственные
+цепочки iptables (`DOCKER-USER`, `KUBE-EXTERNAL-SERVICES`/`KUBE-NODEPORTS`).
+Без дополнительной настройки такой трафик не логируется и не блокируется.
+
+`install-firewall-rules.sh` (он же пункт 5 меню `skipa-watchdog`, он же
+`sudo bash install.sh fw-rules`) решает это автоматически:
+
+1. Создаёт общую цепочку `SKIPA-BLOCK` — именно в неё `watchdog.py`
+   добавляет `-s <ip> -j DROP` при блокировке.
+2. Для каждой найденной цепочки (`INPUT`, и если есть — `DOCKER-USER`,
+   `KUBE-EXTERNAL-SERVICES`, `KUBE-NODEPORTS`) ставит:
+   - переход `-j SKIPA-BLOCK` в самое начало (позиция 1) — чтобы уже
+     заблокированные IP сразу отсекались;
+   - правило логирования `CONN: ` сразу после (позиция 2) — нужно для
+     `monitoring.method = kernel_log`/`both`.
+
+Скрипт идемпотентен — повторный запуск ничего не дублирует. Определение
+Docker/K8s и статус применённых правил также доступны:
+
+- из меню `skipa-watchdog` (пункт 1, "Проверка работоспособности", и
+  пункт 5);
+- командой `/env` в Telegram, если он подключён.
+
+### Kubernetes и режим kube-proxy
+
+Если `kube-proxy` работает в режиме **ipvs** (проверяется через
+`ipvsadm -L -n`), цепочек `KUBE-*` в iptables нет вообще — в этом случае
+скрипт выводит предупреждение и пропускает k8s-часть: логирование и
+блокировка NodePort-трафика через этот механизм недоступны, остаётся
+только защита хоста (`INPUT`).
+
+### Автозапуск правил после перезагрузки
+
+Правила iptables (включая список уже заблокированных IP) не переживают
+`reboot`, если не настроен `iptables-persistent`. Чтобы не терять их:
+
+- `skipa-watchdog-fw-rules.service` — systemd-юнит, который запускает
+  `install-firewall-rules.sh` после старта Docker/kubelet при каждой
+  загрузке сервера (нужно включить: `sudo systemctl enable
+  skipa-watchdog-fw-rules`);
+- сам список заблокированных IP `watchdog.py` дублирует в
+  `data/blocked_ips.json` и при каждом своём старте (в режиме `block`/
+  `block_notify`) накатывает их обратно на iptables — так что даже если
+  сервер перезагрузился без `iptables-persistent`, при следующем старте
+  процесса блокировки восстановятся.
+
+#### Нужны ли для этого какие-то особые пакеты?
+
+Нет. Работа идёт только через команду `iptables` (её ставит сам Docker как
+зависимость), отдельный демон nftables не используется и не нужен;
+`conntrack`/`nat` модули ядра уже загружены самим Docker. Единственное, что
+важно соблюсти — **порядок запуска**: правила в `DOCKER-USER`/`KUBE-*`
+можно ставить только после того, как Docker/kubelet создали эти цепочки,
+поэтому systemd-юнит явно объявляет `After=docker.service` (и
+`After=kubelet.service`, если он есть).
 
 ## Расширенный мониторинг через nftables/iptables (надёжнее, ловит одиночные SYN)
 
-> Начиная с `install.sh`, определять Docker/Kubernetes и ставить правила
-> логирования на нужные цепочки (`INPUT`, `DOCKER-USER`,
-> `KUBE-EXTERNAL-SERVICES`/`KUBE-NODEPORTS`) можно одной командой:
-> `sudo bash install.sh` (пункт меню 6) или `sudo bash install.sh fw-rules`.
-> Раздел ниже описывает, что происходит "под капотом", и пригодится, если
-> нужно настроить всё вручную или разобраться в деталях.
+`monitoring.method` в конфиге может быть:
 
-Опрос через `psutil` раз в несколько секунд может пропустить очень короткие
-соединения (одиночный SYN от zmap/zgrab, который сразу же рвётся RST) —
-это как раз то, чем печально славится Skipa. Реализован второй, более
-надёжный метод: логирование новых TCP-соединений прямо в лог ядра (kernel
-ring buffer), который бот читает через `journalctl -k -f`.
+- **`psutil`** (по умолчанию) — периодический опрос активных соединений
+  через `psutil`. Просто, не требует прав на iptables/журнал ядра для самого
+  мониторинга (но права всё равно нужны для блокировки). Может пропустить
+  очень короткое соединение между двумя опросами.
+- **`kernel_log`** — читает строки `CONN: ...`, которые сам сервер пишет в
+  журнал ядра благодаря правилу `LOG`, поставленному
+  `install-firewall-rules.sh`. Видит вообще каждый SYN-пакет, даже если
+  соединение сразу же оборвалось.
+- **`both`** — оба метода одновременно (дедупликация по `alert_cooldown_minutes`
+  убирает повторные срабатывания на один и тот же IP).
 
-Ниже два варианта настройки — выберите тот, что соответствует вашему серверу.
-Оба варианта пишут в лог ядра в одном и том же формате, поэтому дальше
-конфиг бота и парсер (`tail_kernel_log_loop()`) одинаковые для обоих.
-
-### Вариант A: чистый nftables (сервер без Docker, свой rulebase)
-
-**1. Проверьте текущий rulebase**
-
-```bash
-sudo nft list ruleset
-```
-
-Обычно на Debian/Ubuntu уже есть таблица `inet filter` с цепочкой `input`
-(hook `input`, priority `filter`). Если её нет — создайте:
-
-```bash
-sudo nft add table inet filter
-sudo nft add chain inet filter input '{ type filter hook input priority filter ; policy accept ; }'
-```
-
-**2. Добавьте правило логирования**
-
-Важно поставить его до правил `drop`/`reject` (иначе то, что дропается
-раньше — не долетит до лога), и с лимитом скорости, чтобы при реальной
-атаке/скан-шторме не забить диск и CPU логированием:
-
-```bash
-sudo nft insert rule inet filter input tcp flags syn ct state new \
-  limit rate 20/second log prefix "CONN: " flags all
-```
-
-`ct state new` + `tcp flags syn` — логируем именно момент установления
-нового TCP-соединения (сам факт SYN), а не полный успешный коннект.
-Никакого `group N` здесь не нужно — без `group` nftables пишет запись
-напрямую в kernel log buffer, который читается через `journalctl -k` или
-`dmesg`, без необходимости поднимать отдельный демон вроде ulogd.
-
-**3. Сохраните правило, чтобы оно пережило перезагрузку**
-
-```bash
-sudo nft list ruleset | sudo tee /etc/nftables.conf
-sudo systemctl enable --now nftables
-```
-
-**4. Проверьте, что записи реально появляются**
-
-```bash
-sudo journalctl -k -f
-```
-
-и с другого хоста дёрните любой порт (`curl <ваш_ip>` или `nc -zv <ваш_ip> 80`) —
-должна появиться строка вида:
-
-```
-CONN: IN=eth0 OUT= MAC=... SRC=203.0.113.77 DST=203.0.113.10 LEN=60 ... PROTO=TCP SPT=54321 DPT=80 ... SYN
-```
-
-Если у вас классический **iptables** вместо nftables (и при этом нет Docker) —
-аналог:
-
-```bash
-sudo iptables -I INPUT -p tcp --syn -m conntrack --ctstate NEW \
-  -m limit --limit 20/second -j LOG --log-prefix "CONN: " --log-level 4
-```
-это тоже пишется в kernel log buffer, парсер тот же самый.
-
-### Вариант B: сервер с Docker (бэкенд iptables-nft)
-
-Если на сервере крутится Docker — он **сам управляет iptables** через
-совместимый бэкенд `iptables-nft` (проверить: `sudo iptables -V` покажет
-`(nf_tables)`). Таблицы у него называются `ip filter`/`ip nat` с пометкой
-`managed by iptables-nft, do not touch!` — значит правила добавляются через
-команду `iptables`, а не напрямую через `nft add rule` в эти таблицы (Docker
-их периодически пересоздаёт/дополняет, самодельное nft-правило может
-потеряться или сконфликтовать).
-
-Кроме того, трафик на опубликованные порты контейнеров (те, что указаны
-в `docker run -p` / `ports:` в compose) идёт **не через INPUT**, а через
-`FORWARD → DOCKER-USER` (после DNAT, который меняет адрес назначения раньше,
-чем принимается решение о маршрутизации). Поэтому правило логирования нужно
-ставить в двух местах.
-
-**1. Одноразово примените правила**
-
-```bash
-sudo bash install-logging-rules.sh
-```
-
-Скрипт идемпотентный (безопасно перезапускать) и добавляет:
-
-```bash
-# хостовые сервисы (SSH и всё, что слушает не через Docker)
-iptables -I INPUT -p tcp --syn -m limit --limit 30/second --limit-burst 40 \
-  -j LOG --log-prefix "CONN: " --log-level 4
-
-# всё, что опубликовано через Docker (80/443/3000/8448/51821/turn-порты и т.д.)
-iptables -I DOCKER-USER -p tcp --syn -m limit --limit 30/second --limit-burst 40 \
-  -j LOG --log-prefix "CONN: " --log-level 4
-```
-
-`--syn` матчит именно первый пакет TCP-хендшейка — то есть буквально любую
-попытку соединения, даже если дальше сразу RST. `-m limit` — защита от
-переполнения kernel-лога при реальном шторме пакетов; сам трафик при этом
-не блокируется (`-j LOG` не терминальное действие, пакет идёт дальше как
-обычно).
-
-**2. Поставьте это на автозапуск после Docker**
-
-Правила из `DOCKER-USER` переживают рестарт демона Docker, но **не переживают
-перезагрузку сервера** (после ребута Docker создаёт цепочку заново пустой).
-Поэтому добавьте systemd-юнит, который применяет скрипт после старта Docker:
-
-```bash
-sudo cp skipa-watchdog-fw-rules.service /etc/systemd/system/
-sudo nano /etc/systemd/system/skipa-watchdog-fw-rules.service  # поправить путь ExecStart
-sudo systemctl daemon-reload
-sudo systemctl enable --now skipa-watchdog-fw-rules
-```
-
-**3. Проверьте, что записи реально появляются**
-
-```bash
-sudo journalctl -k -f
-```
-и с другого хоста дёрните любой порт:
-
-```bash
-curl -m 2 http://<ваш_ip>       # для 80/443
-nc -zv <ваш_ip> 3000            # для докер-порта
-```
-
-Должна появиться строка вида:
-
-```
-CONN: IN=eth0 OUT= MAC=... SRC=203.0.113.42 DST=172.20.0.9 LEN=60 ... PROTO=TCP SPT=54321 DPT=80 ... SYN
-```
-
-`DST=` для докер-трафика будет **внутренний** IP контейнера (172.x.x.x) —
-это нормально, бот парсит только `SRC=`, там всегда настоящий внешний IP
-сканера.
-
-**Если Docker не используется** и iptables у вас "чистый" (без `DOCKER-USER`) —
-скрипт сам это определит и пропустит второй шаг, останется только правило
-в INPUT (по сути превращается в вариант A, но через iptables вместо nft).
-
-### Kubernetes (NodePort/LoadBalancer)
-
-Трафик на `NodePort`/`LoadBalancer`-сервисы k8s тоже не проходит через
-обычный `INPUT` — он маршрутизируется через служебные цепочки kube-proxy.
-`install-logging-rules.sh` (и `install.sh`, пункт меню 6) определяют это
-автоматически и ставят то же самое правило логирования на:
-
-- `KUBE-EXTERNAL-SERVICES` — современные версии k8s (iptables-режим kube-proxy);
-- `KUBE-NODEPORTS` — более старые версии.
-
-**Важно:** если kube-proxy работает в режиме **ipvs** (проверяется через
-`ipvsadm -L -n`), цепочек `KUBE-*` в iptables нет вообще — в этом случае
-скрипт выводит предупреждение и пропускает k8s-часть, логирование
-NodePort-трафика через этот механизм недоступно, остаётся только
-мониторинг хоста (`INPUT`). Посмотреть текущее состояние (что обнаружено
-и что уже заармлено) можно командой `/env` в боте или `sudo bash
-install.sh status`.
-
-#### Нужны ли для этого какие-то особые пакеты/права рядом с Docker?
-
-Нет, ничего сверх того, что у вас уже стоит вместе с Docker:
-
-- **Отдельный nftables-пакет не нужен и не запускается** — в варианте B мы
-  работаем только через команду `iptables` (её ставит сам Docker как
-  зависимость), `systemctl enable nftables` тут не при чём и может даже
-  конфликтовать, если параллельно поднимется отдельный демон nftables со
-  своим rulebase.
-- **conntrack/nat модули ядра** уже загружены и используются самим Docker
-  (для проброса портов), дополнительно включать их не нужно.
-- **Специальных capabilities/пакетов для скрипта не требуется** — `iptables`
-  и `-m limit` есть в стандартной поставке `iptables`/`iptables-nft`
-  практически на любом дистрибутиве с Docker.
-- Единственное, что важно соблюсти — **порядок запуска**: правило в
-  `DOCKER-USER`/`KUBE-*` можно поставить только после того, как Docker/kubelet
-  создали соответствующие цепочки, поэтому systemd-юнит явно объявляет
-  `After=docker.service` (и `After=kubelet.service`, если он есть). Если
-  применить скрипт раньше их старта — он просто не найдёт нужные цепочки и
-  пропустит этот шаг (сам скрипт это проверяет и не упадёт, но правило не
-  встанет, пока вы не перезапустите юнит уже после их старта).
-- Для самого бота/сервиса (не для правил) права нужны такие же, как без
-  Docker: либо root, либо членство в группе `systemd-journal` для чтения
-  `journalctl -k`.
+Чтобы `kernel_log`/`both` заработали, обязательно нужно применить
+`install-firewall-rules.sh` (см. раздел про Docker/Kubernetes выше — там же
+описано, как эти правила ставятся и на хост, а не только на контейнеры).
 
 ## Запуск как systemd-сервис
 
-Проще всего через `sudo bash install.sh` (пункты меню 4/5) — он сам
-скопирует нужный юнит, подставит пути и включит автозапуск. Вручную:
+Обычно делает `install.sh` сам (пункт установки/обновления). Вручную:
 
 ```bash
-# режим bot
-sudo cp skipa-watchdog-bot.service /etc/systemd/system/
-sudo nano /etc/systemd/system/skipa-watchdog-bot.service   # поправить путь ExecStart
+sudo cp skipa-watchdog.service /etc/systemd/system/
+sudo nano /etc/systemd/system/skipa-watchdog.service   # поправить путь ExecStart
 sudo systemctl daemon-reload
-sudo systemctl enable --now skipa-watchdog-bot
-sudo journalctl -u skipa-watchdog-bot -f
+sudo systemctl enable --now skipa-watchdog
+sudo journalctl -u skipa-watchdog -f
 
-# режим service (лёгкий, без Telegram) - можно параллельно с bot
-sudo cp skipa-watchdog-svc.service /etc/systemd/system/
-sudo nano /etc/systemd/system/skipa-watchdog-svc.service   # поправить путь ExecStart
+# + автоприменение правил iptables после каждой перезагрузки
+sudo cp skipa-watchdog-fw-rules.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now skipa-watchdog-svc
-sudo journalctl -u skipa-watchdog-svc -f
+sudo systemctl enable --now skipa-watchdog-fw-rules
 ```
 
 ## Структура проекта
 
 ```
 skipa_watchdog/
-├── main.py                          # точка входа бота, команды, оркестрация job'ов
-├── watchdog_service.py              # точка входа "лёгкого" service-режима (без Telegram)
-├── install.sh                       # установщик/менеджер: меню + неинтерактивные команды
-├── config.example.yaml              # шаблон конфига бота
-├── config.yaml                      # ваш конфиг бота
-├── service.example.yaml             # шаблон конфига service-режима
-├── service.yaml                     # ваш конфиг service-режима
-├── requirements.txt                 # зависимости бота (с python-telegram-bot)
-├── requirements-service.txt         # зависимости service-режима (без python-telegram-bot)
-├── VERSION                          # версия проекта (читается /status и install.sh)
-├── install-logging-rules.sh         # ставит iptables-правила логирования (INPUT + DOCKER-USER + KUBE-*)
-├── skipa-watchdog-fw-rules.service  # systemd-юнит: применяет правила после старта Docker
-├── skipa-watchdog-bot.service       # systemd-юнит: бот (main.py)
-├── skipa-watchdog-svc.service       # systemd-юнит: сервис (watchdog_service.py)
+├── watchdog.py                      # единая точка входа: мониторинг + блокировка + (опц.) Telegram
+├── install.sh                       # установщик/менеджер: первый запуск = установка, дальше - меню
+├── config.example.yaml              # шаблон конфига
+├── config.yaml                      # ваш конфиг
+├── requirements.txt                 # все зависимости (включая python-telegram-bot)
+├── VERSION                          # версия проекта (читается меню install.sh)
+├── install-firewall-rules.sh        # ставит SKIPA-BLOCK + переходы + CONN-логирование (INPUT/DOCKER-USER/KUBE-*)
+├── skipa-watchdog-fw-rules.service  # systemd-юнит: применяет правила после старта Docker/kubelet
+├── skipa-watchdog.service           # systemd-юнит: сам watchdog.py
 ├── bot/
-│   ├── config.py            # загрузка config.yaml/service.yaml
-│   ├── ip_lists.py          # скачивание/кэш/обновление базы IP (cidr + range + blacklist)
-│   ├── env_detect.py        # определение Docker/Kubernetes, состояние правил логирования
-│   ├── enrich.py            # ipinfo.io + RIPEstat + ipregistry.co
-│   ├── formatter.py         # сборка текста алерта в нужном стиле
-│   ├── monitor.py           # мониторинг: psutil и/или чтение kernel-лога
-│   └── fallback.py          # audit-лог + очередь на повтор при недоступности Telegram
-├── data/                             # (режим bot) создаётся автоматически
-│   ├── ip_cache.json            # локальный кэш базы
-│   ├── alerts.log                # audit-журнал всех обнаружений
-│   └── pending_telegram.jsonl    # очередь неотправленных алертов
-└── /var/log/skipa_watchdog/          # (режим service) создаётся автоматически
-    ├── skipa-watchdog-svc.log        # общий лог процесса
-    └── detections.log                 # audit-журнал всех обнаружений (аналог alerts.log)
+│   ├── config.py             # загрузка config.yaml
+│   ├── ip_lists.py           # скачивание/кэш/обновление базы IP (list1/list2/merged), проверка новых версий
+│   ├── blocker.py            # блокировка через iptables (цепочка SKIPA-BLOCK), персистентность блокировок
+│   ├── env_detect.py         # определение Docker/Kubernetes, статус правил логирования/блокировки
+│   ├── telegram_layer.py     # необязательный слой Telegram: команды, инлайн-меню, отправка уведомлений
+│   ├── enrich.py              # ipinfo.io + RIPEstat + ipregistry.co
+│   ├── formatter.py          # сборка текста алерта в нужном стиле
+│   ├── monitor.py            # мониторинг: psutil и/или чтение kernel-лога
+│   └── fallback.py           # audit-лог + очередь на повтор при недоступности Telegram
+├── data/                              # создаётся автоматически (внутреннее состояние)
+│   ├── ip_cache.json               # локальный кэш базы IP
+│   ├── list_versions.json           # хэши листов для проверки новых версий
+│   ├── blocked_ips.json             # список заблокированных IP (для восстановления после reboot)
+│   └── pending_telegram.jsonl        # очередь неотправленных алертов
+└── /var/log/skipa_watchdog/          # создаётся автоматически (логи для администратора)
+    ├── skipa-watchdog.log              # общий лог процесса
+    └── detections.log                   # audit-журнал всех обнаружений
 ```
-

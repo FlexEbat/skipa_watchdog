@@ -1,0 +1,25 @@
+[Unit]
+Description=Skipa Watchdog - monitors, blocks and (optionally) notifies via Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Ставится/обновляется install.sh; поправьте путь, если разместили проект вручную
+WorkingDirectory=/opt/skipa_watchdog
+ExecStart=/opt/skipa_watchdog/venv/bin/python /opt/skipa_watchdog/watchdog.py /opt/skipa_watchdog/config.yaml
+Restart=always
+RestartSec=10
+
+# Нужны права на чтение чужих сокетов в /proc/net, запись в /var/log/skipa_watchdog
+# и управление iptables (блокировка) - см. README. Если не хотите запускать от root,
+# раскомментируйте капабилити ниже и убедитесь, что пользователь/группа владеют
+# /var/log/skipa_watchdog (для CAP_NET_ADMIN, нужного iptables, обычно всё равно
+# нужен root или как минимум CAP_NET_ADMIN+CAP_NET_RAW).
+# User=skipa
+# Group=skipa
+# AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+# CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

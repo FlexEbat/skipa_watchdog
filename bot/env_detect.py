@@ -4,7 +4,7 @@
 Используется двумя местами:
 - install.sh при каждом запуске - чтобы предложить поставить правила
   логирования не только на INPUT (хост), но и на DOCKER-USER / KUBE-*
-  цепочки (см. install-logging-rules.sh).
+  цепочки (см. install-firewall-rules.sh).
 - ботом (команда /env) - чтобы показать администратору то же самое,
   не заходя на сервер по SSH.
 
@@ -162,6 +162,7 @@ class EnvironmentSummary:
     k8s_services: list[dict] = field(default_factory=list)
     chains_present: list[str] = field(default_factory=list)
     chains_armed: list[str] = field(default_factory=list)
+    chains_block_wired: list[str] = field(default_factory=list)
 
     def any_container_platform(self) -> bool:
         return self.docker or self.kubernetes
@@ -172,12 +173,22 @@ class EnvironmentSummary:
         relevant = {c for c in self.chains_present if c in INTERESTING_CHAINS}
         return bool(relevant - set(self.chains_armed))
 
+    def needs_extra_block_rules(self) -> bool:
+        """Есть релевантная цепочка без перехода в SKIPA-BLOCK - блокировка
+        для неё реально не работает."""
+        relevant = {c for c in self.chains_present if c in INTERESTING_CHAINS}
+        return bool(relevant - set(self.chains_block_wired))
+
 
 def _chain_has_conn_log_rule(chain: str, log_prefix: str = "CONN: ") -> bool:
     out = _run(["iptables", "-S", chain])
     if not out:
         return False
     return f'--log-prefix "{log_prefix}"' in out or f"--log-prefix {log_prefix}" in out
+
+
+def _chain_has_block_jump(chain: str) -> bool:
+    return _run(["iptables", "-C", chain, "-j", "SKIPA-BLOCK"]) is not None
 
 
 def summarize_environment(log_prefix: str = "CONN: ") -> EnvironmentSummary:
@@ -191,6 +202,9 @@ def summarize_environment(log_prefix: str = "CONN: ") -> EnvironmentSummary:
         summary.chains_present = [c for c in INTERESTING_CHAINS if c in present_chains]
         summary.chains_armed = [
             c for c in summary.chains_present if _chain_has_conn_log_rule(c, log_prefix)
+        ]
+        summary.chains_block_wired = [
+            c for c in summary.chains_present if _chain_has_block_jump(c)
         ]
 
     if summary.docker:
@@ -220,17 +234,19 @@ def format_summary_text(summary: EnvironmentSummary) -> str:
         lines.append(f"Найдены цепочки: {', '.join(summary.chains_present)}")
     if summary.chains_armed:
         lines.append(f"Логирование CONN уже стоит в: {', '.join(summary.chains_armed)}")
+    if summary.chains_block_wired:
+        lines.append(f"Блокировка (SKIPA-BLOCK) подключена к: {', '.join(summary.chains_block_wired)}")
 
-    if summary.needs_extra_logging_rules():
+    if summary.needs_extra_logging_rules() or summary.needs_extra_block_rules():
         lines.append(
-            "⚠️ Есть цепочки без логирования сканов - рекомендуется прогнать "
-            "install-logging-rules.sh (или пункт меню install.sh) ещё раз."
+            "⚠️ Есть цепочки без логирования и/или блокировки сканов - рекомендуется "
+            "прогнать install-firewall-rules.sh (или пункт меню install.sh) ещё раз."
         )
     elif summary.kube_proxy_mode == "ipvs":
         lines.append(
             "ℹ️ kube-proxy работает в режиме ipvs: NodePort-трафик не проходит через "
-            "iptables-цепочки KUBE-*, поэтому автоматическое логирование для него "
-            "недоступно - опирайтесь на мониторинг хоста (INPUT)."
+            "iptables-цепочки KUBE-*, поэтому автоматическое логирование/блокировка для "
+            "него недоступны - опирайтесь на мониторинг и блокировку хоста (INPUT)."
         )
 
     return "\n".join(lines)

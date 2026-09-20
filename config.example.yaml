@@ -50,8 +50,12 @@ action:
 
 monitoring:
   # "poll" (периодический опрос /proc/net/tcp, без доп. зависимостей) /
-  # "kernel_log" (чтение "CONN: " из dmesg/journalctl -k) / "both"
-  method: "poll"
+  # "kernel_log" (чтение "CONN: " из dmesg/journalctl -k) / "both" (оба сразу,
+  # рекомендуется и стоит по умолчанию - "kernel_log" ловит даже одиночный
+  # SYN, который сразу же оборвался, "poll" подстраховывает, если LOG-правило
+  # почему-то не встало). Работает из коробки: install.sh всегда ставит
+  # LOG-правило при установке (см. install-firewall-rules.sh).
+  method: "both"
   kernel_log_prefix: "CONN: "
   kernel_log_command: []
   poll_interval_seconds: 5

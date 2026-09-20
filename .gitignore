@@ -1,1 +1,6 @@
-skipa_watchdog-updated.zip
+config.yaml
+data/
+venv/
+__pycache__/
+*.pyc
+.min-readme

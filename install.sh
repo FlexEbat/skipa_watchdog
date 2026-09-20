@@ -90,41 +90,21 @@ firewall_rules_applied() {
     iptables -L SKIPA-BLOCK -n >/dev/null 2>&1
 }
 
-# При каждом запуске install.sh: смотрим на систему и, если есть
-# Docker/K8s без наших правил - предлагаем это исправить.
-env_check_and_offer() {
+# Ставится один раз, сразу после первой установки: без этого шага защита
+# (блокировка/логирование сканов) физически не работает - именно здесь
+# правило -j SKIPA-BLOCK встаёт в INPUT, DOCKER-USER, KUBE-*. Всегда
+# выполняется безусловно (не только когда обнаружен Docker/K8s), потому что
+# защита хоста (INPUT) нужна в любом случае - Docker/K8s лишь расширяют её.
+setup_firewall_after_install() {
     local has_docker=0 has_k8s=0
     detect_docker && has_docker=1
     detect_k8s && has_k8s=1
 
-    if [ "$has_docker" -eq 0 ] && [ "$has_k8s" -eq 0 ]; then
-        return 0
-    fi
-
     echo
-    info "Анализ системы:"
-    [ "$has_docker" -eq 1 ] && echo "   🐳 Обнаружен Docker"
-    [ "$has_k8s" -eq 1 ] && echo "   ☸️  Обнаружен Kubernetes (kubelet/kubectl)"
-
-    local default_yes=1
-    if firewall_rules_applied; then
-        ok "Правила логирования/блокировки уже стоят (цепочка SKIPA-BLOCK найдена)."
-        echo "   Хотите проверить/дополнить их для Docker/K8s-цепочек ещё раз? [y/N]"
-        default_yes=0
-    else
-        warn "По умолчанию мониторится и блокируется только хост (INPUT). Трафик на порты," \
-             "опубликованные через Docker/Kubernetes, идёт другими цепочками и" \
-             "сейчас НЕ покрыт."
-        echo "   Настроить логирование и блокировку также для Docker/K8s сейчас? [Y/n]"
-    fi
-    read -rp "> " answer
-    if [ -z "$answer" ]; then
-        [ "$default_yes" -eq 1 ] && answer="y" || answer="n"
-    fi
-    case "$answer" in
-        [Yy]*) apply_firewall_rules ;;
-        *) info "Пропускаю (можно сделать позже из меню)." ;;
-    esac
+    info "Настраиваю логирование и блокировку (цепочка SKIPA-BLOCK -> INPUT)..."
+    [ "$has_docker" -eq 1 ] && echo "   🐳 Обнаружен Docker - подключаю также DOCKER-USER"
+    [ "$has_k8s" -eq 1 ] && echo "   ☸️  Обнаружен Kubernetes - подключаю также KUBE-*"
+    apply_firewall_rules
 }
 
 apply_firewall_rules() {
@@ -720,11 +700,12 @@ first_run_flow() {
     a="${a:-y}"
     if [[ "$a" =~ ^[Yy] ]]; then
         if do_install; then
-            # Docker/Kubernetes проверяются и донастраиваются только один раз,
-            # при первичной установке. Дальше это можно повторить вручную из
-            # меню (пункт "Docker/Kubernetes"), само по себе больше не
-            # спрашивается при каждом запуске.
-            env_check_and_offer
+            # Firewall-правила (INPUT -> SKIPA-BLOCK, + DOCKER-USER/KUBE-* если
+            # есть) ставятся один раз, сразу после первой установки - без этого
+            # блокировка физически не работает. Дальше можно повторить вручную
+            # из меню (пункт "Docker/Kubernetes"), при обычных запусках это
+            # больше не всплывает само.
+            setup_firewall_after_install
             check_list_updates
         fi
     else

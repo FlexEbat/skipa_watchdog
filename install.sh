@@ -199,15 +199,15 @@ EOF
 }
 
 _try_install_venv_pkg() {
-    command -v apt-get >/dev/null 2>&1 || return 1
-    info "Пробую автоматически поставить python3-venv через apt..."
-    apt-get update -qq >/dev/null 2>&1
-    apt-get install -y python3-venv >/tmp/skipa_apt_venv.log 2>&1
     local pyver
     pyver="$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null)"
-    if [ -n "$pyver" ]; then
-        apt-get install -y "python${pyver}-venv" >>/tmp/skipa_apt_venv.log 2>&1
-    fi
+    info "Пробую автоматически поставить пакет для venv..."
+    # На большинстве дистрибутивов (dnf/yum/apk/zypper/pacman) venv уже входит
+    # в сам пакет python3 - проблема почти всегда специфична для Debian/Ubuntu,
+    # где apt разносит его в отдельный пакет python3-venv / python3.NN-venv.
+    _pkg_install python3-venv >/dev/null 2>&1
+    [ -n "$pyver" ] && _pkg_install "python${pyver}-venv" >/dev/null 2>&1
+    return 0
 }
 
 ensure_venv() {
@@ -258,10 +258,73 @@ install_telegram_deps() {
     ok "python-telegram-bot установлен."
 }
 
+# ---------------------------------------------------------------------------
+# Автоустановка системных пакетов (git, python3, python3-venv), если их нет.
+# Работает на apt/dnf/yum/apk/zypper/pacman - чего нет, то просто пропускаем.
+# ---------------------------------------------------------------------------
+_detect_pkg_manager() {
+    command -v apt-get >/dev/null 2>&1 && { echo "apt"; return; }
+    command -v dnf >/dev/null 2>&1 && { echo "dnf"; return; }
+    command -v yum >/dev/null 2>&1 && { echo "yum"; return; }
+    command -v apk >/dev/null 2>&1 && { echo "apk"; return; }
+    command -v zypper >/dev/null 2>&1 && { echo "zypper"; return; }
+    command -v pacman >/dev/null 2>&1 && { echo "pacman"; return; }
+    echo ""
+}
+
+_pkg_install() {
+    local mgr log
+    mgr="$(_detect_pkg_manager)"
+    log="$(mktemp)"
+    case "$mgr" in
+        apt)    apt-get update -qq >"$log" 2>&1; apt-get install -y "$@" >>"$log" 2>&1 ;;
+        dnf)    dnf install -y "$@" >"$log" 2>&1 ;;
+        yum)    yum install -y "$@" >"$log" 2>&1 ;;
+        apk)    apk add --no-cache "$@" >"$log" 2>&1 ;;
+        zypper) zypper --non-interactive install "$@" >"$log" 2>&1 ;;
+        pacman) pacman -Sy --noconfirm "$@" >"$log" 2>&1 ;;
+        *) rm -f "$log"; return 1 ;;
+    esac
+    local rc=$?
+    rm -f "$log"
+    return $rc
+}
+
+# ensure_command <команда> <кандидат-пакета> [ещё кандидаты...]
+# Если команда уже есть - молча выходит. Если нет - определяет пакетный
+# менеджер и пробует поставить по очереди каждый кандидат (имена пакетов
+# отличаются между дистрибутивами, например python3 vs python), пока
+# команда не появится.
+ensure_command() {
+    local cmd="$1"
+    shift
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+
+    local mgr
+    mgr="$(_detect_pkg_manager)"
+    if [ -z "$mgr" ]; then
+        warn "Не нашёл известный пакетный менеджер (apt/dnf/yum/apk/zypper/pacman) -" \
+             "поставьте '$cmd' вручную."
+        return 1
+    fi
+
+    info "Команда '$cmd' не найдена - пробую поставить автоматически (через $mgr)..."
+    local pkg
+    for pkg in "$@"; do
+        if _pkg_install "$pkg" && command -v "$cmd" >/dev/null 2>&1; then
+            ok "'$cmd' установлен (пакет $pkg)."
+            return 0
+        fi
+    done
+    return 1
+}
+
 do_install() {
     require_root
-    command -v git >/dev/null 2>&1 || { err "Нужен git"; return 1; }
-    command -v python3 >/dev/null 2>&1 || { err "Нужен python3"; return 1; }
+    ensure_command git git \
+        || { err "Нужен git, не удалось поставить автоматически - поставьте вручную и повторите."; return 1; }
+    ensure_command python3 python3 python3.12 python3.11 python3.10 python \
+        || { err "Нужен python3, не удалось поставить автоматически - поставьте вручную и повторите."; return 1; }
 
     ensure_repo
     [ -f "$INSTALL_DIR/requirements.txt" ] || { err "requirements.txt не найден в $INSTALL_DIR - установка прервана."; return 1; }

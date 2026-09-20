@@ -72,11 +72,28 @@ Proxy ❌ | Abuser ❌ | Server ✅
 только описание и предложение установить (без меню — устанавливать пока
 нечего):
 
+Самый простой способ — без git, вообще без предварительных требований:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/FlexEbat/skipa_watchdog/main/install.sh -o install.sh
+sudo bash install.sh
+```
+
+Либо, если предпочитаете иметь у себя локально весь репозиторий:
+
 ```bash
 git clone https://github.com/FlexEbat/skipa_watchdog.git
 cd skipa_watchdog
 sudo bash install.sh
 ```
+
+Из системных требований нужен только `git` — и то не обязательно: если его
+нет, `install.sh` сам определит пакетный менеджер (apt/dnf/yum/apk/zypper/
+pacman) и поставит `git`, `python3` и `python3-venv` автоматически, если
+чего-то из этого не хватает (актуально именно для второго способа — первый,
+через `curl`, изначально ничего из этого не требует, git понадобится ему
+самому только чтобы склонировать код проекта в `/opt/skipa_watchdog`, и он
+поставит его сам на этом шаге). Ручная установка зависимостей не нужна.
 
 Установщик клонирует актуальную версию в `/opt/skipa_watchdog`, создаёт
 `config.yaml` из шаблона и спрашивает, как ставить:

@@ -21,6 +21,10 @@ CLI_LINK="/usr/local/bin/skipa-watchdog"
 
 UNIT="skipa-watchdog"
 FW_UNIT="skipa-watchdog-fw-rules"
+# Содержит "service" (только stdlib+PyYAML, системный python3, без venv) или
+# "bot" (создан venv под python-telegram-bot) - определяет, каким python
+# запускать watchdog.py и нужно ли что-то ставить через pip при обновлении.
+INSTALL_MODE_FILE="$INSTALL_DIR/.install_mode"
 
 INSTALLER_VERSION="3.0.0"
 
@@ -198,6 +202,53 @@ EOF
     chmod +x "$CLI_LINK"
 }
 
+# "Только сервис" (без Telegram) обходится stdlib + PyYAML - ставить ради
+# этого venv/pip не обязательно, достаточно системного python3-пакета
+# PyYAML. venv нужен только под python-telegram-bot (см. install_telegram_deps).
+_ensure_system_pyyaml() {
+    python3 -c "import yaml" >/dev/null 2>&1 && return 0
+    local mgr
+    mgr="$(_detect_pkg_manager)"
+    if [ -z "$mgr" ]; then
+        warn "Не нашёл пакетный менеджер - поставьте модуль PyYAML для system python3 вручную."
+        return 1
+    fi
+    info "Ставлю PyYAML для системного python3 (без venv)..."
+    local pkg
+    # имя пакета отличается между дистрибутивами - пробуем по очереди
+    for pkg in python3-yaml python3-pyyaml python3-PyYAML py3-yaml python-yaml; do
+        _pkg_install "$pkg" >/dev/null 2>&1
+        if python3 -c "import yaml" >/dev/null 2>&1; then
+            ok "PyYAML доступен (пакет $pkg)."
+            return 0
+        fi
+    done
+    err "Не удалось поставить PyYAML для системного python3."
+    return 1
+}
+
+# Определяет, каким python запускать watchdog.py: venv, если он есть
+# (режим "сервис + бот"), иначе системный python3 (режим "только сервис").
+_python_bin() {
+    if [ -x "$INSTALL_DIR/venv/bin/python" ]; then
+        echo "$INSTALL_DIR/venv/bin/python"
+    else
+        command -v python3
+    fi
+}
+
+# Переписывает ExecStart в уже установленном systemd-юните на нужный python
+# (вызывается и при первой установке, и когда сервис-режим апгрейдится до
+# бота из меню - см. install_telegram_deps).
+_write_unit_exec_start() {
+    [ -f "$SYSTEMD_DIR/${UNIT}.service" ] || return 0
+    local python_bin
+    python_bin="$(_python_bin)"
+    sed -i "s#^ExecStart=.*#ExecStart=$python_bin $INSTALL_DIR/watchdog.py $INSTALL_DIR/config.yaml#" \
+        "$SYSTEMD_DIR/${UNIT}.service"
+    systemctl daemon-reload 2>/dev/null
+}
+
 _try_install_venv_pkg() {
     local pyver
     pyver="$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null)"
@@ -245,8 +296,14 @@ ensure_venv() {
 
 install_telegram_deps() {
     if [ ! -x "$INSTALL_DIR/venv/bin/pip" ]; then
-        err "venv не найден - сначала выполните установку."
-        return 1
+        info "Для Telegram нужен отдельный venv (python-telegram-bot надёжно ставится" \
+             "только через pip) - создаю и переношу туда базовые зависимости..."
+        ensure_venv || return 1
+        "$INSTALL_DIR/venv/bin/pip" install -q --upgrade pip
+        "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt" \
+            || { err "Не удалось поставить базовые зависимости в новый venv."; return 1; }
+        _write_unit_exec_start
+        echo "bot" > "$INSTALL_MODE_FILE"
     fi
     if "$INSTALL_DIR/venv/bin/python" -c "import telegram" >/dev/null 2>&1; then
         return 0
@@ -330,16 +387,6 @@ do_install() {
     [ -f "$INSTALL_DIR/requirements.txt" ] || { err "requirements.txt не найден в $INSTALL_DIR - установка прервана."; return 1; }
     mkdir -p "$LOG_DIR"
 
-    info "Создаю venv и ставлю базовые зависимости (мониторинг, блокировка, локальный лог)..."
-    ensure_venv || return 1
-    "$INSTALL_DIR/venv/bin/pip" install -q --upgrade pip
-    "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt" \
-        || { err "Не удалось поставить зависимости из requirements.txt."; return 1; }
-    # На старых установках могли остаться aiohttp/psutil (использовались до
-    # перехода на stdlib-only реализацию) - тихо подчищаем, если код их уже
-    # не использует, ради минимального веса установки.
-    "$INSTALL_DIR/venv/bin/pip" uninstall -y aiohttp psutil >/dev/null 2>&1 || true
-
     local want_telegram=""
     if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
         cp "$INSTALL_DIR/config.example.yaml" "$INSTALL_DIR/config.yaml" \
@@ -348,32 +395,50 @@ do_install() {
         echo
         echo "Как установить?"
         echo "  1) Только сервис - мониторинг + блокировка через iptables, всё пишется"
-        echo "     локально в $LOG_DIR. Ничего лишнего не ставится."
+        echo "     локально в $LOG_DIR. Системный python3 + PyYAML, без venv/pip -"
+        echo "     минимальный след на диске."
         echo "  2) Сервис + Telegram-бот - то же самое, и дополнительно уведомления и"
-        echo "     команды/меню в чате (ставится доп. пакет python-telegram-bot)."
+        echo "     команды/меню в чате (под python-telegram-bot ставится venv)."
         read -rp "> [1] " install_choice
         install_choice="${install_choice:-1}"
         [ "$install_choice" = "2" ] && want_telegram="y"
-    else
+    elif [ -f "$INSTALL_MODE_FILE" ]; then
         info "config.yaml уже существует, не трогаю."
-        if ! grep -q '^\s*bot_token: ""' "$INSTALL_DIR/config.yaml" 2>/dev/null; then
-            want_telegram="y"  # telegram уже настроен раньше - пакет должен быть на месте
-        fi
+        [ "$(cat "$INSTALL_MODE_FILE")" = "bot" ] && want_telegram="y"
+    else
+        # Установка ещё до появления .install_mode - определяем режим по факту
+        # наличия venv, чтобы не переспрашивать и не ломать то, что уже стоит.
+        info "config.yaml уже существует, не трогаю."
+        [ -x "$INSTALL_DIR/venv/bin/python" ] && want_telegram="y"
     fi
 
     if [[ "$want_telegram" =~ ^[Yy] ]]; then
+        info "Ставлю venv и полный набор зависимостей (включая python-telegram-bot)..."
+        ensure_venv || return 1
+        "$INSTALL_DIR/venv/bin/pip" install -q --upgrade pip
+        "$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt" \
+            || { err "Не удалось поставить зависимости из requirements.txt."; return 1; }
+        # На старых установках могли остаться aiohttp/psutil (использовались до
+        # перехода на stdlib-only реализацию) - тихо подчищаем.
+        "$INSTALL_DIR/venv/bin/pip" uninstall -y aiohttp psutil >/dev/null 2>&1 || true
         install_telegram_deps || return 1
+        echo "bot" > "$INSTALL_MODE_FILE"
         if grep -q '^\s*bot_token: ""' "$INSTALL_DIR/config.yaml" 2>/dev/null; then
             configure_telegram
         fi
     else
-        info "Ставлю только сервис (без python-telegram-bot). Подключить Telegram можно" \
-             "в любой момент из меню (пункт 4), тогда пакет доустановится сам."
+        info "Ставлю только сервис: без venv, системный python3 + PyYAML..."
+        _ensure_system_pyyaml || return 1
+        echo "service" > "$INSTALL_MODE_FILE"
+        info "Готово - без python-telegram-bot, минимальный след на диске. Подключить" \
+             "Telegram можно в любой момент из меню (пункт 4), тогда сам создастся" \
+             "отдельный venv под него."
     fi
 
     [ -f "$INSTALL_DIR/skipa-watchdog.service" ] || { err "skipa-watchdog.service не найден в репозитории."; return 1; }
     cp "$INSTALL_DIR/skipa-watchdog.service" "$SYSTEMD_DIR/${UNIT}.service"
     sed -i "s#/opt/skipa_watchdog#$INSTALL_DIR#g" "$SYSTEMD_DIR/${UNIT}.service"
+    _write_unit_exec_start
     systemctl daemon-reload || { err "systemctl daemon-reload не удался."; return 1; }
     systemctl enable "$UNIT" >/dev/null 2>&1
 
@@ -479,12 +544,6 @@ manage_service() {
 # ---------------------------------------------------------------------------
 # Настройки обнаружения: список IP / режим действия
 # ---------------------------------------------------------------------------
-_venv_python() {
-    if [ -x "$INSTALL_DIR/venv/bin/python" ]; then
-        echo "$INSTALL_DIR/venv/bin/python"
-    fi
-}
-
 _set_yaml_scalar() {
     # Обновляет "key: значение" внутри секции (простая эвристика через grep/sed,
     # без внешних yaml-парсеров - конфиг у нас плоский и предсказуемый).
@@ -622,10 +681,10 @@ telegram_menu() {
 # ---------------------------------------------------------------------------
 blocklist_menu() {
     local py
-    py="$(_venv_python)"
-    if [ -z "$py" ]; then
+    if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
         err "Сначала установите Skipa Watchdog."; pause; return
     fi
+    py="$(_python_bin)"
     echo
     echo "Заблокированные IP:"
     (cd "$INSTALL_DIR" && "$py" -c "
@@ -680,12 +739,12 @@ view_logs() {
 
 force_update_db() {
     local py
-    py="$(_venv_python)"
-    if [ -z "$py" ]; then
+    if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
         err "Skipa Watchdog не установлен - нечем обновлять базу."
         pause
         return
     fi
+    py="$(_python_bin)"
     info "Принудительно обновляю базу IP-адресов..."
     (cd "$INSTALL_DIR" && "$py" - <<'PYEOF'
 import asyncio

@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodic timer for skipa-watchdog-sync-lists (interval set in service.conf, UPDATE_INTERVAL_DAYS)
+
+[Timer]
+# Реальный интервал (в днях) задаётся UPDATE_INTERVAL_DAYS в service.conf,
+# но systemd-таймеры не умеют читать произвольные конфиги - install.sh при
+# установке подставляет сюда OnUnitActiveSec с нужным значением. Значение
+# ниже - запасное по умолчанию (раз в неделю), если install.sh почему-то
+# его не подставил.
+OnBootSec=10min
+OnUnitActiveSec=7d
+Persistent=true
+
+[Install]
+WantedBy=timers.target

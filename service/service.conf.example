@@ -1,0 +1,33 @@
+# Skipa Watchdog - конфиг для режима "только сервис" (чистый bash, без Python).
+# Скопируйте в service.conf - обычно это делает install.sh. Это обычный
+# bash-файл (source-ится напрямую), а не YAML - парсер тут не нужен.
+
+# Что делать при обнаружении:
+#   notify       - только писать в detections.log (ничего не блокируется)
+#   block        - только блокировать через ipset/iptables, без логирования
+#   block_notify - и то, и другое (рекомендуется, по умолчанию)
+ACTION_MODE="block_notify"
+
+# Основной список (CIDR) - CyberOK/Skipa, ГРЧЦ, НКЦКИ
+PRIMARY_LIST_URL="https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
+# Дополнительный список (смешанный формат: CIDR / диапазоны / одиночные IP).
+# Пусто - отключает источник.
+BLACKLIST_URL="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/37cde2b27a560c647d0e8eb9d274e3409082d3e7/blacklist.txt"
+
+# Какой список реально использовать: list1 (только основной) / list2 (только
+# доп.) / merged (оба вместе, без повторов)
+ACTIVE_LIST="merged"
+
+# Как часто обновлять ipset (раз в сколько дней запускается таймер)
+UPDATE_INTERVAL_DAYS=7
+
+LOG_DIR="/var/log/skipa_watchdog"
+
+# Префикс в логе ядра для LOG-правила iptables (используется notify-режимом)
+KERNEL_LOG_PREFIX="CONN: "
+
+# IP/CIDR через пробел, которые никогда не блокируются и не логируются
+# (свои IP, мониторинг и т.п.). Сопоставление точное построчное - если тут
+# указана сеть, а в списке сканеров она встречается под другой маской,
+# исключение может не сработать - при сомнениях указывайте /32.
+IGNORE_IPS=""

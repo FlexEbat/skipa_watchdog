@@ -1,0 +1,9 @@
+[Unit]
+Description=Skipa Watchdog (service mode) - sync scanner IP lists into ipset
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/skipa_watchdog
+ExecStart=/usr/bin/env bash /opt/skipa_watchdog/service/sync-lists.sh /opt/skipa_watchdog/service.conf

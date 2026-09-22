@@ -1,4 +1,5 @@
 config.yaml
+service.conf
 data/
 venv/
 __pycache__/

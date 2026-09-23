@@ -86,11 +86,24 @@ esac
 RAW_FILE="$(mktemp)"
 trap 'rm -f "$RAW_FILE"' EXIT
 
-if [ "$use_list1" = "1" ] && [ -n "${PRIMARY_LIST_URL:-}" ]; then
-    fetch "$PRIMARY_LIST_URL" | normalize_list >> "$RAW_FILE"
+# Оба источника скачиваются всегда, независимо от ACTIVE_LIST - чтобы данные
+# по обоим листам оставались свежими (и было с чем сравнивать при смене
+# активного списка), а не протухали, пока не выбраны. ACTIVE_LIST влияет
+# только на то, какие из скачанных записей реально попадают в ipset ниже.
+PRIMARY_NORMALIZED=""
+BLACKLIST_NORMALIZED=""
+if [ -n "${PRIMARY_LIST_URL:-}" ]; then
+    PRIMARY_NORMALIZED="$(fetch "$PRIMARY_LIST_URL" | normalize_list)"
 fi
-if [ "$use_list2" = "1" ] && [ -n "${BLACKLIST_URL:-}" ]; then
-    fetch "$BLACKLIST_URL" | normalize_list >> "$RAW_FILE"
+if [ -n "${BLACKLIST_URL:-}" ]; then
+    BLACKLIST_NORMALIZED="$(fetch "$BLACKLIST_URL" | normalize_list)"
+fi
+
+if [ "$use_list1" = "1" ] && [ -n "$PRIMARY_NORMALIZED" ]; then
+    printf '%s\n' "$PRIMARY_NORMALIZED" >> "$RAW_FILE"
+fi
+if [ "$use_list2" = "1" ] && [ -n "$BLACKLIST_NORMALIZED" ]; then
+    printf '%s\n' "$BLACKLIST_NORMALIZED" >> "$RAW_FILE"
 fi
 
 # Исключения (IGNORE_IPS) - точное построчное совпадение, см. комментарий в

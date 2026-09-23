@@ -176,7 +176,10 @@ async def fetch_threat_db(
 ) -> ThreatDB:
     """Тянет настроенные списки и собирает единую базу.
 
-    active_list управляет тем, какие источники реально используются:
+    Оба источника скачиваются ВСЕГДА, независимо от active_list - чтобы
+    данные по обоим листам оставались свежими (и не протухали, пока не
+    выбраны), и было с чем сравнивать при переключении. active_list влияет
+    только на то, какие из скачанных записей реально попадают в базу:
       - "list1"  - только primary_url (текущий/основной список)
       - "list2"  - только blacklist_url (доп. список)
       - "merged" - оба вместе, с удалением точных дублей (по умолчанию)
@@ -191,18 +194,18 @@ async def fetch_threat_db(
     use_list2 = active_list in ("list2", "merged")
 
     primary_text, blacklist_text = await asyncio.gather(
-        http_client.get_text(primary_url) if (use_list1 and primary_url) else _empty(),
-        http_client.get_text(blacklist_url) if (use_list2 and blacklist_url) else _empty(),
+        http_client.get_text(primary_url) if primary_url else _empty(),
+        http_client.get_text(blacklist_url) if blacklist_url else _empty(),
     )
 
-    networks = _parse_cidr_list(primary_text) if primary_text else []
+    networks = _parse_cidr_list(primary_text) if (primary_text and use_list1) else []
     ranges: list[IPRange] = []
 
     per_source = {}
-    if use_list1:
+    if use_list1 and primary_text:
         per_source[LABEL_PRIMARY] = len(networks)
 
-    if blacklist_text:
+    if blacklist_text and use_list2:
         bl_nets, bl_ranges = _parse_mixed_list(blacklist_text, blacklist_label)
         networks.extend(bl_nets)
         ranges.extend(bl_ranges)

@@ -426,10 +426,8 @@ do_install() {
         echo
         echo "Как установить?"
         echo "  1) Только сервис - мониторинг + блокировка на bash + iptables/ipset."
-        echo "     Python не используется вообще: ни для установки, ни для работы."
         echo "  2) Сервис + Telegram-бот - то же самое, и дополнительно уведомления и"
-        echo "     команды/меню в чате (единственное место в проекте, где нужен"
-        echo "     Python: venv + python-telegram-bot)."
+        echo "     команды/меню в чате (venv + python-telegram-bot)."
         read -rp "> [1] " install_choice
         install_choice="${install_choice:-1}"
         [ "$install_choice" = "2" ] && mode="bot" || mode="service"

@@ -248,6 +248,15 @@ EOF
     chmod +x "$CLI_LINK"
 }
 
+# Без этого detections.log/skipa-watchdog.log растут неограниченно - актуально
+# для обоих режимов (только один из них, python-бот, ротирует свой
+# skipa-watchdog.log сам изнутри, detections.log не ротирует никто).
+install_logrotate() {
+    [ -f "$INSTALL_DIR/skipa-watchdog.logrotate" ] || return 0
+    cp "$INSTALL_DIR/skipa-watchdog.logrotate" /etc/logrotate.d/skipa-watchdog 2>/dev/null \
+        && info "Настроена ротация логов (/etc/logrotate.d/skipa-watchdog)."
+}
+
 # Определяет, каким python запускать watchdog.py в режиме "bot" - там всегда
 # есть venv (создаётся при установке/подключении Telegram). Системный python3
 # как запасной вариант - защита на случай ручного вмешательства в установку.
@@ -474,6 +483,7 @@ _do_install_bot() {
     systemctl enable "$UNIT" >/dev/null 2>&1
 
     install_cli_link
+    install_logrotate
 
     systemctl restart "$UNIT" 2>/dev/null
     if systemctl is-active --quiet "$UNIT" 2>/dev/null; then
@@ -527,6 +537,7 @@ _do_install_service() {
     _sync_notify_service_state
 
     install_cli_link
+    install_logrotate
 
     ok "Skipa Watchdog (только сервис) установлен - без единой зависимости от Python."
     echo
@@ -591,6 +602,26 @@ health_check() {
         enabled="$(systemctl is-enabled "$UNIT" 2>/dev/null || echo disabled)"
         echo "   Юнит: $UNIT, active=$active, enabled=$enabled"
 
+        if [ -f "$INSTALL_DIR/data/ip_cache.json" ]; then
+            local py last_ts age_days interval
+            py="$(_python_bin)"
+            last_ts="$("$py" -c "
+import json
+print(int(json.load(open('$INSTALL_DIR/data/ip_cache.json')).get('last_update_ts', 0)))
+" 2>/dev/null)"
+            interval="$(grep -oP '(?<=update_interval_days: ).*' "$INSTALL_DIR/config.yaml" 2>/dev/null | tr -d ' ')"
+            interval="${interval:-7}"
+            if [ -n "$last_ts" ] && [ "$last_ts" != "0" ]; then
+                age_days=$(( ($(date +%s) - last_ts) / 86400 ))
+                if [ "$age_days" -gt $(( interval * 2 )) ]; then
+                    warn "База IP не обновлялась $age_days дн. (ожидалось раз в $interval дн.) -" \
+                         "проверьте: journalctl -u $UNIT"
+                else
+                    ok "База IP обновлялась $age_days дн. назад (ожидается раз в $interval дн.)."
+                fi
+            fi
+        fi
+
         if grep -q '^\s*bot_token: ""' "$INSTALL_DIR/config.yaml" 2>/dev/null; then
             info "Telegram не настроен - работает только локальный лог/блокировка (это нормально)."
         else
@@ -616,6 +647,26 @@ health_check() {
         local timer_active notify_active action_mode entries
         timer_active="$(systemctl is-active "${SYNC_UNIT}.timer" 2>/dev/null || echo inactive)"
         echo "   Таймер обновления списков ($SYNC_UNIT.timer): $timer_active"
+
+        # "active" у таймера значит только "запланирован", не "последний запуск
+        # успешен" - реальную свежесть смотрим по метке времени, которую
+        # sync-lists.sh пишет при каждом удачном обновлении.
+        if [ -f /var/lib/skipa_watchdog/last-sync ]; then
+            local last_sync now age_days interval
+            last_sync="$(cat /var/lib/skipa_watchdog/last-sync 2>/dev/null || echo 0)"
+            now="$(date +%s)"
+            age_days=$(( (now - last_sync) / 86400 ))
+            interval="$(_service_conf_get UPDATE_INTERVAL_DAYS)"
+            interval="${interval:-7}"
+            if [ "$age_days" -gt $(( interval * 2 )) ]; then
+                warn "Список не обновлялся $age_days дн. (ожидался раз в $interval дн.) -" \
+                     "проверьте сеть/таймер: journalctl -u $SYNC_UNIT"
+            else
+                ok "Список обновлялся $age_days дн. назад (ожидается раз в $interval дн.)."
+            fi
+        else
+            warn "Список ещё ни разу не обновлялся успешно - запустите пункт 7."
+        fi
 
         action_mode="$(_service_conf_get ACTION_MODE)"
         echo "   Режим действия: ${action_mode:-?}"

@@ -1,0 +1,13 @@
+# Ротация логов Skipa Watchdog - без этого detections.log и
+# skipa-watchdog.log растут неограниченно (актуально для обоих режимов:
+# "только сервис" и "сервис + бот" - оба пишут в одни и те же файлы).
+# Ставится install.sh в /etc/logrotate.d/skipa-watchdog.
+/var/log/skipa_watchdog/*.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

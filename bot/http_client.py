@@ -21,17 +21,28 @@ from typing import Any
 log = logging.getLogger("skipa_watchdog.http")
 
 DEFAULT_TIMEOUT = 15.0
+# Предохранитель: списки IP - это единицы мегабайт максимум. Всё, что больше,
+# скорее ошибка источника (или подмена) - не тянем такое в память.
+MAX_BYTES = 20 * 1024 * 1024
 USER_AGENT = "skipa-watchdog (+https://github.com/FlexEbat/skipa_watchdog)"
 
 
 def _get_bytes(url: str, timeout: float) -> bytes | None:
+    # urllib умеет file:// и ftp:// - разрешаем только http(s)
+    if not url.lower().startswith(("https://", "http://")):
+        log.warning("Пропускаю URL с неподдерживаемой схемой: %s", url)
+        return None
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (URLs пришли из конфига)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (схема проверена выше)
             if resp.status != 200:
                 log.debug("GET %s -> HTTP %s", url, resp.status)
                 return None
-            return resp.read()
+            data = resp.read(MAX_BYTES + 1)
+            if len(data) > MAX_BYTES:
+                log.warning("GET %s: ответ больше %d байт, отбрасываю", url, MAX_BYTES)
+                return None
+            return data
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
         log.debug("GET %s не удался: %s", url, e)
         return None

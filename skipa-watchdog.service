@@ -2,6 +2,9 @@
 Description=Skipa Watchdog - monitors, blocks and (optionally) notifies via Telegram
 After=network-online.target
 Wants=network-online.target
+# Если на хосте есть Docker - стартуем после него (чтобы DOCKER-USER уже
+# существовал); на серверах без Docker этот After ни на что не влияет.
+After=docker.service
 
 [Service]
 Type=simple
@@ -10,6 +13,24 @@ WorkingDirectory=/opt/skipa_watchdog
 ExecStart=/opt/skipa_watchdog/venv/bin/python /opt/skipa_watchdog/watchdog.py /opt/skipa_watchdog/config.yaml
 Restart=always
 RestartSec=10
+
+# --- Песочница ---------------------------------------------------------------
+# Процесс работает от root (нужен для iptables/ipset), поэтому ограничиваем всё
+# лишнее: файловая система только на чтение, кроме каталога установки (кэш,
+# очереди, список блокировок), логов и /run (xtables.lock). Если на вашей
+# системе из-за этого что-то не стартует - закомментируйте строки этого блока
+# и смотрите journalctl -u skipa-watchdog.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/skipa_watchdog /run
+LogsDirectory=skipa_watchdog
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
 
 # Нужны права на чтение чужих сокетов в /proc/net, запись в /var/log/skipa_watchdog
 # и управление iptables (блокировка) - см. README. Если не хотите запускать от root,

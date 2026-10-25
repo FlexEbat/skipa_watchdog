@@ -180,11 +180,19 @@ class EnvironmentSummary:
         return bool(relevant - set(self.chains_block_wired))
 
 
+def _has_log_prefix(out: str | None, log_prefix: str) -> bool:
+    return bool(out) and (f'--log-prefix "{log_prefix}"' in out or f"--log-prefix {log_prefix}" in out)
+
+
 def _chain_has_conn_log_rule(chain: str, log_prefix: str = "CONN: ") -> bool:
-    out = _run(["iptables", "-S", chain])
-    if not out:
-        return False
-    return f'--log-prefix "{log_prefix}"' in out or f"--log-prefix {log_prefix}" in out
+    """Логируется ли трафик этой цепочки: либо LOG стоит прямо в ней (общий LOG
+    всех SYN, iptables-only режим и старые установки), либо цепочка ведёт в
+    SKIPA-BLOCK, где LOG стоит для SYN от известных сканеров (режим с ipset)."""
+    if _has_log_prefix(_run(["iptables", "-S", chain]), log_prefix):
+        return True
+    if _chain_has_block_jump(chain):
+        return _has_log_prefix(_run(["iptables", "-S", "SKIPA-BLOCK"]), log_prefix)
+    return False
 
 
 def _chain_has_block_jump(chain: str) -> bool:

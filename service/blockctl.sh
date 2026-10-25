@@ -9,11 +9,41 @@ set -uo pipefail
 MANUAL_SET="skipa-manual"
 SCANNERS_SET="skipa-scanners"
 ERR_LOG="$(mktemp)"
+
+# Проверка цели: только IPv4/CIDR, не шире /16, не частная/служебная сеть.
+# Защита от `blockctl.sh block 0.0.0.0/0`, который отрезал бы и администратора.
+validate_target() {
+    local t="$1" ip mask
+    ip="${t%%/*}"
+    mask=32
+    [[ "$t" == */* ]] && mask="${t#*/}"
+    if ! [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        echo "Некорректный IPv4-адрес: $t" >&2; return 1
+    fi
+    local o
+    for o in "${BASH_REMATCH[@]:1}"; do
+        [ "$o" -le 255 ] || { echo "Некорректный IPv4-адрес: $t" >&2; return 1; }
+    done
+    if ! [[ "$mask" =~ ^[0-9]+$ ]] || [ "$mask" -gt 32 ] || [ "$mask" -lt 16 ]; then
+        echo "Маска должна быть от /16 до /32 (получено: $t)" >&2; return 1
+    fi
+    local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}"
+    if [ "$a" -eq 0 ] || [ "$a" -eq 10 ] || [ "$a" -eq 127 ] \
+        || { [ "$a" -eq 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ]; } \
+        || { [ "$a" -eq 192 ] && [ "$b" -eq 168 ]; } \
+        || { [ "$a" -eq 169 ] && [ "$b" -eq 254 ]; } || [ "$a" -ge 224 ]; then
+        echo "Служебный или частный адрес - не блокирую: $t" >&2; return 1
+    fi
+    if ipset test skipa-allow "$ip" >/dev/null 2>&1; then
+        echo "Адрес в allowlist (IGNORE_IPS) - не блокирую: $t" >&2; return 1
+    fi
+}
 trap 'rm -f "$ERR_LOG"' EXIT
 
 case "${1:-}" in
     block)
         [ -n "${2:-}" ] || { echo "Использование: $0 block <ip>" >&2; exit 1; }
+        validate_target "$2" || exit 1
         ipset create "$MANUAL_SET" hash:net maxelem 65536 -exist
         if ipset add "$MANUAL_SET" "$2" -exist 2>"$ERR_LOG"; then
             echo "OK"

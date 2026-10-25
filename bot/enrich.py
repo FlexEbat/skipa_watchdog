@@ -89,12 +89,12 @@ async def _fetch_ipregistry(ip: str, key: str) -> dict | None:
 async def enrich_ip(ip: str, ipinfo_token: str = "", ipregistry_key: str = "") -> EnrichedIP:
     result = EnrichedIP(ip=ip)
 
-    # ipinfo и ipregistry не зависят друг от друга - запускаем параллельно.
-    # RIPE whois идёт следом, а AS-overview - только после него (нужен ASN
-    # из ipinfo/whois), поэтому остаётся последовательным.
-    ipinfo_data, ipreg_data = await asyncio.gather(
+    # ipinfo, ipregistry и RIPE whois не зависят друг от друга - запускаем
+    # параллельно. AS-overview нужен ASN из ipinfo, поэтому идёт после.
+    ipinfo_data, ipreg_data, whois_data = await asyncio.gather(
         _fetch_ipinfo(ip, ipinfo_token),
         _fetch_ipregistry(ip, ipregistry_key),
+        _fetch_ripe_whois(ip),
     )
 
     if ipinfo_data:
@@ -111,7 +111,6 @@ async def enrich_ip(ip: str, ipinfo_token: str = "", ipregistry_key: str = "") -
     if ipreg_data:
         _parse_ipregistry(result, ipreg_data)
 
-    whois_data = await _fetch_ripe_whois(ip)
     if whois_data:
         _parse_ripe_whois(result, whois_data)
 

@@ -30,6 +30,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,37 @@ CACHE_FILE = Path(__file__).resolve().parent.parent / "data" / "ip_cache.json"
 CACHE_FORMAT_VERSION = 3  # поднимается при несовместимых изменениях формата кэша
 
 LABEL_PRIMARY = "skipa"
+
+# Предохранители от "отравленного" или битого списка (источники внешние, а
+# блокировка автоматическая): слишком широкая сеть вроде 0.0.0.0/0 заблокировала
+# бы всех, включая администратора. Такие записи отбрасываются при разборе.
+MIN_PREFIX_V4 = 16
+MIN_PREFIX_V6 = 32
+MAX_RANGE_SIZE = 1 << 20
+# Если источник внезапно "похудел" больше чем вдвое - считаем это сбоем
+# источника и оставляем предыдущую версию этого списка.
+SHRINK_GUARD_RATIO = 0.5
+# Если один из источников не скачался, база помечается degraded и обновление
+# повторяется не через update_interval_days, а через этот интервал.
+DEGRADED_RETRY_SECONDS = 3600
+
+
+def normalize_ip(ip_str: str):
+    """Разбирает IP и приводит IPv4-mapped IPv6 (::ffff:1.2.3.4, так их показывает
+    /proc/net/tcp6 для IPv4-клиентов на dual-stack сокетах) к обычному IPv4.
+    Возвращает объект адреса или None."""
+    try:
+        ip_obj = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return None
+    if ip_obj.version == 6 and ip_obj.ipv4_mapped is not None:
+        return ip_obj.ipv4_mapped
+    return ip_obj
+
+
+def network_is_acceptable(net) -> bool:
+    min_prefix = MIN_PREFIX_V4 if net.version == 4 else MIN_PREFIX_V6
+    return net.prefixlen >= min_prefix
 
 
 @dataclass
@@ -69,15 +101,17 @@ class ThreatDB:
     source_line_count: int = 0
     # сколько записей пришло из каждого источника, для /status
     per_source_counts: dict[str, int] = field(default_factory=dict)
+    # True, если при последнем обновлении не удалось получить один из
+    # активных источников (используется его предыдущая версия)
+    degraded: bool = False
 
     # ---------- матчинг ----------
 
     def match(self, ip_str: str) -> str | None:
         """Возвращает 'label: CIDR/диапазон' по которому сработало совпадение,
         либо None."""
-        try:
-            ip_obj = ipaddress.ip_address(ip_str)
-        except ValueError:
+        ip_obj = normalize_ip(ip_str)
+        if ip_obj is None:
             return None
 
         for entry in self.networks:
@@ -91,6 +125,25 @@ class ThreatDB:
 
         return None
 
+    def ipset_entries(self) -> list[str]:
+        """Все IPv4-записи базы в виде CIDR-строк (диапазоны раскладываются на
+        минимальный набор сетей) - для загрузки в ipset. Дубли убираются."""
+        out: dict[str, None] = {}
+        for e in self.networks:
+            if e.network.version == 4:
+                out[str(e.network)] = None
+        for r in self.ranges:
+            try:
+                first = ipaddress.ip_address(r.start)
+                last = ipaddress.ip_address(r.end)
+            except ValueError:
+                continue
+            if first.version != 4 or last.version != 4:
+                continue
+            for net in ipaddress.summarize_address_range(first, last):
+                out[str(net)] = None
+        return list(out)
+
     # ---------- (де)сериализация кэша ----------
 
     def to_json(self) -> dict:
@@ -101,6 +154,7 @@ class ThreatDB:
             "last_update_ts": self.last_update_ts,
             "source_line_count": self.source_line_count,
             "per_source_counts": self.per_source_counts,
+            "degraded": self.degraded,
         }
 
     @classmethod
@@ -117,6 +171,7 @@ class ThreatDB:
             last_update_ts=data.get("last_update_ts", 0.0),
             source_line_count=data.get("source_line_count", 0),
             per_source_counts=data.get("per_source_counts", {}),
+            degraded=bool(data.get("degraded", False)),
         )
 
 
@@ -132,6 +187,9 @@ def _parse_cidr_list(text: str, label: str = LABEL_PRIMARY) -> list[NetEntry]:
                 net = ipaddress.ip_network(line, strict=False)
             else:
                 net = ipaddress.ip_network(f"{line}/32", strict=False)
+            if not network_is_acceptable(net):
+                log.warning("Отбрасываю слишком широкую сеть из списка (%s): %s", label, line)
+                continue
             entries.append(NetEntry(net, label))
         except ValueError:
             log.warning("Не удалось распарсить строку из списка (%s): %r", label, line)
@@ -149,11 +207,19 @@ def _parse_mixed_list(text: str, label: str) -> tuple[list[NetEntry], list[IPRan
             continue
         try:
             if "/" in line:
-                nets.append(NetEntry(ipaddress.ip_network(line, strict=False), label))
+                net = ipaddress.ip_network(line, strict=False)
+                if not network_is_acceptable(net):
+                    log.warning("Отбрасываю слишком широкую сеть из доп. списка (%s): %s", label, line)
+                    continue
+                nets.append(NetEntry(net, label))
             elif "-" in line and line.count("-") == 1:
                 start_s, end_s = [p.strip() for p in line.split("-", 1)]
-                start = int(ipaddress.ip_address(start_s))
-                end = int(ipaddress.ip_address(end_s))
+                start_ip = ipaddress.ip_address(start_s)
+                end_ip = ipaddress.ip_address(end_s)
+                start, end = int(start_ip), int(end_ip)
+                if start_ip.version != 4 or end_ip.version != 4 or end < start or end - start + 1 > MAX_RANGE_SIZE:
+                    log.warning("Отбрасываю некорректный/слишком большой диапазон (%s): %r", label, line)
+                    continue
                 ranges.append(IPRange(start, end, line, label))
             else:
                 nets.append(NetEntry(ipaddress.ip_network(f"{line}/32", strict=False), label))
@@ -168,11 +234,21 @@ async def _empty() -> str:
     return ""
 
 
+def _previous_entries(previous: "ThreatDB | None", label: str):
+    if previous is None:
+        return [], []
+    return (
+        [e for e in previous.networks if e.label == label],
+        [r for r in previous.ranges if r.label == label],
+    )
+
+
 async def fetch_threat_db(
     primary_url: str,
     blacklist_url: str = "",
     blacklist_label: str = "blacklist",
     active_list: str = "merged",
+    previous: "ThreatDB | None" = None,
 ) -> ThreatDB:
     """Тянет настроенные списки и собирает единую базу.
 
@@ -185,7 +261,12 @@ async def fetch_threat_db(
       - "merged" - оба вместе, с удалением точных дублей (по умолчанию)
 
     Любой из URL может быть пустым - тогда соответствующий источник просто
-    пропускается."""
+    пропускается.
+
+    previous - прошлая версия базы. Если АКТИВНЫЙ источник не скачался (или
+    вернул подозрительно мало записей), берутся его записи из previous, а база
+    помечается degraded=True (обновление повторится скоро, а не через неделю).
+    Так временный сбой одного источника не стирает защиту."""
     if active_list not in ("list1", "list2", "merged"):
         log.warning("Неизвестный active_list=%r, использую 'merged'", active_list)
         active_list = "merged"
@@ -198,18 +279,59 @@ async def fetch_threat_db(
         http_client.get_text(blacklist_url) if blacklist_url else _empty(),
     )
 
-    networks = _parse_cidr_list(primary_text) if (primary_text and use_list1) else []
+    networks: list[NetEntry] = []
     ranges: list[IPRange] = []
+    per_source: dict[str, int] = {}
+    degraded = False
 
-    per_source = {}
-    if use_list1 and primary_text:
-        per_source[LABEL_PRIMARY] = len(networks)
+    def _guard(label: str, new_count: int) -> bool:
+        """True, если новое число записей выглядит нормально."""
+        old = (previous.per_source_counts.get(label, 0) if previous else 0)
+        if old and new_count < old * SHRINK_GUARD_RATIO:
+            log.warning(
+                "Источник %s вернул %d записей вместо ~%d - похоже на сбой, оставляю прошлую версию",
+                label, new_count, old,
+            )
+            return False
+        return True
 
-    if blacklist_text and use_list2:
-        bl_nets, bl_ranges = _parse_mixed_list(blacklist_text, blacklist_label)
-        networks.extend(bl_nets)
-        ranges.extend(bl_ranges)
-        per_source[blacklist_label] = len(bl_nets) + len(bl_ranges)
+    # ---- primary ----
+    if use_list1 and primary_url:
+        new_nets = _parse_cidr_list(primary_text) if primary_text else []
+        if new_nets and _guard(LABEL_PRIMARY, len(new_nets)):
+            networks.extend(new_nets)
+            per_source[LABEL_PRIMARY] = len(new_nets)
+        else:
+            old_nets, _ = _previous_entries(previous, LABEL_PRIMARY)
+            degraded = True
+            if old_nets:
+                log.warning("Основной список недоступен - использую прошлую версию (%d записей)", len(old_nets))
+                networks.extend(old_nets)
+                per_source[LABEL_PRIMARY] = len(old_nets)
+            else:
+                log.error("Основной список недоступен, прошлой версии нет")
+
+    # ---- blacklist ----
+    if use_list2 and blacklist_url:
+        bl_nets, bl_ranges = _parse_mixed_list(blacklist_text, blacklist_label) if blacklist_text else ([], [])
+        count = len(bl_nets) + len(bl_ranges)
+        if count and _guard(blacklist_label, count):
+            networks.extend(bl_nets)
+            ranges.extend(bl_ranges)
+            per_source[blacklist_label] = count
+        else:
+            old_nets, old_ranges = _previous_entries(previous, blacklist_label)
+            degraded = True
+            if old_nets or old_ranges:
+                log.warning(
+                    "Доп. список (%s) недоступен - использую прошлую версию (%d записей)",
+                    blacklist_label, len(old_nets) + len(old_ranges),
+                )
+                networks.extend(old_nets)
+                ranges.extend(old_ranges)
+                per_source[blacklist_label] = len(old_nets) + len(old_ranges)
+            else:
+                log.error("Доп. список (%s) недоступен, прошлой версии нет", blacklist_label)
 
     # "Объединить - без повторов": убираем точные дубли (одна и та же сеть/диапазон
     # встретилась в нескольких источниках). Оставляем первое вхождение, чтобы метка
@@ -227,15 +349,21 @@ async def fetch_threat_db(
         last_update_ts=time.time(),
         source_line_count=len(networks) + len(ranges),
         per_source_counts=per_source,
+        degraded=degraded,
     )
     log.info(
-        "Обновлена база угроз (active_list=%s): %d сетей/IP + %d диапазонов (по источникам: %s)",
+        "Обновлена база угроз (active_list=%s%s): %d сетей/IP + %d диапазонов (по источникам: %s)",
         active_list,
+        ", degraded" if degraded else "",
         len(networks),
         len(ranges),
         per_source,
     )
     return db
+
+
+def has_data(db: "ThreatDB | None") -> bool:
+    return db is not None and bool(db.networks or db.ranges)
 
 
 def _dedup_networks(entries: list[NetEntry]) -> list[NetEntry]:
@@ -267,16 +395,26 @@ def load_cache() -> ThreatDB | None:
         return None
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    """Запись через временный файл + rename: при сбое/отключении питания остаётся
+    либо старая, либо новая версия файла целиком, но не обрубок."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def save_cache(db: ThreatDB) -> None:
-    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CACHE_FILE.write_text(json.dumps(db.to_json(), ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(CACHE_FILE, json.dumps(db.to_json(), ensure_ascii=False, indent=2))
 
 
 def needs_update(db: ThreatDB | None, interval_days: int) -> bool:
     if db is None or (not db.networks and not db.ranges):
         return True
-    age_days = (time.time() - db.last_update_ts) / 86400
-    return age_days >= interval_days
+    age_seconds = time.time() - db.last_update_ts
+    if db.degraded and age_seconds >= DEGRADED_RETRY_SECONDS:
+        return True
+    return age_seconds / 86400 >= interval_days
 
 
 # ---------------------------------------------------------------------------
@@ -323,10 +461,7 @@ async def check_list_versions(
             changed[label] = True
 
     if new_state:
-        VERSION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         merged_state = {**old_state, **new_state}
-        VERSION_STATE_FILE.write_text(
-            json.dumps(merged_state, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        atomic_write_text(VERSION_STATE_FILE, json.dumps(merged_state, ensure_ascii=False, indent=2))
 
     return changed

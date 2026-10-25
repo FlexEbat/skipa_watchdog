@@ -14,8 +14,10 @@
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -26,6 +28,10 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 AUDIT_LOG = DATA_DIR / "alerts.log"
 PENDING_FILE = DATA_DIR / "pending_telegram.jsonl"
 
+# Очередь не должна расти бесконечно, если Telegram недоступен неделями
+MAX_PENDING = 500
+PENDING_TTL_SECONDS = 7 * 86400
+
 _TAG_RE = re.compile(r"<[^>]+>")
 _LINK_RE = re.compile(r'<a href="[^"]*">([^<]*)</a>')
 
@@ -33,7 +39,7 @@ _LINK_RE = re.compile(r'<a href="[^"]*">([^<]*)</a>')
 def _strip_html(text: str) -> str:
     """Грубая очистка HTML-разметки для читаемого текстового лога."""
     text = _LINK_RE.sub(r"\1", text)
-    return _TAG_RE.sub("", text)
+    return html.unescape(_TAG_RE.sub("", text))
 
 
 def append_audit_log(
@@ -52,10 +58,10 @@ def append_audit_log(
         log.error("Не удалось записать audit-лог %s: %s", target, e)
 
 
-def queue_pending_alert(chat_id: int, html_text: str) -> None:
+def queue_pending_alert(chat_id: int, html_text: str, ts: float | None = None) -> None:
     """Кладёт неотправленный алерт в очередь на диске для повторной отправки."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    record = {"ts": time.time(), "chat_id": chat_id, "text": html_text}
+    record = {"ts": ts if ts is not None else time.time(), "chat_id": chat_id, "text": html_text}
     try:
         with PENDING_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -82,12 +88,50 @@ def load_pending() -> list[dict]:
     return records
 
 
-def save_pending(records: list[dict]) -> None:
+def drain_pending() -> list[dict]:
+    """Забирает ВСЮ очередь и очищает файл за один синхронный шаг (без await
+    между чтением и очисткой). Раньше цикл делал load -> await отправки ->
+    save, и алерты, поставленные в очередь за время отправки, затирались.
+    Теперь неотправленное возвращается через queue_pending_alert()/requeue().
+    Просроченные (старше TTL) отбрасываются, лишние старые - тоже."""
+    records = load_pending()
+    if not records:
+        return []
+    try:
+        PENDING_FILE.unlink()
+    except OSError as e:
+        log.error("Не удалось очистить очередь %s: %s", PENDING_FILE, e)
+        return []
+    now = time.time()
+    fresh = [r for r in records if now - float(r.get("ts", now)) <= PENDING_TTL_SECONDS]
+    if len(fresh) > MAX_PENDING:
+        log.warning("Очередь алертов длиннее %d - отбрасываю самые старые", MAX_PENDING)
+        fresh = fresh[-MAX_PENDING:]
+    return fresh
+
+
+def requeue(records: list[dict]) -> None:
+    """Возвращает неотправленные записи в очередь (дописывает в конец файла)."""
+    if not records:
+        return
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        with PENDING_FILE.open("w", encoding="utf-8") as f:
+        with PENDING_FILE.open("a", encoding="utf-8") as f:
             for r in records:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    except Exception as e:  # noqa: BLE001
+        log.error("Не удалось вернуть алерты в очередь %s: %s", PENDING_FILE, e)
+
+
+def save_pending(records: list[dict]) -> None:
+    """Атомарная перезапись очереди (оставлено для совместимости)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        tmp = PENDING_FILE.with_name(PENDING_FILE.name + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        os.replace(tmp, PENDING_FILE)
     except Exception as e:  # noqa: BLE001
         log.error("Не удалось перезаписать очередь %s: %s", PENDING_FILE, e)
 

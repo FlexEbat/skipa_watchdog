@@ -31,7 +31,7 @@ import re
 import time
 from dataclasses import dataclass
 
-from .ip_lists import ThreatDB
+from .ip_lists import ThreatDB, normalize_ip
 
 log = logging.getLogger("skipa_watchdog.monitor")
 
@@ -41,9 +41,15 @@ log = logging.getLogger("skipa_watchdog.monitor")
 _SRC_RE = re.compile(r"SRC=(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
 _DPT_RE = re.compile(r"DPT=(\d+)")
 
-# /proc/net/tcp(6): столбец state, интересуют реально живые соединения.
-# 01=ESTABLISHED, 02=SYN_SENT, 03=SYN_RECV - соединение уже видно по remote-адресу.
-_LIVE_TCP_STATES = {"01", "02", "03"}
+# /proc/net/tcp(6): столбец state. Интересуют только ВХОДЯЩИЕ соединения:
+# 01=ESTABLISHED, 03=SYN_RECV (SYN_SENT=02 - это исходящее подключение самого
+# сервера, его раньше тоже считали "сканером", из-за чего можно было заблокировать
+# адрес, к которому ходит сам сервер). Входящее - то, у которого локальный порт
+# слушается нами (state 0A=LISTEN).
+_STATE_ESTABLISHED = "01"
+_STATE_SYN_RECV = "03"
+_STATE_LISTEN = "0A"
+_INBOUND_STATES = {_STATE_ESTABLISHED, _STATE_SYN_RECV}
 
 
 @dataclass
@@ -65,6 +71,8 @@ def _is_ignored(ip: str, ignore_networks) -> bool:
 class Deduper:
     """Общий антиспам-кулдаун на IP, разделяется между всеми методами мониторинга."""
 
+    _MAX_ENTRIES = 20000
+
     def __init__(self, cooldown_minutes: int):
         self._cooldown_seconds = cooldown_minutes * 60
         self._last_alert: dict[str, float] = {}
@@ -74,8 +82,36 @@ class Deduper:
         last = self._last_alert.get(ip, 0)
         if now - last < self._cooldown_seconds:
             return False
+        if len(self._last_alert) >= self._MAX_ENTRIES:
+            self._purge(now)
         self._last_alert[ip] = now
         return True
+
+    def penalize_retry(self, ip: str, retry_seconds: int = 60) -> None:
+        """Обработка IP не удалась (например, не получилось заблокировать) -
+        разрешаем повторную попытку через retry_seconds, а не через весь
+        кулдаун."""
+        self._last_alert[ip] = time.time() - self._cooldown_seconds + min(
+            retry_seconds, self._cooldown_seconds
+        )
+
+    def _purge(self, now: float) -> None:
+        self._last_alert = {
+            k: v for k, v in self._last_alert.items() if now - v < self._cooldown_seconds
+        }
+
+
+async def _dispatch(on_hit, dedup: Deduper, hit: "Hit") -> None:
+    """Вызывает on_hit так, чтобы сбой на одном IP не ломал обработку остальных.
+    on_hit возвращает False, если не удалось выполнить действие (блокировку) -
+    тогда повторная попытка разрешается через минуту."""
+    try:
+        result = await on_hit(hit)
+    except Exception as e:  # noqa: BLE001
+        log.exception("Ошибка при обработке %s: %s", hit.ip, e)
+        result = False
+    if result is False:
+        dedup.penalize_retry(hit.ip)
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +128,10 @@ def _hex_to_ip_port(hex_addr: str, ipv6: bool) -> tuple[str, int] | None:
         if ipv6:
             # 16 байт = 4 слова по 4 байта, каждое слово little-endian
             packed = b"".join(raw[i : i + 4][::-1] for i in range(0, 16, 4))
-            ip = ipaddress.IPv6Address(packed).compressed
+            addr6 = ipaddress.IPv6Address(packed)
+            # IPv4-клиент на dual-stack сокете выглядит как ::ffff:a.b.c.d -
+            # приводим к обычному IPv4, иначе он не совпадёт ни с одним CIDR базы
+            ip = addr6.ipv4_mapped.compressed if addr6.ipv4_mapped else addr6.compressed
         else:
             packed = raw[::-1]
             ip = ipaddress.IPv4Address(packed).compressed
@@ -101,33 +140,53 @@ def _hex_to_ip_port(hex_addr: str, ipv6: bool) -> tuple[str, int] | None:
         return None
 
 
-def _read_live_tcp_connections() -> list[tuple[str, int, int | None]]:
+def read_tcp_table() -> list[tuple[str, str, int, int]]:
     """Читает /proc/net/tcp и /proc/net/tcp6, возвращает список
-    (remote_ip, remote_port, local_port) для соединений с непустым удалённым
-    адресом. Не требует прав root - в отличие от опроса чужих сокетов через
-    psutil, /proc/net/tcp(6) и так виден любому процессу в том же network
-    namespace."""
-    results: list[tuple[str, int, int | None]] = []
+    (state_hex, remote_ip, remote_port, local_port). Не требует прав root -
+    /proc/net/tcp(6) виден любому процессу в том же network namespace."""
+    results: list[tuple[str, str, int, int]] = []
     for path, ipv6 in (("/proc/net/tcp", False), ("/proc/net/tcp6", True)):
         try:
             with open(path, encoding="ascii", errors="replace") as f:
                 next(f, None)  # пропускаем заголовок
                 for line in f:
                     parts = line.split()
-                    if len(parts) < 3:
+                    if len(parts) < 4:
                         continue
-                    if parts[3] not in _LIVE_TCP_STATES:
-                        continue
+                    state = parts[3]
                     remote = _hex_to_ip_port(parts[2], ipv6)
-                    if remote is None or remote[1] == 0:
-                        continue
                     local = _hex_to_ip_port(parts[1], ipv6)
-                    results.append((remote[0], remote[1], local[1] if local else None))
+                    if remote is None or local is None:
+                        continue
+                    results.append((state, remote[0], remote[1], local[1]))
         except FileNotFoundError:
             continue  # система без IPv6 (или без tcp вовсе) - не ошибка
         except OSError as e:
             log.debug("Не удалось прочитать %s: %s", path, e)
     return results
+
+
+def _inbound_connections(table=None) -> list[tuple[str, int, int | None]]:
+    """(remote_ip, remote_port, local_port) только для ВХОДЯЩИХ соединений:
+    состояние ESTABLISHED/SYN_RECV и локальный порт есть среди слушаемых."""
+    table = read_tcp_table() if table is None else table
+    listen_ports = {lport for state, _ip, _rp, lport in table if state == _STATE_LISTEN}
+    return [
+        (ip, rport, lport)
+        for state, ip, rport, lport in table
+        if state in _INBOUND_STATES and rport != 0 and lport in listen_ports
+    ]
+
+
+def established_peers(local_ports: set[int]) -> set[str]:
+    """Удалённые IP установленных соединений на заданные локальные порты
+    (используется для автодобавления текущих SSH-сессий администратора в
+    allowlist, чтобы не отрезать себя от сервера)."""
+    peers = set()
+    for state, ip, _rp, lport in read_tcp_table():
+        if state == _STATE_ESTABLISHED and lport in local_ports:
+            peers.add(ip)
+    return peers
 
 
 async def poll_connections_loop(
@@ -147,18 +206,20 @@ async def poll_connections_loop(
         try:
             db: ThreatDB = get_db()
             if db is not None and (db.networks or db.ranges):
-                seen_this_round = set()
+                checked: set[str] = set()
                 # чтение /proc - блокирующий файловый ввод-вывод, но по факту это
                 # быстрая операция с виртуальной файловой системой, отдельный
                 # поток ради неё не нужен
-                for remote_ip, _remote_port, local_port in _read_live_tcp_connections():
-                    if remote_ip in seen_this_round or _is_ignored(remote_ip, ignore_networks):
+                for remote_ip, _remote_port, local_port in _inbound_connections():
+                    if remote_ip in checked:
+                        continue
+                    checked.add(remote_ip)
+                    if _is_ignored(remote_ip, ignore_networks):
                         continue
 
                     matched = db.match(remote_ip)
                     if not matched:
                         continue
-                    seen_this_round.add(remote_ip)
 
                     if not dedup.should_alert(remote_ip):
                         continue
@@ -168,7 +229,7 @@ async def poll_connections_loop(
                         "[poll] Подключение от известного сканера: %s (совпадение: %s, порт: %s)",
                         remote_ip, matched, local_port,
                     )
-                    await on_hit(hit)
+                    await _dispatch(on_hit, dedup, hit)
         except Exception as e:  # noqa: BLE001
             log.exception("Ошибка в цикле мониторинга (poll): %s", e)
 
@@ -226,6 +287,10 @@ async def tail_kernel_log_loop(
                 if not src_match:
                     continue
                 remote_ip = src_match.group(1)
+                ip_obj = normalize_ip(remote_ip)
+                if ip_obj is None:
+                    continue
+                remote_ip = str(ip_obj)
 
                 if _is_ignored(remote_ip, ignore_networks):
                     continue
@@ -249,7 +314,7 @@ async def tail_kernel_log_loop(
                     "[kernel_log] SYN от известного сканера: %s (совпадение: %s, порт: %s)",
                     remote_ip, matched, local_port,
                 )
-                await on_hit(hit)
+                await _dispatch(on_hit, dedup, hit)
 
         except FileNotFoundError:
             log.error(

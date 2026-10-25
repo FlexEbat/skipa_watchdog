@@ -268,6 +268,24 @@ _python_bin() {
     fi
 }
 
+# Права на config.yaml: там токен Telegram-бота
+_secure_config() {
+    [ -f "$INSTALL_DIR/config.yaml" ] && chmod 600 "$INSTALL_DIR/config.yaml"
+}
+
+# Юнит с правилами iptables для загрузки системы. Сам watchdog.py теперь
+# проверяет и чинит эти правила раз в минуту, юнит - дополнительная страховка
+# на время между загрузкой системы и стартом watchdog.
+_install_fw_unit() {
+    local src="$INSTALL_DIR/skipa-watchdog-fw-rules.service"
+    [ -f "$src" ] || { warn "skipa-watchdog-fw-rules.service не найден - пропускаю."; return 0; }
+    chmod +x "$INSTALL_DIR/install-firewall-rules.sh" 2>/dev/null
+    cp "$src" "$SYSTEMD_DIR/${FW_UNIT}.service"
+    sed -i "s#/opt/skipa_watchdog#$INSTALL_DIR#g" "$SYSTEMD_DIR/${FW_UNIT}.service"
+    systemctl daemon-reload 2>/dev/null
+    systemctl enable "$FW_UNIT" >/dev/null 2>&1
+}
+
 # Переписывает ExecStart в уже установленном systemd-юните на нужный python
 # (вызывается и при первой установке, и когда сервис-режим апгрейдится до
 # бота из меню - см. install_telegram_deps).
@@ -454,6 +472,13 @@ _do_install_bot() {
         || { err "Нужен python3, не удалось поставить автоматически - поставьте вручную и повторите."; return 1; }
     [ -f "$INSTALL_DIR/requirements.txt" ] || { err "requirements.txt не найден в $INSTALL_DIR - установка прервана."; return 1; }
 
+    ensure_command iptables iptables >/dev/null 2>&1
+    # ipset нужен для предзагрузки всей базы сканеров и таймаутов блокировок;
+    # без него watchdog работает в упрощённом режиме (правило на каждый IP)
+    ensure_command ipset ipset >/dev/null 2>&1 \
+        || warn "ipset не установлен - буду работать в упрощённом режиме iptables (без предзагрузки базы)."
+    mkdir -p "$INSTALL_DIR/data"
+
     if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
         cp "$INSTALL_DIR/config.example.yaml" "$INSTALL_DIR/config.yaml" \
             || { err "Не удалось создать config.yaml (нет config.example.yaml?)."; return 1; }
@@ -474,6 +499,7 @@ _do_install_bot() {
     if grep -q '^\s*bot_token: ""' "$INSTALL_DIR/config.yaml" 2>/dev/null; then
         configure_telegram
     fi
+    _secure_config
 
     [ -f "$INSTALL_DIR/skipa-watchdog.service" ] || { err "skipa-watchdog.service не найден в репозитории."; return 1; }
     cp "$INSTALL_DIR/skipa-watchdog.service" "$SYSTEMD_DIR/${UNIT}.service"
@@ -481,6 +507,7 @@ _do_install_bot() {
     _write_unit_exec_start
     systemctl daemon-reload || { err "systemctl daemon-reload не удался."; return 1; }
     systemctl enable "$UNIT" >/dev/null 2>&1
+    _install_fw_unit
 
     install_cli_link
     install_logrotate
@@ -916,6 +943,8 @@ _migrate_service_to_bot() {
     systemctl enable "$UNIT" >/dev/null 2>&1
 
     echo "bot" > "$INSTALL_MODE_FILE"
+    mkdir -p "$INSTALL_DIR/data"
+    _install_fw_unit
     _apply_bot_firewall_rules
     ok "Режим переключён на 'сервис + бот'."
 }
@@ -942,6 +971,7 @@ configure_telegram() {
         formatted="[$(echo "$admins" | tr -d ' ')]"
         _set_yaml_scalar "$INSTALL_DIR/config.yaml" "admin_ids" "$formatted"
     fi
+    _secure_config
     ok "Telegram настроен."
     systemctl restart "$UNIT" 2>/dev/null
 }
@@ -1006,9 +1036,12 @@ print('  (никто не заблокирован)' if not ips else '\n'.join(f
             read -rp "IP для блокировки: " ip
             if [ "$mode" = "bot" ]; then
                 (cd "$INSTALL_DIR" && "$py" -c "
+import sys
 from bot import blocker
-print('OK' if blocker.block_ip('$ip') else 'FAIL')
-")
+# вручную - бессрочно (второй аргумент 0), IP передаётся через argv, а не
+# подстановкой в код
+print('OK' if blocker.block_ip(sys.argv[1], 0) else 'FAIL')
+" "$ip")
             else
                 bash "$INSTALL_DIR/service/blockctl.sh" block "$ip"
             fi
@@ -1017,9 +1050,10 @@ print('OK' if blocker.block_ip('$ip') else 'FAIL')
             read -rp "IP для разблокировки: " ip
             if [ "$mode" = "bot" ]; then
                 (cd "$INSTALL_DIR" && "$py" -c "
+import sys
 from bot import blocker
-print('OK' if blocker.unblock_ip('$ip') else 'FAIL')
-")
+print('OK' if blocker.unblock_ip(sys.argv[1]) else 'FAIL')
+" "$ip")
             else
                 bash "$INSTALL_DIR/service/blockctl.sh" unblock "$ip"
             fi

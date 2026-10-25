@@ -1,0 +1,14 @@
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+deactivate
+
+sudo cp skipa-watchdog.service /etc/systemd/system/
+sudo nano /etc/systemd/system/skipa-watchdog.service   # проверить пути WorkingDirectory/ExecStart
+sudo cp skipa-watchdog-fw-rules.service /etc/systemd/system/
+sudo nano /etc/systemd/system/skipa-watchdog-fw-rules.service  # поправить путь ExecStart
+sudo systemctl daemon-reload
+sudo systemctl enable --now skipa-watchdog
+
+
+sudo journalctl -u skipa-watchdog -f

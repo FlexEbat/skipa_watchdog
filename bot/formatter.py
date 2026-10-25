@@ -39,7 +39,12 @@ def _bool_icon(value: bool | None) -> str:
     return "✅" if value else "❌"
 
 
-def build_alert_message(ip: str, matched_source: str, data: EnrichedIP) -> str:
+def build_alert_message(ip: str, matched_source: str, data: EnrichedIP, source_name: str = "") -> str:
+    """matched_source - строка вида "Метка: 1.2.3.0/24" (так её отдаёт ThreatDB.match);
+    имя базы и сеть показываются раздельно. source_name можно передать явно."""
+    if ": " in matched_source:
+        parsed_name, matched_source = matched_source.split(": ", 1)
+        source_name = source_name or parsed_name
     lines = []
     lines.append("🚨 <b>УГРОЗА. СКАНЕР ОБНАРУЖЕН - IP</b>")
     lines.append("")
@@ -82,6 +87,9 @@ def build_alert_message(ip: str, matched_source: str, data: EnrichedIP) -> str:
         )
 
     lines.append("")
-    lines.append(f"<i>Совпадение по базе: {escape(matched_source)}</i>")
+    if source_name:
+        lines.append(f"<i>База: {escape(source_name)} | Совпадение: {escape(matched_source)}</i>")
+    else:
+        lines.append(f"<i>Совпадение по базе: {escape(matched_source)}</i>")
 
     return "\n".join(lines)

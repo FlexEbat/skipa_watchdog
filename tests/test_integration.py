@@ -88,7 +88,8 @@ class HitHandlerTests(unittest.TestCase):
             ok = asyncio.run(wd._make_hit_handler(cfg, {}, log, q)(self.hit()))
         self.assertTrue(ok)
         b.assert_called_once_with("185.224.228.5")
-        hit, note = q.get_nowait()
+        hit, note, blocked = q.get_nowait()
+        self.assertTrue(blocked)
         self.assertIn("заблокирован", note)
         self.assertIn("185.224.228.5", log.read_text())
 
@@ -132,7 +133,39 @@ class SmokeTests(unittest.TestCase):
         self.assertIn("Telegram недоступен", logs)
         self.assertIn("Skipa Watchdog остановлен", logs)
 
-    def _run(self, telegram):
+    def test_dashboard_healthcheck_and_events_run_in_real_process(self):
+        import socket
+        import urllib.request
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        seen = {}
+
+        def probe():
+            for _ in range(20):
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=2) as r:
+                        seen["status"] = r.status
+                        seen["body"] = r.read().decode()
+                        return
+                except OSError:
+                    time.sleep(0.3)
+
+        import threading
+        import time
+        t = threading.Thread(target=probe)
+        t.start()
+        logs = self._run(telegram=False, extra={
+            "dashboard": {"enabled": True, "port": port},
+            "healthcheck": {"enabled": True},
+        }, wait=4.0)
+        t.join()
+        self.assertEqual(seen.get("status"), 200)
+        self.assertIn("monitors", seen["body"])
+        self.assertIn("Веб-дашборд запущен", logs)
+
+    def _run(self, telegram, extra=None, wait=2.5):
         import watchdog
         from bot import ip_lists
         from bot.ip_lists import NetEntry, ThreatDB
@@ -146,6 +179,7 @@ class SmokeTests(unittest.TestCase):
                 "logging": {"log_dir": str(d / "log")},
                 "environment": {"docker_scan": False, "k8s_scan": False},
             }
+            cfg.update(extra or {})
             if telegram:
                 cfg["telegram"] = {"bot_token": "123456:ABC", "chat_id": 1, "admin_ids": [1]}
             (d / "c.yaml").write_text(yaml.safe_dump(cfg))
@@ -157,7 +191,7 @@ class SmokeTests(unittest.TestCase):
 
             async def main():
                 task = asyncio.create_task(watchdog.async_main())
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(wait)
                 signal.raise_signal(signal.SIGTERM)
                 await asyncio.wait_for(task, 15)
 

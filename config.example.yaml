@@ -40,6 +40,37 @@ sources:
   # Как часто обновлять базу IP (в днях)
   update_interval_days: 7
 
+  # Дополнительные источники (кроме двух списков выше) - Spamhaus DROP, FireHOL,
+  # AbuseIPDB blacklist или любой другой список IP/CIDR. Каждый показывается в
+  # алерте отдельно ("База: Spamhaus DROP"), матчится тем же движком и (при
+  # блокировке) попадает в ipset вместе с остальной базой. Участвуют всегда,
+  # независимо от active_list, пока enabled: true.
+  #
+  # type: "cidr_list" - простой текстовый список (CIDR или IP на строку,
+  #                     комментарии после '#' или ';'): Spamhaus DROP, FireHOL и т.п.
+  # type: "abuseipdb"  - JSON blacklist API AbuseIPDB (нужен свой api_key).
+  extra:
+    - name: "spamhaus_drop"
+      display_name: "Spamhaus DROP"
+      type: "cidr_list"
+      url: "https://www.spamhaus.org/drop/drop.txt"
+      enabled: false
+
+    - name: "firehol_level1"
+      display_name: "FireHOL Level 1"
+      type: "cidr_list"
+      url: "https://iplists.firehol.org/files/firehol_level1.netset"
+      enabled: false
+
+    - name: "abuseipdb"
+      display_name: "AbuseIPDB Blacklist"
+      type: "abuseipdb"
+      # Бесплатный ключ: https://www.abuseipdb.com/register
+      api_key: ""
+      # Минимальный confidence score для включения IP в базу (0-100)
+      min_confidence: 90
+      enabled: false
+
 action:
   # Что делать при обнаружении скана:
   #   "notify"       - только уведомление (лог + Telegram, если настроен)
@@ -81,6 +112,11 @@ monitoring:
   # Автоматически не блокировать IP, с которых сейчас открыты SSH-сессии на
   # ssh_ports (защита от отрезания себя от сервера)
   auto_allowlist: true
+  # Метод poll дополнительно читает таблицу conntrack ядра (/proc/net/nf_conntrack):
+  # так он видит и трафик на опубликованные порты Docker-контейнеров (в
+  # /proc/net/tcp хоста его нет), и короткие сканы, успевшие закрыться между
+  # опросами. Нужен root и загруженный nf_conntrack (при Docker он есть всегда).
+  use_conntrack: true
   ssh_ports: [22]
   # Как часто проверять и чинить правила iptables/ipset (сек.)
   guard_interval_seconds: 60
@@ -98,7 +134,8 @@ environment:
   # заметку в лог (плюс доступно по команде /env в Telegram, если он
   # подключён). docker_scan/k8s_scan: false - не подключать SKIPA-BLOCK к
   # DOCKER-USER / KUBE-* соответственно. Важно: опубликованные порты контейнеров
-  # не видны в /proc/net/tcp хоста, для них работает только kernel_log/ipset.
+  # не видны в /proc/net/tcp хоста - их видит conntrack (monitoring.use_conntrack)
+  # и kernel_log/ipset.
   docker_scan: true
   k8s_scan: true
 
@@ -116,3 +153,58 @@ alerting:
   # Как часто повторять попытку отправки алертов, которые не ушли в
   # Telegram из-за временной недоступности связи (сек.)
   retry_interval_seconds: 300
+
+banning:
+  # Бан вручную и автоматически поверх общего механизма блокировки (цепочка
+  # SKIPA-BLOCK + ipset, см. раздел action). Включает кнопку "🚫 Забанить" под
+  # каждым алертом в Telegram и команды /banlist, /unban. Отдельно настраивать
+  # ipset или правила не нужно - watchdog создаёт и чинит их сам.
+  enabled: false
+  # Автоматически банить КАЖДЫЙ обнаруженный IP, без нажатия кнопки (работает и
+  # при action.mode: notify). РИСК: ложные срабатывания (например, легитимный
+  # сканер безопасности вроде Shodan/Censys, который вы сами используете)
+  # забанятся тоже. Если не уверены - оставьте false и банте кнопкой.
+  auto_ban_new_hits: false
+  # Длительность автобана в минутах, 0 = навсегда
+  auto_ban_duration_minutes: 60
+  # Длительность бана по кнопке "Забанить" в минутах, 0 = навсегда
+  manual_ban_duration_minutes: 1440
+  # Если указать имя существующего jail в fail2ban (например "sshd" или свой
+  # кастомный, см. fail2ban/ в этом репозитории) - бот ДОПОЛНИТЕЛЬНО
+  # зарегистрирует бан там же (`fail2ban-client set <jail> banip <ip>`), чтобы
+  # он был виден в `fail2ban-client status`. Необязательно.
+  fail2ban_jail: ""
+
+healthcheck:
+  # "Watchdog для watchdog'а": следит, что сами циклы мониторинга (опрос
+  # соединений, чтение kernel-лога, проверка правил firewall) не зависли молча.
+  # Если монитор не подавал признаков жизни дольше stale_after_minutes - в лог и
+  # в Telegram придёт предупреждение, а при восстановлении - сообщение об этом.
+  enabled: true
+  stale_after_minutes: 15
+  check_interval_minutes: 5
+
+dashboard:
+  # Простой веб-дашборд (без внешних зависимостей) со статусом базы, последними
+  # событиями, списком блокировок и состоянием мониторов. По умолчанию слушает
+  # только localhost - откройте через SSH-туннель (ssh -L 8080:localhost:8080 ...)
+  # либо смените host на 0.0.0.0 и ОБЯЗАТЕЛЬНО задайте username/password ниже
+  # (лучше - за reverse-proxy с TLS).
+  enabled: false
+  host: "127.0.0.1"
+  port: 8080
+  # Если оба поля не пустые - дашборд спрашивает HTTP Basic Auth
+  username: ""
+  password: ""
+
+digest:
+  # Автоматический еженедельный дайджест (статистика + график) в Telegram, не
+  # дожидаясь команды /stats. График рисует matplotlib (необязательная
+  # зависимость: pip install -r requirements-extras.txt), без него приходит
+  # текстовая гистограмма по часам.
+  enabled: true
+  # День недели: 0=понедельник, 1=вторник, ..., 6=воскресенье
+  weekday: 0
+  # Время отправки (по времени сервера)
+  hour: 9
+  minute: 0

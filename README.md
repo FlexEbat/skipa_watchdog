@@ -237,6 +237,11 @@ python watchdog.py
 в потоке, без `aiohttp`; мониторинг — через чтение `/proc/net/tcp`, без
 `psutil`) плюс единственный пакет `PyYAML` для чтения `config.yaml`.
 
+Необязательно: `pip install -r requirements-extras.txt` ставит `matplotlib` для
+графика в `/stats` и еженедельном дайджесте; без него вместо картинки приходит
+текстовая гистограмма по часам. Веб-дашборд написан на asyncio и никаких
+пакетов не требует.
+
 | | Доп. место на диске | Память процесса (RSS) |
 |---|---|---|
 | Только сервис | **0** (только код проекта, ~30 КБ bash-скриптов) | **0** в режиме `block` (нет процесса); ~1–2 МБ на недолго живущий bash в `notify`/таймере |
@@ -301,8 +306,11 @@ Telegram-слой (`bot/telegram_layer.py`).
   на примере `203.0.113.42`), удобно для проверки форматирования
 - `/pending` — сколько алертов сейчас в очереди на повтор из-за недоступности Telegram
 - `/env` — обнаружены ли Docker/Kubernetes и стоит ли на их цепочках логирование/блокировка
-- `/blocklist` — список заблокированных IP
-- `/block <ip или сеть> [часы]` / `/unblock <ip>` — заблокировать (по умолчанию
+- `/blocklist` (он же `/banlist`) — список заблокированных IP
+- `/stats [дней]` — статистика срабатываний (топ стран, организаций, баз-источников,
+  портов) и график по часам суток; по умолчанию за 7 дней
+- `/export [дней]` — выгрузить события за период текстовым файлом
+- `/block <ip или сеть> [часы]` / `/unblock <ip>` (он же `/unban`) — заблокировать (по умолчанию
   бессрочно) / разблокировать IP вручную. Цель проверяется: служебные и частные
   адреса, сети шире /16, IPv6 и всё, что пересекается с allowlist, не блокируются
 - `/start` — краткая справка
@@ -375,9 +383,13 @@ root.
 проходит через обычный `INPUT`** — он маршрутизируется через собственные
 цепочки iptables (`DOCKER-USER`, `KUBE-EXTERNAL-SERVICES`/`KUBE-NODEPORTS`).
 Без дополнительной настройки такой трафик не логируется и не блокируется.
-Метод `poll` такой трафик вообще не видит: он DNAT-ится в сетевой namespace
-контейнера и не попадает в `/proc/net/tcp` хоста, поэтому для контейнеров
-работает только `kernel_log` (LOG-правило) и ipset. Входящие IPv4-клиенты на
+Трафик на опубликованные порты контейнеров DNAT-ится в сетевой namespace
+контейнера и не попадает в `/proc/net/tcp` хоста, поэтому метод `poll`
+дополнительно читает таблицу conntrack ядра (`/proc/net/nf_conntrack`,
+`monitoring.use_conntrack: true`, нужен root): в ней виден инициатор каждого
+соединения, в том числе к контейнерам и мимолётные сканы, успевшие закрыться
+между опросами (запись живёт до двух минут). Блокировка и LOG-правило
+(`kernel_log`) работают на цепочке DOCKER-USER независимо от этого. Входящие IPv4-клиенты на
 dual-stack сокетах (`::ffff:a.b.c.d`) учитываются как обычные IPv4.
 
 Пункт 5 меню `skipa-watchdog` (он же `sudo bash install.sh fw-rules`) решает
@@ -483,6 +495,92 @@ sudo cp skipa-watchdog-fw-rules.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now skipa-watchdog-fw-rules
 ```
+
+## Бан по кнопке, автобан и fail2ban
+
+Работает поверх общего механизма блокировки (цепочка `SKIPA-BLOCK`, ipset
+`skipa-dyn` с таймаутом, см. выше), отдельный набор `skipa_watchdog_ban` и ручной
+запуск скриптов с правилами не нужны — watchdog создаёт и чинит всё сам. Включается
+секцией `banning` в `config.yaml`:
+
+- `banning.enabled: true` — под каждым алертом в Telegram появляется кнопка
+  «🚫 Забанить» (бан на `manual_ban_duration_minutes`, по умолчанию сутки, `0` —
+  навсегда), работают `/banlist` и `/unban`. Кнопку видят только администраторы;
+  защита от самоблокировки действует и здесь (служебные адреса, сети шире /16 и
+  IP из allowlist забанить нельзя).
+- `banning.auto_ban_new_hits: true` — банить каждый обнаруженный IP автоматически на
+  `auto_ban_duration_minutes` (работает и при `action.mode: notify`). Риск ложных
+  срабатываний: легитимный сканер безопасности, которым вы сами пользуетесь
+  (Shodan, Censys), забанится тоже — если не уверены, банте кнопкой.
+- `banning.fail2ban_jail: "<jail>"` — дополнительно регистрировать бан в fail2ban
+  (`fail2ban-client set <jail> banip <ip>`), чтобы он был виден в
+  `fail2ban-client status`.
+- История банов и разбанов (кто, когда, на сколько, почему) пишется в
+  `data/bans.jsonl`.
+
+**fail2ban как альтернатива.** В каталоге `fail2ban/` лежат фильтр и jail, которые
+читают audit-лог `/var/log/skipa_watchdog/detections.log` и банят средствами самого
+fail2ban (тогда все баны видны в одном месте). Это *альтернатива* встроенной
+блокировке: при этом поставьте `action.mode: notify` и `banning.auto_ban_new_hits:
+false`, чтобы не банить дважды. Установка:
+
+```bash
+sudo cp fail2ban/skipa-watchdog.conf /etc/fail2ban/filter.d/
+sudo cp fail2ban/jail-skipa-watchdog.local /etc/fail2ban/jail.d/
+sudo systemctl restart fail2ban && sudo fail2ban-client status skipa-watchdog
+```
+
+## Дополнительные источники IP
+
+Кроме двух списков из `sources` (основной и `blacklist_url`), в `sources.extra`
+можно подключить Spamhaus DROP, FireHOL, AbuseIPDB или любой свой список. Каждый
+источник показывается в алерте отдельно («База: Spamhaus DROP | Совпадение:
+203.0.113.0/24»), попадает в ipset вместе с остальной базой и защищён теми же
+предохранителями (сети шире /16 отбрасываются, при сбое берётся прошлая версия):
+
+```yaml
+sources:
+  extra:
+    - name: "spamhaus_drop"
+      display_name: "Spamhaus DROP"
+      type: "cidr_list"          # CIDR/IP на строку, комментарии после # или ;
+      url: "https://www.spamhaus.org/drop/drop.txt"
+      enabled: true
+    - name: "abuseipdb"
+      display_name: "AbuseIPDB Blacklist"
+      type: "abuseipdb"          # JSON API, нужен свой api_key
+      api_key: "..."
+      min_confidence: 90
+      enabled: true
+```
+
+Дополнительные источники работают в python-варианте (`watchdog.py`).
+
+## Статистика и еженедельный дайджест
+
+Каждое обнаружение пишется в структурированный журнал `data/events.jsonl` (IP, база,
+страна, организация, порт, метод) независимо от доставки в Telegram; хранятся
+последние 200 000 записей. Из него строятся `/stats [дней]`, `/export [дней]`,
+дашборд и еженедельный дайджест (`digest.weekday/hour/minute`, время сервера) —
+статистика плюс график по часам суток (`matplotlib` необязателен, см. «Зависимости»).
+
+## Веб-дашборд
+
+`dashboard.enabled: true` поднимает в том же процессе простую страницу (без внешних
+пакетов): записи в базе, последние события за сутки, список блокировок и состояние
+мониторов, обновление каждые 15 секунд. По умолчанию слушает только `127.0.0.1` —
+открывайте через SSH-туннель (`ssh -L 8080:localhost:8080 user@server`). Если нужен
+доступ извне, обязательно задайте `dashboard.username`/`password` (HTTP Basic Auth)
+и держите дашборд за reverse-proxy с TLS. Данные из внешних источников на странице
+экранируются.
+
+## Health-check («watchdog для watchdog'а»)
+
+Каждый цикл (опрос `/proc/net/tcp`, чтение kernel-лога, проверка правил firewall)
+отмечается heartbeat'ом. Если монитор молчит дольше `healthcheck.stale_after_minutes`
+(по умолчанию 15), в лог и в Telegram приходит предупреждение со ссылкой на
+`journalctl`, а когда он оживает — сообщение о восстановлении. Состояние мониторов
+видно и в дашборде.
 
 ## Тесты
 
@@ -592,6 +690,9 @@ skipa_watchdog/
 ├── config.example.yaml              # шаблон конфига python-варианта
 ├── requirements.txt                 # базовые зависимости python-варианта (только PyYAML)
 ├── requirements-telegram.txt        # доп. пакет python-telegram-bot - только если нужен Telegram
+├── requirements-extras.txt          # необязательно: matplotlib для графиков в /stats и дайджесте
+├── fail2ban/                        # фильтр и jail для fail2ban (альтернативный способ бана по detections.log)
+├── .min-readme                      # короткая шпаргалка по ручной установке и просмотру логов
 ├── install-firewall-rules.sh        # ставит SKIPA-BLOCK + переходы + CONN-логирование (INPUT/DOCKER-USER/KUBE-*)
 ├── skipa-watchdog-fw-rules.service  # systemd-юнит: применяет правила после старта Docker/kubelet
 ├── skipa-watchdog.service           # systemd-юнит: сам watchdog.py
@@ -614,6 +715,8 @@ skipa_watchdog/
 │   ├── ip_cache.json               # локальный кэш базы IP
 │   ├── list_versions.json           # хэши листов для проверки новых версий
 │   ├── blocked_ips.json             # список заблокированных IP (для восстановления после reboot)
+│   ├── events.jsonl                  # журнал событий для /stats, /export, дашборда
+│   ├── bans.jsonl                    # история банов/разбанов
 │   └── pending_telegram.jsonl        # очередь неотправленных алертов
 └── /var/log/skipa_watchdog/          # создаётся автоматически в обоих вариантах
     ├── skipa-watchdog.log              # общий процесс-лог

@@ -31,6 +31,7 @@ import re
 import time
 from dataclasses import dataclass
 
+from .healthcheck import heartbeat
 from .ip_lists import ThreatDB, normalize_ip
 
 log = logging.getLogger("skipa_watchdog.monitor")
@@ -58,6 +59,16 @@ class Hit:
     matched_source: str
     local_port: int | None
     method: str = "poll"
+
+    @property
+    def source_name(self) -> str:
+        """Имя базы-источника из matched_source вида "Метка: 1.2.3.0/24"."""
+        return self.matched_source.split(": ", 1)[0] if ": " in self.matched_source else ""
+
+    @property
+    def matched_cidr(self) -> str:
+        """Конкретная сеть/диапазон, по которой совпало."""
+        return self.matched_source.split(": ", 1)[1] if ": " in self.matched_source else self.matched_source
 
 
 def _is_ignored(ip: str, ignore_networks) -> bool:
@@ -166,16 +177,77 @@ def read_tcp_table() -> list[tuple[str, str, int, int]]:
     return results
 
 
-def _inbound_connections(table=None) -> list[tuple[str, int, int | None]]:
+_CONNTRACK_PATHS = ("/proc/net/nf_conntrack", "/proc/net/ip_conntrack")
+_MAX_CONNTRACK_LINES = 300_000
+
+
+def parse_conntrack_line(line: str) -> tuple[str, int, int] | None:
+    """Разбирает строку /proc/net/nf_conntrack для TCP:
+        ipv4 2 tcp 6 431999 ESTABLISHED src=1.2.3.4 dst=10.0.0.5 sport=51234 dport=443 ... src=172.17.0.2 ...
+    Возвращает (src, sport, dport) ИСХОДНОГО направления, т.е. адрес того, кто
+    инициировал соединение. Для трафика на опубликованный порт контейнера
+    (DNAT) это внешний клиент - именно то, чего нет в /proc/net/tcp хоста. Для
+    исходящих подключений самого сервера src - адрес сервера/контейнера, он в
+    базе сканеров не окажется."""
+    parts = line.split()
+    if len(parts) < 8 or parts[2] != "tcp":
+        return None
+    src = sport = dport = None
+    for token in parts[5:]:
+        if token.startswith("src=") and src is None:
+            src = token[4:]
+        elif token.startswith("sport=") and sport is None:
+            sport = token[6:]
+        elif token.startswith("dport=") and dport is None:
+            dport = token[6:]
+        if src and sport and dport:
+            break
+    if not (src and sport and dport):
+        return None
+    try:
+        return str(normalize_ip(src) or src), int(sport), int(dport)
+    except ValueError:
+        return None
+
+
+def read_conntrack() -> list[tuple[str, int, int]]:
+    """Входящие TCP-соединения из таблицы conntrack ядра (нужен root и загруженный
+    nf_conntrack - при Docker/NAT он всегда есть). Видит и трафик на
+    опубликованные порты контейнеров, и уже закрытые коротким сканом соединения
+    (записи живут ещё до 2 минут в TIME_WAIT), которые опрос /proc/net/tcp
+    пропускает. Если файла нет или нет прав - тихо возвращает пустой список."""
+    for path in _CONNTRACK_PATHS:
+        try:
+            out = []
+            with open(path, encoding="ascii", errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i >= _MAX_CONNTRACK_LINES:
+                        break
+                    parsed = parse_conntrack_line(line)
+                    if parsed:
+                        out.append(parsed)
+            return out
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            log.debug("Не удалось прочитать %s: %s", path, e)
+            return []
+    return []
+
+
+def _inbound_connections(table=None, conntrack=None) -> list[tuple[str, int, int | None]]:
     """(remote_ip, remote_port, local_port) только для ВХОДЯЩИХ соединений:
     состояние ESTABLISHED/SYN_RECV и локальный порт есть среди слушаемых."""
     table = read_tcp_table() if table is None else table
     listen_ports = {lport for state, _ip, _rp, lport in table if state == _STATE_LISTEN}
-    return [
+    result: list[tuple[str, int, int | None]] = [
         (ip, rport, lport)
         for state, ip, rport, lport in table
         if state in _INBOUND_STATES and rport != 0 and lport in listen_ports
     ]
+    # conntrack: инициатор соединения (в т.ч. к контейнерам и мимолётные сканы)
+    result.extend((ip, sport, dport) for ip, sport, dport in (conntrack or []))
+    return result
 
 
 def established_peers(local_ports: set[int]) -> set[str]:
@@ -195,14 +267,19 @@ async def poll_connections_loop(
     poll_interval: int,
     dedup: Deduper,
     on_hit,
+    use_conntrack: bool = True,
 ):
     """Каждые poll_interval секунд смотрит активные TCP-соединения и сверяет
     удалённые IP с базой угроз. get_db() возвращает текущий ThreatDB (чтобы
     подхватывать обновления базы на лету)."""
 
-    log.info("Мониторинг соединений (poll /proc/net/tcp) запущен, интервал опроса: %ss", poll_interval)
+    log.info(
+        "Мониторинг соединений (poll /proc/net/tcp%s) запущен, интервал опроса: %ss",
+        " + conntrack" if use_conntrack else "", poll_interval,
+    )
 
     while True:
+        heartbeat("poll")  # health-check: цикл жив, даже если ничего не найдено
         try:
             db: ThreatDB = get_db()
             if db is not None and (db.networks or db.ranges):
@@ -210,7 +287,8 @@ async def poll_connections_loop(
                 # чтение /proc - блокирующий файловый ввод-вывод, но по факту это
                 # быстрая операция с виртуальной файловой системой, отдельный
                 # поток ради неё не нужен
-                for remote_ip, _remote_port, local_port in _inbound_connections():
+                conntrack = await asyncio.to_thread(read_conntrack) if use_conntrack else []
+                for remote_ip, _remote_port, local_port in _inbound_connections(conntrack=conntrack):
                     if remote_ip in checked:
                         continue
                     checked.add(remote_ip)
@@ -263,6 +341,7 @@ async def tail_kernel_log_loop(
     log.info("Мониторинг соединений (kernel_log) запущен: %s", " ".join(command))
 
     while True:
+        heartbeat("kernel_log")
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -272,7 +351,15 @@ async def tail_kernel_log_loop(
             )
 
             while True:
-                line_bytes = await proc.stdout.readline()
+                try:
+                    line_bytes = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
+                except asyncio.TimeoutError:
+                    # 30с без строк в логе ядра - нормально в тихие периоды: отмечаем,
+                    # что цикл жив, и продолжаем читать тот же подпроцесс
+                    heartbeat("kernel_log")
+                    continue
+
+                heartbeat("kernel_log")
                 if not line_bytes:
                     # процесс завершился (например journald перезапустился) - выходим
                     # из внутреннего цикла, чтобы пересоздать подпроцесс

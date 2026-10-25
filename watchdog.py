@@ -44,7 +44,9 @@ from bot.allowlist import build_allowlist
 from bot.config import Config
 from bot.dbupdate import apply_db_to_firewall, preload_effective, refresh_db
 from bot.env_detect import format_summary_text, summarize_environment
+from bot.events_store import prune_events, record_event
 from bot.fallback import append_audit_log, drain_pending, queue_pending_alert, requeue
+from bot.healthcheck import heartbeat, seconds_since_last
 from bot.ip_lists import check_list_versions, fetch_threat_db, has_data, load_cache, needs_update, save_cache
 from bot.monitor import Deduper, poll_connections_loop, tail_kernel_log_loop
 
@@ -100,6 +102,19 @@ async def _supervised(name: str, factory) -> None:
 # Обработка срабатываний
 # ---------------------------------------------------------------------------
 
+def _record_event(hit, enriched=None) -> None:
+    """Структурированный журнал событий (data/events.jsonl) для /stats, /export,
+    еженедельного дайджеста и дашборда."""
+    record_event(
+        ip=hit.ip,
+        matched_source=hit.matched_cidr,
+        source_name=hit.source_name,
+        method=hit.method,
+        enriched=enriched,
+        local_port=hit.local_port,
+    )
+
+
 def _make_hit_handler(config: Config, state: dict, detections_log: Path, notify_queue: asyncio.Queue):
     do_notify = config.action_mode in ("notify", "block_notify")
     do_block = config.drop_enabled
@@ -144,10 +159,11 @@ def _make_hit_handler(config: Config, state: dict, detections_log: Path, notify_
             if block_note:
                 plain += f"\n{block_note}"
             await asyncio.to_thread(append_audit_log, hit.ip, hit.matched_source, plain, detections_log)
+            await asyncio.to_thread(_record_event, hit, None)
 
         if do_notify:
             try:
-                notify_queue.put_nowait((hit, block_note))
+                notify_queue.put_nowait((hit, block_note, blocked))
             except asyncio.QueueFull:
                 log.error("Очередь уведомлений переполнена, алерт по %s остался только в логе", hit.ip)
         return ok
@@ -162,7 +178,7 @@ async def _notify_worker(config: Config, state: dict, queue: asyncio.Queue, dete
     from bot.formatter import build_alert_message
 
     while True:
-        hit, block_note = await queue.get()
+        hit, block_note, blocked = await queue.get()
         try:
             if config.enrich_enabled:
                 try:
@@ -186,21 +202,29 @@ async def _notify_worker(config: Config, state: dict, queue: asyncio.Queue, dete
 
             if config.enrich_enabled:
                 await asyncio.to_thread(append_audit_log, hit.ip, hit.matched_source, text, detections_log)
+                await asyncio.to_thread(_record_event, hit, data)
 
             if not config.telegram_enabled:
                 continue
+            markup = None
+            if config.ban_enabled and not blocked:
+                from bot.telegram_layer import ban_keyboard
+
+                markup = ban_keyboard(hit.ip)  # кнопка «🚫 Забанить» под алертом
+            markup_json = markup.to_dict() if markup else None
+
             app = state.get("telegram_app")
             if app is None:
                 # Telegram ещё не поднялся (или временно недоступен) - не теряем алерт
-                queue_pending_alert(config.chat_id, text)
+                queue_pending_alert(config.chat_id, text, markup_json)
                 continue
             from bot.telegram_layer import send_notification
 
             try:
-                await send_notification(app, config.chat_id, text)
+                await send_notification(app, config.chat_id, text, markup)
             except Exception as e:  # noqa: BLE001
                 log.error("Не удалось отправить в Telegram (%s), кладу в очередь на повтор", e)
-                queue_pending_alert(config.chat_id, text)
+                queue_pending_alert(config.chat_id, text, markup_json)
         except Exception:  # noqa: BLE001
             log.exception("Ошибка при отправке уведомления по %s", hit.ip)
 
@@ -219,6 +243,7 @@ async def _periodic_db_updates(config: Config, state: dict) -> None:
         if needs_update(state.get("db"), config.update_interval_days):
             log.info("Обновляю базу IP-адресов...")
             log.info("%s", await refresh_db(config, state))
+            await asyncio.to_thread(prune_events)  # журнал событий не должен расти бесконечно
 
         if time.time() - last_version_check > 86400:
             last_version_check = time.time()
@@ -252,8 +277,16 @@ async def _flush_pending_alerts(config: Config, state: dict) -> None:
 
         failed = []
         for i, record in enumerate(records):
+            markup = None
+            if record.get("reply_markup"):
+                try:
+                    from telegram import InlineKeyboardMarkup
+
+                    markup = InlineKeyboardMarkup.de_json(record["reply_markup"], app.bot)
+                except Exception:  # noqa: BLE001
+                    markup = None
             try:
-                await send_notification(app, record["chat_id"], record["text"])
+                await send_notification(app, record["chat_id"], record["text"], markup)
             except Exception as e:  # noqa: BLE001
                 log.warning("Повтор снова не удался (%s), остальное оставляю в очереди", e)
                 failed = records[i:]  # связи нет - не тратим время на таймауты по каждому
@@ -306,6 +339,101 @@ async def _telegram_supervisor(config: Config, state: dict) -> None:
         backoff = min(backoff * 2, 600)
 
 
+async def _send_text(config: Config, state: dict, text: str) -> None:
+    """Отправляет служебное сообщение администратору; при недоступном Telegram -
+    в очередь на повтор. Без Telegram - только в лог."""
+    if not config.telegram_enabled:
+        return
+    app = state.get("telegram_app")
+    if app is None:
+        queue_pending_alert(config.chat_id, text)
+        return
+    from bot.telegram_layer import send_notification
+
+    try:
+        await send_notification(app, config.chat_id, text)
+    except Exception as e:  # noqa: BLE001
+        log.error("Не удалось отправить служебное сообщение (%s), кладу в очередь", e)
+        queue_pending_alert(config.chat_id, text)
+
+
+async def _healthcheck_loop(config: Config, state: dict) -> None:
+    """«Watchdog для watchdog'а»: проверяет, что циклы мониторинга не зависли
+    молча (каждый обязан отмечаться через heartbeat()). Если монитор молчит
+    дольше healthcheck.stale_after_minutes - предупреждение в лог и в Telegram,
+    а когда он оживает - сообщение о восстановлении."""
+    expected = []
+    if config.method in ("poll", "both"):
+        expected.append("poll")
+    if config.method in ("kernel_log", "both"):
+        expected.append("kernel_log")
+    if config.firewall_needed:
+        expected.append("firewall-guard")
+
+    stale_seconds = config.healthcheck_stale_after_minutes * 60
+    already_alerted: dict[str, bool] = {}
+    while True:
+        await asyncio.sleep(config.healthcheck_check_interval_minutes * 60)
+        for name in expected:
+            ago = seconds_since_last(name)
+            is_stale = ago is None or ago > stale_seconds
+            if is_stale and not already_alerted.get(name):
+                minutes = "неизвестно сколько" if ago is None else f"{ago / 60:.1f} мин."
+                log.error("Health-check: монитор %s не подавал признаков жизни %s", name, minutes)
+                await _send_text(
+                    config, state,
+                    f"⚠️ <b>Watchdog для watchdog'а:</b> монитор <code>{escape(name)}</code> "
+                    f"не подавал признаков жизни последние {minutes}. Возможно, завис или упал "
+                    f"без явной ошибки в логах - проверьте "
+                    f"<code>sudo journalctl -u skipa-watchdog -n 100</code>.",
+                )
+                already_alerted[name] = True
+            elif not is_stale and already_alerted.get(name):
+                log.info("Health-check: монитор %s снова в порядке", name)
+                await _send_text(config, state, f"✅ Монитор <code>{escape(name)}</code> снова в порядке.")
+                already_alerted[name] = False
+
+
+def _seconds_until_digest(config: Config) -> float:
+    import datetime
+
+    now = datetime.datetime.now()
+    target = now.replace(hour=config.digest_hour, minute=config.digest_minute, second=0, microsecond=0)
+    target += datetime.timedelta(days=(config.digest_weekday - now.weekday()) % 7)
+    if target <= now:
+        target += datetime.timedelta(days=7)
+    return (target - now).total_seconds()
+
+
+async def _weekly_digest_loop(config: Config, state: dict) -> None:
+    """Раз в неделю (digest.weekday/hour/minute по времени сервера) присылает в
+    Telegram статистику и график, не дожидаясь команды /stats."""
+    import io
+
+    from bot.stats import format_summary_text as format_stats_text
+    from bot.stats import stats_for_period
+
+    while True:
+        await asyncio.sleep(_seconds_until_digest(config))
+        try:
+            summary, chart_png, hist = await asyncio.to_thread(stats_for_period, 7)
+            text = "📬 <b>Еженедельный дайджест Skipa Watchdog</b>\n\n" + format_stats_text(summary, "неделю")
+            if hist:
+                text += "\n\n" + hist
+            app = state.get("telegram_app")
+            if chart_png and app is not None:
+                await app.bot.send_photo(
+                    chat_id=config.chat_id, photo=io.BytesIO(chart_png), caption=text[:1024], parse_mode="HTML"
+                )
+                if len(text) > 1024:
+                    await _send_text(config, state, text)
+            else:
+                await _send_text(config, state, text)
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось отправить еженедельный дайджест")
+        await asyncio.sleep(61)  # чтобы не сработать дважды в ту же минуту
+
+
 def _configure_blocker(config: Config) -> None:
     blocker.configure(
         log_prefix=config.kernel_log_prefix,
@@ -313,7 +441,7 @@ def _configure_blocker(config: Config) -> None:
         log_burst=config.log_burst,
         preload_db=preload_effective(config),
         drop_enabled=config.drop_enabled,
-        auto_timeout_s=int(config.block_timeout_hours * 3600),
+        auto_timeout_s=config.auto_block_timeout_s,
         skip_docker=not config.docker_scan_enabled,
         skip_k8s=not config.k8s_scan_enabled,
     )
@@ -327,6 +455,7 @@ async def _guard_loop(config: Config, state: dict) -> None:
     last_allow_key = None
     last_status: dict[str, str] = {}
     while True:
+        heartbeat("firewall-guard")
         try:
             nets = await asyncio.to_thread(
                 build_allowlist, config.ignore_networks, config.auto_allowlist, config.ssh_ports
@@ -363,7 +492,7 @@ async def _init_firewall(config: Config, state: dict) -> None:
     await asyncio.to_thread(blocker.sync_allowlist, nets)  # allowlist первым - до любых блокировок
     result = await asyncio.to_thread(blocker.ensure_wiring)
     log.info("Правила firewall: %s", result)
-    if config.drop_enabled:
+    if config.drop_enabled or config.ban_enabled:
         await asyncio.to_thread(blocker.restore_persisted_blocks)
     db = state.get("db")
     if has_data(db):
@@ -393,7 +522,7 @@ async def async_main() -> None:
         log.info("Локального кэша нет или он устарел, качаю базу...")
         new_db = await fetch_threat_db(
             config.primary_list_url, config.blacklist_url, config.blacklist_name,
-            config.active_list, previous=db,
+            config.active_list, previous=db, extra_sources=config.extra_sources,
         )
         if has_data(new_db):
             db = new_db
@@ -403,6 +532,7 @@ async def async_main() -> None:
         else:
             log.error("База IP пуста и скачать её не удалось - мониторинг заработает после успешной загрузки")
     state["db"] = db if has_data(db) else None
+    await asyncio.to_thread(prune_events)
 
     if config.firewall_needed:
         await _init_firewall(config, state)
@@ -424,6 +554,14 @@ async def async_main() -> None:
         jobs.append(("notify-worker", lambda: _notify_worker(config, state, notify_queue, detections_log)))
     if config.firewall_needed:
         jobs.append(("firewall-guard", lambda: _guard_loop(config, state)))
+    if config.healthcheck_enabled:
+        jobs.append(("healthcheck", lambda: _healthcheck_loop(config, state)))
+    if config.dashboard_enabled:
+        from bot.webapp import serve_dashboard
+
+        jobs.append(("dashboard", lambda: serve_dashboard(lambda: state.get("db"), config)))
+    if config.telegram_enabled and config.digest_enabled:
+        jobs.append(("weekly-digest", lambda: _weekly_digest_loop(config, state)))
 
     if config.telegram_enabled:
         jobs.append(("telegram", lambda: _telegram_supervisor(config, state)))
@@ -441,6 +579,7 @@ async def async_main() -> None:
                 poll_interval=config.poll_interval_seconds,
                 dedup=dedup,
                 on_hit=on_hit,
+                use_conntrack=config.use_conntrack,
             ),
         ))
     if method in ("kernel_log", "both"):

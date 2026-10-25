@@ -234,6 +234,64 @@ async def _empty() -> str:
     return ""
 
 
+def _parse_generic_cidr_list(text: str, label: str) -> list[NetEntry]:
+    """Универсальный парсер внешних блок-листов (Spamhaus DROP, FireHOL и т.п.):
+    строка = CIDR или одиночный IP, хвостовой комментарий после ';' или '#'.
+        203.0.113.0/24 ; SBL12345    <- Spamhaus DROP
+        203.0.113.0/24               <- FireHOL netset
+    Служебные/битые строки тихо пропускаются, слишком широкие сети отбрасываются."""
+    out: list[NetEntry] = []
+    for raw in text.splitlines():
+        line = raw.split(";", 1)[0].split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            net = ipaddress.ip_network(line if "/" in line else f"{line}/32", strict=False)
+        except ValueError:
+            continue
+        if not network_is_acceptable(net):
+            log.warning("Отбрасываю слишком широкую сеть из списка (%s): %s", label, line)
+            continue
+        out.append(NetEntry(net, label))
+    return out
+
+
+async def _fetch_extra_source(extra: dict) -> tuple[str, list[NetEntry]]:
+    """Скачивает один дополнительный источник из sources.extra.
+    type: cidr_list (по умолчанию) - текстовый список; abuseipdb - JSON API
+    (нужен api_key). Возвращает (метка, записи); пустой список = недоступен."""
+    name = str(extra.get("name", "extra"))
+    label = str(extra.get("display_name") or name)
+    src_type = str(extra.get("type", "cidr_list"))
+
+    if src_type == "cidr_list":
+        url = extra.get("url", "")
+        text = await http_client.get_text(url) if url else ""
+        return label, _parse_generic_cidr_list(text, label) if text else []
+
+    if src_type == "abuseipdb":
+        api_key = extra.get("api_key", "")
+        if not api_key:
+            log.warning("Источник %r (AbuseIPDB) пропущен: не задан api_key в config.yaml", name)
+            return label, []
+        conf = int(extra.get("min_confidence", 90))
+        data = await http_client.get_json(
+            f"https://api.abuseipdb.com/api/v2/blacklist?confidenceMinimum={conf}",
+            headers={"Key": api_key, "Accept": "application/json"},
+        )
+        entries: list[NetEntry] = []
+        for item in (data or {}).get("data", []):
+            ip = item.get("ipAddress") if isinstance(item, dict) else None
+            try:
+                entries.append(NetEntry(ipaddress.ip_network(f"{ip}/32"), label))
+            except ValueError:
+                continue
+        return label, entries
+
+    log.warning("Неизвестный тип источника %r у %r, пропускаю", src_type, name)
+    return label, []
+
+
 def _previous_entries(previous: "ThreatDB | None", label: str):
     if previous is None:
         return [], []
@@ -249,6 +307,7 @@ async def fetch_threat_db(
     blacklist_label: str = "blacklist",
     active_list: str = "merged",
     previous: "ThreatDB | None" = None,
+    extra_sources: "list[dict] | None" = None,
 ) -> ThreatDB:
     """Тянет настроенные списки и собирает единую базу.
 
@@ -263,6 +322,11 @@ async def fetch_threat_db(
     Любой из URL может быть пустым - тогда соответствующий источник просто
     пропускается.
 
+    extra_sources - дополнительные источники из sources.extra (Spamhaus DROP,
+    FireHOL, AbuseIPDB и любые свои списки CIDR); включённые (enabled: true)
+    участвуют всегда, независимо от active_list. Каждый показывается в алерте
+    под своим display_name.
+
     previous - прошлая версия базы. Если АКТИВНЫЙ источник не скачался (или
     вернул подозрительно мало записей), берутся его записи из previous, а база
     помечается degraded=True (обновление повторится скоро, а не через неделю).
@@ -274,9 +338,19 @@ async def fetch_threat_db(
     use_list1 = active_list in ("list1", "merged")
     use_list2 = active_list in ("list2", "merged")
 
-    primary_text, blacklist_text = await asyncio.gather(
+    enabled_extras = []
+    for e in extra_sources or []:
+        if not e.get("enabled", True):
+            continue
+        if e.get("type") == "abuseipdb" and not e.get("api_key"):
+            log.warning("Источник %r (AbuseIPDB) пропущен: не задан api_key в config.yaml", e.get("name"))
+            continue
+        enabled_extras.append(e)
+    primary_text, blacklist_text, *extra_results = await asyncio.gather(
         http_client.get_text(primary_url) if primary_url else _empty(),
         http_client.get_text(blacklist_url) if blacklist_url else _empty(),
+        *[_fetch_extra_source(e) for e in enabled_extras],
+        return_exceptions=False,
     )
 
     networks: list[NetEntry] = []
@@ -332,6 +406,21 @@ async def fetch_threat_db(
                 per_source[blacklist_label] = len(old_nets) + len(old_ranges)
             else:
                 log.error("Доп. список (%s) недоступен, прошлой версии нет", blacklist_label)
+
+    # ---- дополнительные источники (sources.extra) ----
+    for (label, entries), extra in zip(extra_results, enabled_extras):
+        if entries and _guard(label, len(entries)):
+            networks.extend(entries)
+            per_source[label] = len(entries)
+        else:
+            old_nets, _ = _previous_entries(previous, label)
+            degraded = True
+            if old_nets:
+                log.warning("Источник %s недоступен - использую прошлую версию (%d записей)", label, len(old_nets))
+                networks.extend(old_nets)
+                per_source[label] = len(old_nets)
+            else:
+                log.error("Источник %s недоступен, прошлой версии нет", label)
 
     # "Объединить - без повторов": убираем точные дубли (одна и та же сеть/диапазон
     # встретилась в нескольких источниках). Оставляем первое вхождение, чтобы метка

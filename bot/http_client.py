@@ -27,12 +27,12 @@ MAX_BYTES = 20 * 1024 * 1024
 USER_AGENT = "skipa-watchdog (+https://github.com/FlexEbat/skipa_watchdog)"
 
 
-def _get_bytes(url: str, timeout: float) -> bytes | None:
+def _get_bytes(url: str, timeout: float, headers: dict | None = None) -> bytes | None:
     # urllib умеет file:// и ftp:// - разрешаем только http(s)
     if not url.lower().startswith(("https://", "http://")):
         log.warning("Пропускаю URL с неподдерживаемой схемой: %s", url)
         return None
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (схема проверена выше)
             if resp.status != 200:
@@ -48,11 +48,11 @@ def _get_bytes(url: str, timeout: float) -> bytes | None:
         return None
 
 
-async def get_text(url: str, timeout: float = DEFAULT_TIMEOUT) -> str:
+async def get_text(url: str, timeout: float = DEFAULT_TIMEOUT, headers: dict | None = None) -> str:
     """Возвращает тело ответа как текст, либо '' при любой ошибке (сеть,
     таймаут, не-200 статус) - вызывающий код сам решает, что делать с
     пустым результатом."""
-    data = await asyncio.to_thread(_get_bytes, url, timeout)
+    data = await asyncio.to_thread(_get_bytes, url, timeout, headers)
     if data is None:
         return ""
     try:
@@ -61,9 +61,9 @@ async def get_text(url: str, timeout: float = DEFAULT_TIMEOUT) -> str:
         return ""
 
 
-async def get_json(url: str, timeout: float = DEFAULT_TIMEOUT) -> Any | None:
+async def get_json(url: str, timeout: float = DEFAULT_TIMEOUT, headers: dict | None = None) -> Any | None:
     """Возвращает распарсенный JSON, либо None при любой ошибке."""
-    data = await asyncio.to_thread(_get_bytes, url, timeout)
+    data = await asyncio.to_thread(_get_bytes, url, timeout, headers)
     if data is None:
         return None
     try:

@@ -89,7 +89,7 @@ class DbUpdateTests(unittest.TestCase):
         from bot import dbupdate
         old = ThreatDB(networks=[NetEntry(ipaddress.ip_network("1.2.3.0/24"), "skipa")])
         state = {"db": old}
-        cfg = mock.Mock(primary_list_url="P", blacklist_url="B", blacklist_name="bl", active_list="merged")
+        cfg = mock.Mock(primary_list_url="P", blacklist_url="B", blacklist_name="bl", active_list="merged", extra_sources=[])
         async def fake_get(url, **kw):
             return ""
         with mock.patch.object(ip_lists.http_client, "get_text", fake_get):
@@ -102,7 +102,7 @@ class DbUpdateTests(unittest.TestCase):
     def test_refresh_without_any_data_leaves_state_alone(self):
         from bot import dbupdate
         state = {"db": None}
-        cfg = mock.Mock(primary_list_url="P", blacklist_url="B", blacklist_name="bl", active_list="merged")
+        cfg = mock.Mock(primary_list_url="P", blacklist_url="B", blacklist_name="bl", active_list="merged", extra_sources=[])
         async def fake_get(url, **kw):
             return ""
         with mock.patch.object(ip_lists.http_client, "get_text", fake_get):

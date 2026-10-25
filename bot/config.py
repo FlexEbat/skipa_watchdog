@@ -96,8 +96,39 @@ class Config:
     # автоматически не блокировать loopback/частные сети и IP текущих SSH-сессий
     auto_allowlist: bool = True
     ssh_ports: list[int] = field(default_factory=lambda: [22])
+    # метод poll дополнительно читает conntrack ядра: видит трафик на опубликованные
+    # порты Docker-контейнеров и короткие сканы, которых нет в /proc/net/tcp
+    use_conntrack: bool = True
     # как часто проверять, что правила iptables на месте (сек.)
     guard_interval_seconds: int = 60
+
+    # ---- дополнительные источники (Spamhaus DROP, FireHOL, AbuseIPDB, ...) ----
+    extra_sources: list[dict] = field(default_factory=list)
+
+    # ---- бан: кнопка под алертом, автобан, зеркалирование в fail2ban ----
+    ban_enabled: bool = False
+    auto_ban_new_hits: bool = False
+    auto_ban_duration_minutes: int = 60
+    manual_ban_duration_minutes: int = 1440
+    fail2ban_jail: str = ""
+
+    # ---- health-check самих мониторов ----
+    healthcheck_enabled: bool = True
+    healthcheck_stale_after_minutes: int = 15
+    healthcheck_check_interval_minutes: int = 5
+
+    # ---- веб-дашборд ----
+    dashboard_enabled: bool = False
+    dashboard_host: str = "127.0.0.1"
+    dashboard_port: int = 8080
+    dashboard_username: str = ""
+    dashboard_password: str = ""
+
+    # ---- еженедельный дайджест ----
+    digest_enabled: bool = True
+    digest_weekday: int = 0   # 0=понедельник ... 6=воскресенье
+    digest_hour: int = 9
+    digest_minute: int = 0
 
     # ---- параметры LOG-правила ----
     log_limit: str = "30/second"
@@ -109,12 +140,29 @@ class Config:
 
     @property
     def firewall_needed(self) -> bool:
-        """Нужны ли правила iptables: для блокировки и для kernel_log-мониторинга."""
-        return self.action_mode in ("block", "block_notify") or self.method in ("kernel_log", "both")
+        """Нужны ли правила iptables: для блокировки, бана по кнопке и для
+        kernel_log-мониторинга."""
+        return (
+            self.drop_enabled
+            or self.ban_enabled
+            or self.method in ("kernel_log", "both")
+        )
 
     @property
     def drop_enabled(self) -> bool:
-        return self.action_mode in ("block", "block_notify")
+        """Блокировать ли автоматически: action.mode=block/block_notify либо
+        banning.auto_ban_new_hits."""
+        return self.action_mode in ("block", "block_notify") or (
+            self.ban_enabled and self.auto_ban_new_hits
+        )
+
+    @property
+    def auto_block_timeout_s(self) -> int:
+        """Таймаут автоблокировки в секундах (0 = бессрочно). Если автобан
+        включён через banning.*, действует banning.auto_ban_duration_minutes."""
+        if self.ban_enabled and self.auto_ban_new_hits and self.action_mode == "notify":
+            return int(self.auto_ban_duration_minutes * 60)
+        return int(self.block_timeout_hours * 3600)
 
     @classmethod
     def load(cls, path: str | Path = "config.yaml") -> "Config":
@@ -140,6 +188,10 @@ class Config:
         env = sect("environment")
         alerting = sect("alerting")
         fw = sect("firewall")
+        banning = sect("banning")
+        healthcheck = sect("healthcheck")
+        dashboard = sect("dashboard")
+        digest = sect("digest")
 
         ignore_nets = []
         for item in mon.get("ignore_ips", []) or []:
@@ -207,8 +259,27 @@ class Config:
             block_timeout_hours=max(0.0, float(act.get("block_timeout_hours", 72))),
             preload_db=bool(act.get("preload_db", True)),
             auto_allowlist=bool(mon.get("auto_allowlist", True)),
+            use_conntrack=bool(mon.get("use_conntrack", True)),
             ssh_ports=ssh_ports or [22],
             guard_interval_seconds=max(10, int(mon.get("guard_interval_seconds", 60))),
+            extra_sources=[e for e in (src.get("extra") or []) if isinstance(e, dict)],
+            ban_enabled=bool(banning.get("enabled", False)),
+            auto_ban_new_hits=bool(banning.get("auto_ban_new_hits", False)),
+            auto_ban_duration_minutes=max(0, int(banning.get("auto_ban_duration_minutes", 60))),
+            manual_ban_duration_minutes=max(0, int(banning.get("manual_ban_duration_minutes", 1440))),
+            fail2ban_jail=str(banning.get("fail2ban_jail", "") or ""),
+            healthcheck_enabled=bool(healthcheck.get("enabled", True)),
+            healthcheck_stale_after_minutes=max(1, int(healthcheck.get("stale_after_minutes", 15))),
+            healthcheck_check_interval_minutes=max(1, int(healthcheck.get("check_interval_minutes", 5))),
+            dashboard_enabled=bool(dashboard.get("enabled", False)),
+            dashboard_host=str(dashboard.get("host", "127.0.0.1")),
+            dashboard_port=int(dashboard.get("port", 8080)),
+            dashboard_username=str(dashboard.get("username", "") or ""),
+            dashboard_password=str(dashboard.get("password", "") or ""),
+            digest_enabled=bool(digest.get("enabled", True)),
+            digest_weekday=min(6, max(0, int(digest.get("weekday", 0)))),
+            digest_hour=min(23, max(0, int(digest.get("hour", 9)))),
+            digest_minute=min(59, max(0, int(digest.get("minute", 0)))),
             log_limit=str(fw.get("log_limit", "30/second")),
             log_burst=max(1, int(fw.get("log_burst", 40))),
         )
@@ -216,6 +287,13 @@ class Config:
         return cfg
 
     def _sanity_warnings(self, path: Path) -> None:
+        if self.dashboard_enabled and not self.dashboard_username:
+            print(
+                "[config] dashboard.enabled=true без username/password: дашборд откроется без "
+                "авторизации. Держите host=127.0.0.1 (доступ через SSH-туннель) или задайте логин и пароль."
+            )
+        if self.dashboard_enabled and self.dashboard_username and not self.dashboard_password:
+            print("[config] dashboard.username задан, а password пуст - вход будет невозможен")
         if self.telegram_enabled:
             if self.chat_id == 0:
                 print("[config] telegram.bot_token задан, а chat_id=0 - уведомления некуда отправлять")

@@ -1,0 +1,4 @@
+# Необязательно: графики для /stats и еженедельного дайджеста.
+# Без matplotlib вместо картинки приходит текстовая гистограмма по часам.
+#   pip install -r requirements-extras.txt
+matplotlib>=3.8

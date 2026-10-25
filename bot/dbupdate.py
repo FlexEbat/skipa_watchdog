@@ -40,6 +40,7 @@ async def refresh_db(config: Config, state: dict) -> str:
         config.blacklist_name,
         config.active_list,
         previous=previous,
+        extra_sources=config.extra_sources,
     )
     if not has_data(new_db):
         return "Не удалось получить свежую базу, оставил старую версию."

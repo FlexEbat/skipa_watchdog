@@ -1,7 +1,9 @@
 [Unit]
-Description=Install skipa-watchdog firewall rules (SKIPA-BLOCK + CONN logging: INPUT + DOCKER-USER + KUBE-*)
+Description=Install skipa-watchdog firewall rules (SKIPA-BLOCK jumps: INPUT + DOCKER-USER + KUBE-*)
 After=docker.service
-Requires=docker.service
+# Wants, а не Requires: на хосте без Docker юнит с Requires=docker.service не
+# запускался вообще, и правила не ставились
+Wants=docker.service
 # Если на узле есть ещё и kubelet, тоже дождёмся его (юнит должен существовать -
 # на серверах без k8s этот After просто ни на что не влияет)
 After=kubelet.service

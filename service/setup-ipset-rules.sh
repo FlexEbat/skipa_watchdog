@@ -29,16 +29,25 @@ ACTION_MODE="${1:-block_notify}"
 SKIP_DOCKER="${SKIPA_SKIP_DOCKER:-0}"
 SKIP_K8S="${SKIPA_SKIP_K8S:-0}"
 
+ipt() { iptables -w 5 "$@"; }
+
 ipset create skipa-scanners hash:net maxelem "$MAXELEM_SCANNERS" -exist
 ipset create skipa-manual hash:net maxelem "$MAXELEM_MANUAL" -exist
+# allowlist (частные сети + IGNORE_IPS): наполняет sync-lists.sh. Каждое правило
+# ниже содержит условие "src НЕ в skipa-allow", поэтому свои адреса не
+# блокируются, даже если попали внутрь большой сети из списка.
+ipset create skipa-allow hash:net maxelem 4096 -exist
+
+# Хвост условия, общий для LOG и DROP
+ALLOW_COND=(-m set ! --match-set skipa-allow src)
 
 ensure_log_rule() {
     local chain="$1" set="$2"
-    if iptables -C "$chain" -m set --match-set "$set" src -m limit --limit "$LIMIT" \
+    if ipt -C "$chain" -m set --match-set "$set" src "${ALLOW_COND[@]}" -m limit --limit "$LIMIT" \
         --limit-burst "$BURST" -j LOG --log-prefix "$LOG_PREFIX" --log-level 4 2>/dev/null; then
         echo "[skipa-watchdog] LOG-правило ($set) в $chain уже стоит"
     else
-        iptables -I "$chain" 1 -m set --match-set "$set" src -m limit --limit "$LIMIT" \
+        ipt -I "$chain" 1 -m set --match-set "$set" src "${ALLOW_COND[@]}" -m limit --limit "$LIMIT" \
             --limit-burst "$BURST" -j LOG --log-prefix "$LOG_PREFIX" --log-level 4
         echo "[skipa-watchdog] LOG-правило ($set) добавлено в $chain"
     fi
@@ -46,23 +55,34 @@ ensure_log_rule() {
 
 remove_log_rule() {
     local chain="$1" set="$2"
-    iptables -D "$chain" -m set --match-set "$set" src -m limit --limit "$LIMIT" \
+    ipt -D "$chain" -m set --match-set "$set" src "${ALLOW_COND[@]}" -m limit --limit "$LIMIT" \
         --limit-burst "$BURST" -j LOG --log-prefix "$LOG_PREFIX" --log-level 4 2>/dev/null || true
 }
 
 ensure_drop_rule() {
     local chain="$1" set="$2"
-    if iptables -C "$chain" -m set --match-set "$set" src -j DROP 2>/dev/null; then
+    if ipt -C "$chain" -m set --match-set "$set" src "${ALLOW_COND[@]}" -j DROP 2>/dev/null; then
         echo "[skipa-watchdog] DROP-правило ($set) в $chain уже стоит"
     else
-        iptables -I "$chain" 1 -m set --match-set "$set" src -j DROP
+        ipt -I "$chain" 1 -m set --match-set "$set" src "${ALLOW_COND[@]}" -j DROP
         echo "[skipa-watchdog] DROP-правило ($set) добавлено в $chain"
     fi
 }
 
 remove_drop_rule() {
     local chain="$1" set="$2"
-    iptables -D "$chain" -m set --match-set "$set" src -j DROP 2>/dev/null || true
+    ipt -D "$chain" -m set --match-set "$set" src "${ALLOW_COND[@]}" -j DROP 2>/dev/null || true
+}
+
+# Правила прошлых версий (без проверки allowlist) - убираем, иначе они продолжат
+# блокировать адреса из allowlist
+remove_legacy_rules() {
+    local chain="$1" set
+    for set in "${SETS[@]}"; do
+        ipt -D "$chain" -m set --match-set "$set" src -j DROP 2>/dev/null || true
+        ipt -D "$chain" -m set --match-set "$set" src -m limit --limit "$LIMIT" \
+            --limit-burst "$BURST" -j LOG --log-prefix "$LOG_PREFIX" --log-level 4 2>/dev/null || true
+    done
 }
 
 # Порядок вставки важен: чтобы LOG успел сработать ДО того, как пакет
@@ -71,6 +91,7 @@ remove_drop_rule() {
 apply_to_chain() {
     local chain="$1"
     local set
+    remove_legacy_rules "$chain"
     for set in "${SETS[@]}"; do
         case "$ACTION_MODE" in
             notify)
@@ -93,7 +114,7 @@ apply_to_chain INPUT
 
 if [ "$SKIP_DOCKER" = "1" ]; then
     echo "[skipa-watchdog] SKIPA_SKIP_DOCKER=1 - пропускаю DOCKER-USER"
-elif iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+elif ipt -L DOCKER-USER -n >/dev/null 2>&1; then
     apply_to_chain DOCKER-USER
 else
     echo "[skipa-watchdog] Цепочка DOCKER-USER не найдена - Docker не запущен или не установлен. Пропускаю."
@@ -107,7 +128,7 @@ elif command -v ipvsadm >/dev/null 2>&1 && ipvsadm -L -n 2>/dev/null | grep -q .
 else
     found=0
     for chain in KUBE-EXTERNAL-SERVICES KUBE-NODEPORTS; do
-        if iptables -L "$chain" -n >/dev/null 2>&1; then
+        if ipt -L "$chain" -n >/dev/null 2>&1; then
             apply_to_chain "$chain"
             found=1
         fi

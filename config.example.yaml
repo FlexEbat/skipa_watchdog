@@ -13,9 +13,13 @@ telegram:
   # Оставьте пустым, чтобы работать без Telegram (только локальный лог/блокировка)
   bot_token: ""
   chat_id: 0
-  # Если список пуст - команды бота доступны всем, кто напишет боту.
-  # Рекомендуется указать хотя бы свой Telegram user id.
+  # Telegram user id администраторов (кому разрешены команды /block, /unblock,
+  # /update и т.д.). Если список пуст, команды принимаются только из чата
+  # chat_id. Рекомендуется указать свой user id.
   admin_ids: []
+  # Прокси для Telegram, если он недоступен напрямую (http://, https://, socks5://).
+  # Для socks5 нужен extra: pip install "python-telegram-bot[socks]"
+  proxy: ""
 
 sources:
   # Основной список: CIDR-блоки сканеров CyberOK/Skipa, ГРЧЦ, НКЦКИ
@@ -44,9 +48,17 @@ action:
   #
   # Блокировка работает через отдельную цепочку iptables SKIPA-BLOCK,
   # подключённую и к хосту (INPUT), и к Docker (DOCKER-USER), и к
-  # Kubernetes (KUBE-*) - см. install-firewall-rules.sh. Без него сама
-  # блокировка технически создаётся, но трафик до неё не доходит.
+  # Kubernetes (KUBE-*). Переходы в эту цепочку watchdog.py ставит и сам
+  # проверяет/чинит каждую минуту (после перезагрузки, рестарта Docker,
+  # ufw/firewalld reload) - вручную запускать install-firewall-rules.sh не нужно.
   mode: "block_notify"
+  # На сколько часов блокировать автоматически (0 = бессрочно). Ручные
+  # блокировки (/block) по умолчанию бессрочные.
+  block_timeout_hours: 72
+  # Если установлен ipset: загружать ВСЮ базу сканеров в ядро заранее, чтобы
+  # сканер отсекался уже на первом SYN, а не после него. LOG пишется только для
+  # SYN от сканеров (общий LOG всех SYN не нужен).
+  preload_db: true
 
 monitoring:
   # "poll" (периодический опрос /proc/net/tcp, без доп. зависимостей) /
@@ -61,8 +73,17 @@ monitoring:
   poll_interval_seconds: 5
   # Не слать повторный алерт с одного и того же IP чаще, чем раз в N минут
   alert_cooldown_minutes: 60
-  # IP/подсети, которые никогда не считаются сканом (свои IP, мониторинг и т.п.)
+  # IP/подсети, которые никогда не считаются сканом и не блокируются (свои IP,
+  # мониторинг и т.п.). Частные сети (10/8, 172.16/12, 192.168/16, 127/8) и
+  # сети короче /16 защищены всегда. ВАЖНО: впишите сюда IP, с которого
+  # подключаетесь по SSH, если он статический.
   ignore_ips: []
+  # Автоматически не блокировать IP, с которых сейчас открыты SSH-сессии на
+  # ssh_ports (защита от отрезания себя от сервера)
+  auto_allowlist: true
+  ssh_ports: [22]
+  # Как часто проверять и чинить правила iptables/ipset (сек.)
+  guard_interval_seconds: 60
 
 enrichment:
   # Обогащать алерт гео/ASN-данными (ipinfo.io + RIPEstat + ipregistry.co).
@@ -75,10 +96,16 @@ enrichment:
 environment:
   # При старте процесс один раз проверяет наличие Docker/Kubernetes и пишет
   # заметку в лог (плюс доступно по команде /env в Telegram, если он
-  # подключён). Само логирование/блокировка сканов на DOCKER-USER/KUBE-*
-  # цепочках ставится через install.sh / install-firewall-rules.sh.
+  # подключён). docker_scan/k8s_scan: false - не подключать SKIPA-BLOCK к
+  # DOCKER-USER / KUBE-* соответственно. Важно: опубликованные порты контейнеров
+  # не видны в /proc/net/tcp хоста, для них работает только kernel_log/ipset.
   docker_scan: true
   k8s_scan: true
+
+firewall:
+  # Лимит LOG-правила (чтобы шторм сканов не забил журнал)
+  log_limit: "30/second"
+  log_burst: 40
 
 logging:
   level: "INFO"

@@ -5,6 +5,12 @@
 # Запускается install.sh при установке и дальше периодически через
 # skipa-watchdog-sync-lists.timer (systemd). Можно и вручную:
 #   sudo bash sync-lists.sh /opt/skipa_watchdog/service.conf
+#
+# Защита от сбоев источников:
+#   - слишком широкие сети (короче /16) и битые строки отбрасываются;
+#   - если источник не скачался - используется его последняя удачная копия;
+#   - если источник внезапно "похудел" больше чем вдвое - тоже;
+#   - ipset подменяется (swap) только если restore прошёл без ошибок.
 set -uo pipefail
 
 CONF="${1:-/opt/skipa_watchdog/service.conf}"
@@ -21,58 +27,105 @@ mkdir -p "$LOG_DIR" "$STATE_DIR"
 
 SETNAME="skipa-scanners"
 TMPSET="skipa-scanners-tmp"
+ALLOWSET="skipa-allow"
 MAXELEM=200000
-RANGE_CAP=65536
+MAXELEM_ALLOW=4096
+MIN_PREFIX=16
+MAX_RANGE=1048576
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [sync-lists] $*" | tee -a "$LOG_DIR/skipa-watchdog.log" >&2
 }
 
 fetch() {
+    # --max-filesize: источник не должен отдавать десятки мегабайт
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time 30 "$1" 2>/dev/null
+        curl -fsSL --max-time 30 --max-filesize 20971520 "$1" 2>/dev/null
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO- --timeout=30 "$1" 2>/dev/null
+        wget -qO- --timeout=30 "$1" 2>/dev/null | head -c 20971520
     fi
 }
 
-# Раскладывает диапазон A-B на отдельные записи /32 (с ограничением по
-# размеру - предохранитель от случайно огромного диапазона в источнике).
-expand_range() {
-    local start="$1" end="$2"
-    awk -v start="$start" -v end="$end" -v cap="$RANGE_CAP" '
-    function ip2int(ip,   a,n) {
+# Нормализует источник в записи, которые ipset (hash:net) принимает как есть:
+# "IP/MASK", диапазон "A-B" (ipset сам разложит его на сети - вручную
+# раскладывать не нужно и лимитов на размер диапазона больше нет) или
+# одиночный IP (-> /32). Битые строки, обратные диапазоны и сети короче
+# /MIN_PREFIX отбрасываются.
+normalize_list() {
+    awk -v minp="$MIN_PREFIX" -v maxr="$MAX_RANGE" '
+    function ip2int(ip,   a, n, k) {
         n = split(ip, a, ".")
         if (n != 4) return -1
-        return (a[1]*16777216)+(a[2]*65536)+(a[3]*256)+a[4]
+        for (k = 1; k <= 4; k++) if (a[k] !~ /^[0-9]+$/ || a[k] + 0 > 255) return -1
+        return a[1]*16777216 + a[2]*65536 + a[3]*256 + a[4]
     }
-    function int2ip(n,   o1,o2,o3,o4) {
-        o1 = int(n/16777216); n = n % 16777216
-        o2 = int(n/65536); n = n % 65536
-        o3 = int(n/256); o4 = n % 256
-        return o1"."o2"."o3"."o4
-    }
-    BEGIN {
-        s = ip2int(start); e = ip2int(end)
-        if (s < 0 || e < 0 || e < s) { exit 0 }
-        if (e - s + 1 > cap) { exit 0 }
-        for (i = s; i <= e; i++) print int2ip(i) "/32"
+    {
+        sub(/#.*/, ""); gsub(/[ \t\r]/, "")
+        if ($0 == "") next
+        if (index($0, "/")) {
+            split($0, p, "/")
+            if (ip2int(p[1]) < 0 || p[2] !~ /^[0-9]+$/ || p[2] + 0 > 32 || p[2] + 0 < minp) next
+            print $0
+        } else if (index($0, "-")) {
+            split($0, p, "-")
+            s = ip2int(p[1]); e = ip2int(p[2])
+            if (s < 0 || e < s || e - s + 1 > maxr) next
+            print p[1] "-" p[2]
+        } else {
+            if (ip2int($0) < 0) next
+            print $0 "/32"
+        }
     }'
 }
 
-# Построчно нормализует источник (CIDR / диапазон "A-B" / одиночный IP) в
-# записи вида "IP/MASK".
-normalize_list() {
-    while IFS= read -r line; do
-        line="${line%%#*}"
-        line="$(echo "$line" | tr -d '[:space:]')"
-        [ -z "$line" ] && continue
-        case "$line" in
-            */*) echo "$line" ;;
-            *-*) expand_range "${line%-*}" "${line#*-}" ;;
-            *) echo "${line}/32" ;;
-        esac
-    done
+# Скачивает один источник с откатом на последнюю удачную копию.
+# $1 - имя (для файла кэша и лога), $2 - URL. Результат - в stdout.
+get_source() {
+    local name="$1" url="$2" cache="$STATE_DIR/$1.last" fresh="" n_new n_old=0
+    [ -z "$url" ] && return 0
+    fresh="$(fetch "$url" | normalize_list)"
+    n_new=$(printf '%s' "$fresh" | grep -c . || true)
+    [ -f "$cache" ] && n_old=$(grep -c . "$cache" || true)
+
+    if [ "$n_new" -eq 0 ]; then
+        if [ "$n_old" -gt 0 ]; then
+            log "Источник $name недоступен - использую последнюю удачную копию ($n_old записей)"
+            cat "$cache"
+        else
+            log "Источник $name недоступен, копии нет"
+        fi
+        return 0
+    fi
+    if [ "$n_old" -gt 0 ] && [ $((n_new * 2)) -lt "$n_old" ]; then
+        log "Источник $name вернул $n_new записей вместо ~$n_old - похоже на сбой, использую прошлую копию"
+        cat "$cache"
+        return 0
+    fi
+    printf '%s\n' "$fresh" > "$cache"
+    printf '%s\n' "$fresh"
+}
+
+# Атомарно подменяет содержимое набора: restore во временный + swap. Подмена
+# выполняется ТОЛЬКО если restore прошёл без ошибок (раньше недозагруженный
+# набор мог попасть в бой). $1 - боевой набор, $2 - временный, $3 - maxelem,
+# $4 - файл с записями.
+replace_set() {
+    local live="$1" tmp="$2" maxelem="$3" file="$4"
+    ipset create "$tmp" hash:net maxelem "$maxelem" -exist || return 1
+    ipset flush "$tmp" || return 1
+    {
+        echo "create $tmp hash:net maxelem $maxelem -exist"
+        while IFS= read -r net; do
+            echo "add $tmp $net -exist"
+        done < "$file"
+    } | ipset restore -exist
+    if [ "${PIPESTATUS[1]}" -ne 0 ]; then
+        ipset destroy "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    ipset create "$live" hash:net maxelem "$maxelem" -exist || return 1
+    ipset swap "$tmp" "$live" || { ipset destroy "$tmp" 2>/dev/null; return 1; }
+    ipset destroy "$tmp" 2>/dev/null || true
 }
 
 use_list1=0
@@ -84,39 +137,20 @@ case "${ACTIVE_LIST:-merged}" in
 esac
 
 RAW_FILE="$(mktemp)"
-trap 'rm -f "$RAW_FILE"' EXIT
+ALLOW_FILE="$(mktemp)"
+trap 'rm -f "$RAW_FILE" "$ALLOW_FILE"' EXIT
 
 # Оба источника скачиваются всегда, независимо от ACTIVE_LIST - чтобы данные
-# по обоим листам оставались свежими (и было с чем сравнивать при смене
-# активного списка), а не протухали, пока не выбраны. ACTIVE_LIST влияет
-# только на то, какие из скачанных записей реально попадают в ipset ниже.
-PRIMARY_NORMALIZED=""
-BLACKLIST_NORMALIZED=""
-if [ -n "${PRIMARY_LIST_URL:-}" ]; then
-    PRIMARY_NORMALIZED="$(fetch "$PRIMARY_LIST_URL" | normalize_list)"
-fi
-if [ -n "${BLACKLIST_URL:-}" ]; then
-    BLACKLIST_NORMALIZED="$(fetch "$BLACKLIST_URL" | normalize_list)"
-fi
+# по обоим листам оставались свежими, а не протухали, пока не выбраны.
+# ACTIVE_LIST влияет только на то, какие записи реально попадают в ipset.
+PRIMARY_NORMALIZED="$(get_source primary "${PRIMARY_LIST_URL:-}")"
+BLACKLIST_NORMALIZED="$(get_source blacklist "${BLACKLIST_URL:-}")"
 
-if [ "$use_list1" = "1" ] && [ -n "$PRIMARY_NORMALIZED" ]; then
-    printf '%s\n' "$PRIMARY_NORMALIZED" >> "$RAW_FILE"
-fi
-if [ "$use_list2" = "1" ] && [ -n "$BLACKLIST_NORMALIZED" ]; then
-    printf '%s\n' "$BLACKLIST_NORMALIZED" >> "$RAW_FILE"
-fi
-
-# Исключения (IGNORE_IPS) - точное построчное совпадение, см. комментарий в
-# service.conf.example про ограничение этого подхода.
-if [ -n "${IGNORE_IPS:-}" ]; then
-    for ign in $IGNORE_IPS; do
-        [[ "$ign" == */* ]] || ign="${ign}/32"
-        grep -vxF "$ign" "$RAW_FILE" > "$RAW_FILE.f" 2>/dev/null && mv "$RAW_FILE.f" "$RAW_FILE"
-    done
-fi
+[ "$use_list1" = "1" ] && [ -n "$PRIMARY_NORMALIZED" ] && printf '%s\n' "$PRIMARY_NORMALIZED" >> "$RAW_FILE"
+[ "$use_list2" = "1" ] && [ -n "$BLACKLIST_NORMALIZED" ] && printf '%s\n' "$BLACKLIST_NORMALIZED" >> "$RAW_FILE"
 
 sort -u "$RAW_FILE" -o "$RAW_FILE"
-COUNT=$(wc -l < "$RAW_FILE" | tr -d ' ')
+COUNT=$(grep -c . "$RAW_FILE" || true)
 
 if [ "$COUNT" -eq 0 ]; then
     log "Не удалось получить ни одной записи (сеть недоступна или оба источника пусты) -" \
@@ -124,20 +158,28 @@ if [ "$COUNT" -eq 0 ]; then
     exit 0
 fi
 
-# Собираем новый набор во временном ipset и подменяем им боевой атомарно
-# (ipset swap) - без окна, когда список пуст или наполовину загружен.
-ipset create "$TMPSET" hash:net maxelem "$MAXELEM" -exist
-ipset flush "$TMPSET"
+# allowlist: частные/служебные сети + IGNORE_IPS (IP или CIDR). Это именно набор,
+# а не вычёркивание строк из списка: так исключение работает и для адреса,
+# лежащего ВНУТРИ большой сети из списка. DROP-правило проверяет его первым
+# (см. setup-ipset-rules.sh).
 {
-    echo "create $TMPSET hash:net maxelem $MAXELEM -exist"
-    while IFS= read -r net; do
-        echo "add $TMPSET $net -exist"
-    done < "$RAW_FILE"
-} | ipset restore -exist
+    printf '%s\n' 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16
+    for ign in ${IGNORE_IPS:-}; do
+        [[ "$ign" == */* ]] || ign="${ign}/32"
+        echo "$ign"
+    done
+} | normalize_list | sort -u > "$ALLOW_FILE"
 
-ipset create "$SETNAME" hash:net maxelem "$MAXELEM" -exist
-ipset swap "$TMPSET" "$SETNAME"
-ipset destroy "$TMPSET" 2>/dev/null || true
+if ! replace_set "$ALLOWSET" "$ALLOWSET-tmp" "$MAXELEM_ALLOW" "$ALLOW_FILE"; then
+    log "Не удалось обновить ipset $ALLOWSET - список сканеров НЕ обновляю, чтобы не заблокировать своих"
+    exit 1
+fi
+
+if ! replace_set "$SETNAME" "$TMPSET" "$MAXELEM" "$RAW_FILE"; then
+    log "ОШИБКА: не удалось загрузить список в ipset (возможно, превышен maxelem=$MAXELEM) -" \
+        "прежнее содержимое $SETNAME оставлено без изменений"
+    exit 1
+fi
 
 date +%s > "$STATE_DIR/last-sync"
 log "Обновлено: $COUNT записей в ipset $SETNAME (active_list=${ACTIVE_LIST:-merged})"

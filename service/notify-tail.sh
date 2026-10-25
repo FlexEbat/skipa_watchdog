@@ -22,15 +22,38 @@ PROCESS_LOG="$LOG_DIR/skipa-watchdog.log"
 echo "$(date '+%Y-%m-%d %H:%M:%S') [notify-tail] Запущен, слежу за journalctl -k (префикс '$PREFIX')" \
     >> "$PROCESS_LOG"
 
-journalctl -k -f -n 0 --output=cat 2>/dev/null | grep --line-buffered -F "$PREFIX" | while IFS= read -r line; do
-    src="$(echo "$line" | grep -oP 'SRC=\K[0-9.]+' || true)"
-    dpt="$(echo "$line" | grep -oP 'DPT=\K[0-9]+' || true)"
-    [ -z "$src" ] && continue
-    ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    {
-        echo "===== $ts | IP=$src | port=${dpt:-?} ====="
-        echo "$line"
-        echo
-    } >> "$DETECTIONS_LOG"
-    echo "$ts [notify-tail] СКАНЕР ОБНАРУЖЕН: $src (порт ${dpt:-?})" >> "$PROCESS_LOG"
-done
+# Антиспам: один и тот же IP пишется в detections.log не чаще раза в
+# ALERT_COOLDOWN_MINUTES (иначе сканер, бьющий по портам, давал бы до 30
+# записей в секунду - лимит LOG-правила).
+COOLDOWN=$(( ${ALERT_COOLDOWN_MINUTES:-60} * 60 ))
+SRC_RE='SRC=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)'
+DPT_RE='DPT=([0-9]+)'
+
+journalctl -k -f -n 0 --output=cat 2>/dev/null | grep --line-buffered -F "$PREFIX" | {
+    declare -A last_seen=()
+    while IFS= read -r line; do
+        [[ $line =~ $SRC_RE ]] || continue
+        src="${BASH_REMATCH[1]}"
+        dpt="?"
+        [[ $line =~ $DPT_RE ]] && dpt="${BASH_REMATCH[1]}"
+
+        now=$(date +%s)
+        prev="${last_seen[$src]:-0}"
+        if [ $((now - prev)) -lt "$COOLDOWN" ]; then
+            continue
+        fi
+        last_seen[$src]=$now
+        # не даём массиву расти бесконечно
+        if [ "${#last_seen[@]}" -gt 20000 ]; then
+            last_seen=()
+        fi
+
+        ts="$(date '+%Y-%m-%d %H:%M:%S')"
+        {
+            echo "===== $ts | IP=$src | port=$dpt ====="
+            echo "$line"
+            echo
+        } >> "$DETECTIONS_LOG"
+        echo "$ts [notify-tail] СКАНЕР ОБНАРУЖЕН: $src (порт $dpt)" >> "$PROCESS_LOG"
+    done
+}

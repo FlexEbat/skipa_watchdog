@@ -30,22 +30,27 @@ USER_AGENT = "skipa-watchdog (+https://github.com/FlexEbat/skipa_watchdog)"
 def _get_bytes(url: str, timeout: float, headers: dict | None = None) -> bytes | None:
     # urllib умеет file:// и ftp:// - разрешаем только http(s)
     if not url.lower().startswith(("https://", "http://")):
-        log.warning("Пропускаю URL с неподдерживаемой схемой: %s", url)
+        log.warning("Пропускаю URL с неподдерживаемой схемой: %s", _safe_url(url))
         return None
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (схема проверена выше)
             if resp.status != 200:
-                log.debug("GET %s -> HTTP %s", url, resp.status)
+                log.debug("GET %s -> HTTP %s", _safe_url(url), resp.status)
                 return None
             data = resp.read(MAX_BYTES + 1)
             if len(data) > MAX_BYTES:
-                log.warning("GET %s: ответ больше %d байт, отбрасываю", url, MAX_BYTES)
+                log.warning("GET %s: ответ больше %d байт, отбрасываю", _safe_url(url), MAX_BYTES)
                 return None
             return data
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
-        log.debug("GET %s не удался: %s", url, e)
+        log.debug("GET %s не удался: %s", _safe_url(url), e)
         return None
+
+
+def _safe_url(url: str) -> str:
+    """URL без строки запроса для журнала: в ней бывают токены (ipinfo)."""
+    return url.split("?", 1)[0]
 
 
 async def get_text(url: str, timeout: float = DEFAULT_TIMEOUT, headers: dict | None = None) -> str:
@@ -69,5 +74,5 @@ async def get_json(url: str, timeout: float = DEFAULT_TIMEOUT, headers: dict | N
     try:
         return json.loads(data)
     except json.JSONDecodeError as e:
-        log.debug("Некорректный JSON от %s: %s", url, e)
+        log.debug("Некорректный JSON от %s: %s", _safe_url(url), e)
         return None

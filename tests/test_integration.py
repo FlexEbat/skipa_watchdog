@@ -212,3 +212,35 @@ class SmokeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SecretsInLogsTests(unittest.TestCase):
+    def test_bot_token_and_keys_never_reach_the_log_file(self):
+        import logging
+        import watchdog
+        from tests.helpers import make_config
+
+        token = "123456789:AAH-secret_token_value_0123456789"
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_config(bot_token=token, ipinfo_token="ipinfo_secret_value", log_dir=d, log_level="INFO",
+                              extra_sources=[{"api_key": "abuse_secret_value"}])
+            root = logging.getLogger()
+            before = list(root.handlers)
+            try:
+                watchdog._setup_logging(cfg)
+                log = logging.getLogger("test")
+                log.info("HTTP Request: POST https://api.telegram.org/bot%s/getUpdates", token)
+                log.warning("ошибка: https://ipinfo.io/1.2.3.4/json?token=ipinfo_secret_value, ключ abuse_secret_value")
+                try:
+                    raise RuntimeError(f"сбой при обращении к /bot{token}/sendMessage")
+                except RuntimeError:
+                    log.exception("упало")
+                self.assertEqual(logging.getLogger("httpx").level, logging.WARNING)
+            finally:
+                for h in root.handlers[len(before):]:
+                    root.removeHandler(h)
+                    h.close()
+            text = (Path(d) / "skipa-watchdog.log").read_text()
+        for secret in (token, "AAH-secret_token_value", "ipinfo_secret_value", "abuse_secret_value"):
+            self.assertNotIn(secret, text)
+        self.assertIn("<скрыто>", text)

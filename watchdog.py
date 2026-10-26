@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import logging.handlers
+import re
 import signal
 import sys
 import time
@@ -60,6 +61,29 @@ NOTIFY_QUEUE_SIZE = 1000
 ENRICH_TIMEOUT_SECONDS = 25
 
 
+_SECRET_PATTERNS = (
+    (re.compile(r"bot\d{5,}:[A-Za-z0-9_-]{20,}"), "bot<скрыто>"),                     # токен Telegram в URL
+    (re.compile(r"(?i)\b(token|api_key|apikey|key)=[^&\s\"']+"), r"\1=<скрыто>"),     # ключи в строке запроса
+)
+
+
+class _RedactingFormatter(logging.Formatter):
+    """Не даёт секретам попасть в журнал: маскирует токен бота и ключи API в
+    итоговой строке (включая трейсбеки) и точные значения секретов из конфига."""
+
+    def __init__(self, fmt: str, secrets: list[str]):
+        super().__init__(fmt)
+        self._secrets = [x for x in secrets if x and len(x) >= 8]
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        for pattern, repl in _SECRET_PATTERNS:
+            text = pattern.sub(repl, text)
+        for secret in self._secrets:
+            text = text.replace(secret, "<скрыто>")
+        return text
+
+
 def _setup_logging(config: Config) -> Path:
     log_dir = Path(config.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -68,7 +92,15 @@ def _setup_logging(config: Config) -> Path:
     root = logging.getLogger()
     root.setLevel(level)
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    fmt = _RedactingFormatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        [config.bot_token, config.ipinfo_token, config.ipregistry_key, config.dashboard_password]
+        + [str(e.get("api_key", "")) for e in config.extra_sources],
+    )
+    # httpx (под python-telegram-bot) на уровне INFO пишет каждый запрос вместе с
+    # адресом, а в адресе Bot API лежит токен бота: тихо раз в несколько секунд
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(fmt)

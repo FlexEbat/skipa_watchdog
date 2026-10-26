@@ -14,33 +14,10 @@ ExecStart=/opt/skipa_watchdog/venv/bin/python /opt/skipa_watchdog/watchdog.py /o
 Restart=always
 RestartSec=10
 
-# --- Песочница ---------------------------------------------------------------
-# Процесс работает от root (нужен для iptables/ipset), поэтому ограничиваем всё
-# лишнее: файловая система только на чтение, кроме каталога установки (кэш,
-# очереди, список блокировок), логов и /run (xtables.lock). Если на вашей
-# системе из-за этого что-то не стартует - закомментируйте строки этого блока
-# и смотрите journalctl -u skipa-watchdog.
-NoNewPrivileges=yes
-ProtectSystem=strict
-ReadWritePaths=/opt/skipa_watchdog /run
-LogsDirectory=skipa_watchdog
-ProtectHome=read-only
-PrivateTmp=yes
-ProtectKernelModules=yes
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
-RestrictRealtime=yes
-LockPersonality=yes
-
-# Нужны права на чтение чужих сокетов в /proc/net, запись в /var/log/skipa_watchdog
-# и управление iptables (блокировка) - см. README. Если не хотите запускать от root,
-# раскомментируйте капабилити ниже и убедитесь, что пользователь/группа владеют
-# /var/log/skipa_watchdog (для CAP_NET_ADMIN, нужного iptables, обычно всё равно
-# нужен root или как минимум CAP_NET_ADMIN+CAP_NET_RAW).
-# User=skipa
-# Group=skipa
-# AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-# CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+# Сервис работает от root без песочницы: ему нужны iptables/ipset (блокировка и
+# правила firewall), чтение /proc/net (в том числе conntrack), запись в
+# /var/log/skipa_watchdog и в каталог установки.
+User=root
 
 [Install]
 WantedBy=multi-user.target

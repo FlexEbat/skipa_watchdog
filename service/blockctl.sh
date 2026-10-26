@@ -35,7 +35,7 @@ validate_target() {
         echo "Служебный или частный адрес - не блокирую: $t" >&2; return 1
     fi
     if ipset test skipa-allow "$ip" >/dev/null 2>&1; then
-        echo "Адрес в allowlist (IGNORE_IPS) - не блокирую: $t" >&2; return 1
+        echo "Адрес в allowlist (monitoring.ignore_ips) - не блокирую: $t" >&2; return 1
     fi
 }
 trap 'rm -f "$ERR_LOG"' EXIT
@@ -58,7 +58,7 @@ case "${1:-}" in
         # Разблокировать можно только то, что заблокировали вручную. Если IP
         # пришёл из базового списка (skipa-scanners) - он вернётся при
         # следующем обновлении; чтобы исключить его насовсем, впишите в
-        # IGNORE_IPS в service.conf.
+        # monitoring.ignore_ips в config.yaml.
         if ipset del "$MANUAL_SET" "$2" -exist 2>"$ERR_LOG"; then
             echo "OK"
         else
@@ -69,7 +69,7 @@ case "${1:-}" in
         if ipset test "$SCANNERS_SET" "$2" >/dev/null 2>&1; then
             echo "ПРИМЕЧАНИЕ: $2 также входит в автообновляемый список skipa-scanners -" \
                  "останется заблокирован через него. Чтобы исключить насовсем, добавьте" \
-                 "IP в IGNORE_IPS в service.conf." >&2
+                 "IP в monitoring.ignore_ips в config.yaml." >&2
         fi
         ;;
     list)

@@ -14,26 +14,34 @@
 # динамической цепочки SKIPA-BLOCK используется статичный ipset-матчинг.
 #
 # Использование:
-#   sudo bash setup-ipset-rules.sh <action_mode>
-#   action_mode: notify | block | block_notify (по умолчанию block_notify)
+#   sudo bash setup-ipset-rules.sh [config.yaml | notify|block|block_notify]
+# Настройки (режим действия, префикс LOG, лимит, пропуск Docker/K8s) берутся из
+# единого config.yaml; режим можно передать и явно третьим вариантом.
 set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARG="${1:-$HERE/../config.yaml}"
+# shellcheck source=lib-config.sh
+source "$HERE/lib-config.sh"
+if [ -f "$ARG" ]; then
+    load_service_config "$ARG"
+else
+    load_service_config "$HERE/../config.yaml"
+    ACTION_MODE="$ARG"
+fi
 
 SETS=("skipa-scanners" "skipa-manual")
 MAXELEM_SCANNERS=200000
 MAXELEM_MANUAL=65536
-LOG_PREFIX="${SKIPA_LOG_PREFIX:-CONN: }"
-LIMIT="${SKIPA_LIMIT:-30/second}"
-BURST="${SKIPA_BURST:-40}"
-ACTION_MODE="${1:-block_notify}"
-
-SKIP_DOCKER="${SKIPA_SKIP_DOCKER:-0}"
-SKIP_K8S="${SKIPA_SKIP_K8S:-0}"
+LOG_PREFIX="$KERNEL_LOG_PREFIX"
+LIMIT="$LOG_LIMIT"
+BURST="$LOG_BURST"
 
 ipt() { iptables -w 5 "$@"; }
 
 ipset create skipa-scanners hash:net maxelem "$MAXELEM_SCANNERS" -exist
 ipset create skipa-manual hash:net maxelem "$MAXELEM_MANUAL" -exist
-# allowlist (частные сети + IGNORE_IPS): наполняет sync-lists.sh. Каждое правило
+# allowlist (частные сети + monitoring.ignore_ips): наполняет sync-lists.sh. Каждое правило
 # ниже содержит условие "src НЕ в skipa-allow", поэтому свои адреса не
 # блокируются, даже если попали внутрь большой сети из списка.
 ipset create skipa-allow hash:net maxelem 4096 -exist
@@ -113,7 +121,7 @@ apply_to_chain() {
 apply_to_chain INPUT
 
 if [ "$SKIP_DOCKER" = "1" ]; then
-    echo "[skipa-watchdog] SKIPA_SKIP_DOCKER=1 - пропускаю DOCKER-USER"
+    echo "[skipa-watchdog] environment.docker_scan: false - пропускаю DOCKER-USER"
 elif ipt -L DOCKER-USER -n >/dev/null 2>&1; then
     apply_to_chain DOCKER-USER
 else
@@ -121,7 +129,7 @@ else
 fi
 
 if [ "$SKIP_K8S" = "1" ]; then
-    echo "[skipa-watchdog] SKIPA_SKIP_K8S=1 - пропускаю KUBE-* цепочки"
+    echo "[skipa-watchdog] environment.k8s_scan: false - пропускаю KUBE-* цепочки"
 elif command -v ipvsadm >/dev/null 2>&1 && ipvsadm -L -n 2>/dev/null | grep -q .; then
     echo "[skipa-watchdog] kube-proxy работает в режиме ipvs - цепочек KUBE-* в iptables нет," \
          "автоматическое логирование/блокировка NodePort-трафика недоступны."

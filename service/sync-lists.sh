@@ -4,7 +4,7 @@
 #
 # Запускается install.sh при установке и дальше периодически через
 # skipa-watchdog-sync-lists.timer (systemd). Можно и вручную:
-#   sudo bash sync-lists.sh /opt/skipa_watchdog/service.conf
+#   sudo bash sync-lists.sh /opt/skipa_watchdog/config.yaml
 #
 # Защита от сбоев источников:
 #   - слишком широкие сети (короче /16) и битые строки отбрасываются;
@@ -13,15 +13,15 @@
 #   - ipset подменяется (swap) только если restore прошёл без ошибок.
 set -uo pipefail
 
-CONF="${1:-/opt/skipa_watchdog/service.conf}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF="${1:-$HERE/../config.yaml}"
 if [ ! -f "$CONF" ]; then
     echo "Конфиг $CONF не найден" >&2
     exit 1
 fi
-# shellcheck disable=SC1090
-source "$CONF"
-
-LOG_DIR="${LOG_DIR:-/var/log/skipa_watchdog}"
+# shellcheck source=lib-config.sh
+source "$HERE/lib-config.sh"
+load_service_config "$CONF"   # единый config.yaml, тот же, что читает watchdog.py
 STATE_DIR="/var/lib/skipa_watchdog"
 mkdir -p "$LOG_DIR" "$STATE_DIR"
 
@@ -158,7 +158,7 @@ if [ "$COUNT" -eq 0 ]; then
     exit 0
 fi
 
-# allowlist: частные/служебные сети + IGNORE_IPS (IP или CIDR). Это именно набор,
+# allowlist: частные/служебные сети + monitoring.ignore_ips (IP или CIDR). Это именно набор,
 # а не вычёркивание строк из списка: так исключение работает и для адреса,
 # лежащего ВНУТРИ большой сети из списка. DROP-правило проверяет его первым
 # (см. setup-ipset-rules.sh).

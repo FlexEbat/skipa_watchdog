@@ -24,7 +24,7 @@ UNIT="skipa-watchdog"                       # systemd-юнит python-бота (
 FW_UNIT="skipa-watchdog-fw-rules"           # применяет правила python-режима после старта Docker
 SYNC_UNIT="skipa-watchdog-sync-lists"       # bash-режим: таймер обновления ipset
 NOTIFY_UNIT="skipa-watchdog-notify"         # bash-режим: демон записи detections.log
-SERVICE_CONF="$INSTALL_DIR/service.conf"    # конфиг bash-режима (не YAML - обычный bash source)
+SERVICE_CONF="$INSTALL_DIR/config.yaml"      # единый конфиг для обоих вариантов (bash читает его через service/lib-config.sh)
 
 # Содержит "service" (чистый bash + ipset/iptables, без Python вообще) или
 # "bot" (venv + python-telegram-bot) - определяет, какой из двух полностью
@@ -52,6 +52,13 @@ ok()    { echo -e "${C_GREEN}[+]${C_RESET} $*"; }
 warn()  { echo -e "${C_YELLOW}[!]${C_RESET} $*"; }
 err()   { echo -e "${C_RED}[x]${C_RESET} $*" >&2; }
 pause() { read -rp "Нажмите Enter, чтобы продолжить..." _; }
+
+# Подтверждение любого изменяющего действия: confirm "Что сделать?" -> 0 только на y/д
+confirm() {
+    local a
+    read -rp "$1 [y/N] " a || return 1
+    [[ "$a" =~ ^[YyДд] ]]
+}
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -106,6 +113,16 @@ detect_k8s() {
     fi
     command -v kubectl >/dev/null 2>&1 && [ -f "${KUBECONFIG:-$HOME/.kube/config}" ] && return 0
     return 1
+}
+
+# Есть ли в цепочке правила проекта - независимо от точной формы правила
+# (ipset-набор skipa-* или переход в SKIPA-BLOCK)
+_chain_has_skipa_rules() {
+    # вывод сначала в переменную: `iptables | grep -q` при pipefail падает по
+    # SIGPIPE, когда grep закрывает канал после первого совпадения
+    local rules
+    rules="$(iptables -w 5 -S "$1" 2>/dev/null)" || return 1
+    grep -qE 'SKIPA-BLOCK|skipa-(scanners|manual|allow|dyn|db)' <<<"$rules"
 }
 
 firewall_rules_applied() {
@@ -536,9 +553,11 @@ _do_install_service() {
         || { err "service/sync-lists.sh не найден в репозитории - установка прервана."; return 1; }
     chmod +x "$INSTALL_DIR"/service/*.sh
 
+    _migrate_legacy_service_conf
     if [ ! -f "$SERVICE_CONF" ]; then
-        cp "$INSTALL_DIR/service/service.conf.example" "$SERVICE_CONF" \
-            || { err "Не удалось создать service.conf."; return 1; }
+        cp "$INSTALL_DIR/config.example.yaml" "$SERVICE_CONF" \
+            || { err "Не удалось создать config.yaml."; return 1; }
+        chmod 600 "$SERVICE_CONF"
         info "Создан $SERVICE_CONF из шаблона (значения по умолчанию уже рабочие)."
     fi
 
@@ -591,18 +610,38 @@ do_uninstall() {
     read -rp "Удалить также логи в $LOG_DIR? [y/N] " a
     [[ "$a" =~ ^[Yy] ]] && rm -rf "$LOG_DIR"
 
-    if [ "$mode" = "bot" ]; then
-        ok "Skipa Watchdog полностью удалён. Правила iptables (SKIPA-BLOCK и переходы" \
-           "в INPUT/DOCKER-USER/KUBE-*) не трогал - уберите вручную при необходимости:"
-        echo "   iptables -D INPUT -j SKIPA-BLOCK ; iptables -F SKIPA-BLOCK ; iptables -X SKIPA-BLOCK"
+    if confirm "Убрать правила iptables и ipset проекта (SKIPA-BLOCK, skipa-*)?"; then
+        _remove_firewall_rules
+        ok "Skipa Watchdog полностью удалён, правила iptables и ipset убраны."
     else
-        ok "Skipa Watchdog полностью удалён. ipset skipa-scanners/skipa-manual и переходы" \
-           "в INPUT/DOCKER-USER/KUBE-* не трогал - уберите вручную при необходимости:"
-        echo "   iptables -D INPUT -m set --match-set skipa-scanners src -j DROP"
-        echo "   iptables -D INPUT -m set --match-set skipa-manual src -j DROP"
-        echo "   iptables -D INPUT -m set --match-set skipa-scanners src -j LOG --log-prefix \"CONN: \""
-        echo "   iptables -D INPUT -m set --match-set skipa-manual src -j LOG --log-prefix \"CONN: \""
-        echo "   ipset destroy skipa-scanners ; ipset destroy skipa-manual"
+        ok "Skipa Watchdog полностью удалён. Правила iptables/ipset оставлены - убрать позже:"
+        echo "   (переустановите и выберите удаление правил, либо удалите правила с 'skipa' вручную: iptables -S | grep -i skipa)"
+    fi
+}
+
+# Удаляет все правила проекта из INPUT/DOCKER-USER/KUBE-*, цепочку SKIPA-BLOCK и
+# ipset-наборы skipa-*. Правила берутся из `iptables -S`, поэтому не важно,
+# какой версией они были созданы.
+_remove_firewall_rules() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    local chain rule
+    for chain in INPUT DOCKER-USER KUBE-EXTERNAL-SERVICES KUBE-NODEPORTS SKIPA-BLOCK; do
+        iptables -w 5 -L "$chain" -n >/dev/null 2>&1 || continue
+        [ "$chain" = "SKIPA-BLOCK" ] && continue
+        while IFS= read -r rule; do
+            # shellcheck disable=SC2086
+            eval "iptables -w 5 ${rule/#-A /-D }" 2>/dev/null
+        done < <(iptables -w 5 -S "$chain" 2>/dev/null | grep -E 'SKIPA-BLOCK|skipa-(scanners|manual|allow|dyn|db)')
+    done
+    if iptables -w 5 -L SKIPA-BLOCK -n >/dev/null 2>&1; then
+        iptables -w 5 -F SKIPA-BLOCK 2>/dev/null
+        iptables -w 5 -X SKIPA-BLOCK 2>/dev/null
+    fi
+    if command -v ipset >/dev/null 2>&1; then
+        local set
+        for set in skipa-scanners skipa-manual skipa-allow skipa-dyn skipa-db skipa-scanners-tmp skipa-allow-tmp skipa-db-tmp; do
+            ipset destroy "$set" 2>/dev/null
+        done
     fi
 }
 
@@ -636,7 +675,7 @@ health_check() {
 import json
 print(int(json.load(open('$INSTALL_DIR/data/ip_cache.json')).get('last_update_ts', 0)))
 " 2>/dev/null)"
-            interval="$(grep -oP '(?<=update_interval_days: ).*' "$INSTALL_DIR/config.yaml" 2>/dev/null | tr -d ' ')"
+            interval="$(_service_conf_get UPDATE_INTERVAL_DAYS)"
             interval="${interval:-7}"
             if [ -n "$last_ts" ] && [ "$last_ts" != "0" ]; then
                 age_days=$(( ($(date +%s) - last_ts) / 86400 ))
@@ -661,10 +700,10 @@ print(int(json.load(open('$INSTALL_DIR/data/ip_cache.json')).get('last_update_ts
         if command -v iptables >/dev/null 2>&1; then
             if firewall_rules_applied; then
                 ok "Цепочка SKIPA-BLOCK существует."
-                if iptables -C INPUT -j SKIPA-BLOCK >/dev/null 2>&1; then
+                if iptables -w 5 -C INPUT -j SKIPA-BLOCK >/dev/null 2>&1; then
                     ok "INPUT подключён к SKIPA-BLOCK (блокировка/логирование хоста работает)."
                 else
-                    warn "INPUT НЕ подключён к SKIPA-BLOCK - запустите пункт про Docker/Kubernetes в меню."
+                    warn "INPUT НЕ подключён к SKIPA-BLOCK (watchdog подключит сам в течение минуты; если не помогло - пункт 5 меню)."
                 fi
             else
                 warn "Цепочка SKIPA-BLOCK не найдена - блокировка/логирование ещё не настроены."
@@ -713,13 +752,15 @@ print(int(json.load(open('$INSTALL_DIR/data/ip_cache.json')).get('last_update_ts
         fi
 
         if command -v iptables >/dev/null 2>&1; then
-            if iptables -C INPUT -m set --match-set skipa-scanners src -j DROP >/dev/null 2>&1 \
-                || iptables -C INPUT -m set --match-set skipa-scanners src -m limit --limit 30/second \
-                    --limit-burst 40 -j LOG --log-prefix "CONN: " --log-level 4 >/dev/null 2>&1; then
-                ok "INPUT подключён к ipset-правилам."
-            else
-                warn "INPUT НЕ подключён к ipset-правилам - запустите пункт 5 (Docker/Kubernetes)."
-            fi
+            local chain
+            for chain in INPUT DOCKER-USER KUBE-EXTERNAL-SERVICES KUBE-NODEPORTS; do
+                iptables -w 5 -L "$chain" -n >/dev/null 2>&1 || continue
+                if _chain_has_skipa_rules "$chain"; then
+                    ok "$chain подключён к правилам блокировки/логирования."
+                else
+                    warn "$chain НЕ подключён к правилам - примените их: пункт 5 (Docker/Kubernetes)."
+                fi
+            done
         fi
     fi
 
@@ -732,90 +773,142 @@ print(int(json.load(open('$INSTALL_DIR/data/ip_cache.json')).get('last_update_ts
 }
 
 manage_service() {
-    echo
     if [ ! -f "$INSTALL_MODE_FILE" ]; then
         warn "Не установлен."
         pause
         return
     fi
-
-    local mode
+    local mode action
     mode="$(_current_mode)"
-    if [ "$mode" = "bot" ]; then
-        echo "Действие: 1) start  2) stop  3) restart  4) статус"
-        read -rp "> " action
-        case "$action" in
-            1) systemctl start "$UNIT" && ok "Запущен" ;;
-            2) systemctl stop "$UNIT" && ok "Остановлен" ;;
-            3) systemctl restart "$UNIT" && ok "Перезапущен" ;;
-            4) systemctl status "$UNIT" --no-pager -l | head -n 15 ;;
-            *) warn "Неизвестное действие" ;;
-        esac
-    else
-        echo "В режиме 'только сервис' блокировка идёт в ядре без отдельного процесса -"
-        echo "управлять можно только вспомогательными юнитами:"
-        echo "  1) Обновить список IP сейчас (запустить $SYNC_UNIT)"
-        echo "  2) Перезапустить демон detections.log ($NOTIFY_UNIT)"
-        echo "  3) Статус обоих юнитов"
-        read -rp "> " action
-        case "$action" in
-            1) systemctl start "$SYNC_UNIT" && ok "Запущено" ;;
-            2) systemctl restart "$NOTIFY_UNIT" 2>/dev/null && ok "Перезапущен" \
-                || warn "Юнит $NOTIFY_UNIT не установлен (текущий режим действия - 'block'?)" ;;
-            3)
-                systemctl status "${SYNC_UNIT}.timer" --no-pager -l | head -n 10
-                systemctl status "$NOTIFY_UNIT" --no-pager -l 2>/dev/null | head -n 10
-                ;;
-            *) warn "Неизвестное действие" ;;
-        esac
-    fi
-    pause
+    while true; do
+        echo
+        if [ "$mode" = "bot" ]; then
+            echo "Управление сервисом ($UNIT):"
+            echo "  1) Запустить"
+            echo "  2) Остановить"
+            echo "  3) Перезапустить"
+            echo "  4) Статус"
+            echo "  0) Назад"
+            read -rp "> " action || return
+            case "$action" in
+                1) confirm "Запустить $UNIT?" && systemctl start "$UNIT" && ok "Запущен" ;;
+                2) confirm "Остановить $UNIT? (защита и блокировка новых IP остановятся, правила в ядре останутся)" \
+                    && systemctl stop "$UNIT" && ok "Остановлен" ;;
+                3) confirm "Перезапустить $UNIT?" && systemctl restart "$UNIT" && ok "Перезапущен" ;;
+                4) systemctl status "$UNIT" --no-pager -l | head -n 15 ;;
+                0) return ;;
+                *) warn "Неизвестное действие" ;;
+            esac
+        else
+            echo "В режиме 'только сервис' блокировка идёт в ядре без отдельного процесса -"
+            echo "управлять можно только вспомогательными юнитами:"
+            echo "  1) Обновить список IP сейчас (запустить $SYNC_UNIT)"
+            echo "  2) Перезапустить демон detections.log ($NOTIFY_UNIT)"
+            echo "  3) Статус обоих юнитов"
+            echo "  0) Назад"
+            read -rp "> " action || return
+            case "$action" in
+                1) confirm "Обновить список IP сейчас?" && systemctl start "$SYNC_UNIT" && ok "Запущено" ;;
+                2) confirm "Перезапустить $NOTIFY_UNIT?" \
+                    && { systemctl restart "$NOTIFY_UNIT" 2>/dev/null && ok "Перезапущен" \
+                        || warn "Юнит $NOTIFY_UNIT не установлен (текущий режим действия - 'block'?)"; } ;;
+                3)
+                    systemctl status "${SYNC_UNIT}.timer" --no-pager -l | head -n 10
+                    systemctl status "$NOTIFY_UNIT" --no-pager -l 2>/dev/null | head -n 10
+                    ;;
+                0) return ;;
+                *) warn "Неизвестное действие" ;;
+            esac
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------
 # Настройки обнаружения: список IP / режим действия
 # ---------------------------------------------------------------------------
-_set_yaml_scalar() {
-    # Обновляет "key: значение" внутри секции (простая эвристика через grep/sed,
-    # без внешних yaml-парсеров - конфиг у нас плоский и предсказуемый).
-    local file="$1" key="$2" value="$3"
-    if grep -q "^\(\s*${key}:\).*" "$file"; then
-        sed -i "s#^\(\s*${key}:\).*#\1 ${value}#" "$file"
-    else
-        warn "Ключ $key не найден в $file - допишите вручную."
-    fi
+# Единый конфиг: config.yaml читают и пишут оба варианта. Bash-часть работает
+# через service/lib-config.sh (awk, без Python).
+_conf_lib() {
+    # shellcheck source=/dev/null
+    source "$INSTALL_DIR/service/lib-config.sh"
 }
 
-# То же самое, но для service.conf (обычный bash KEY="value", без вложенных
-# секций) - используется bash-режимом "только сервис".
+# Старые имена ключей (service.conf) и короткие имена -> путь секция.ключ в config.yaml
+_conf_path() {
+    case "$1" in
+        ACTION_MODE|mode) echo "action.mode" ;;
+        ACTIVE_LIST|active_list) echo "sources.active_list" ;;
+        UPDATE_INTERVAL_DAYS) echo "sources.update_interval_days" ;;
+        PRIMARY_LIST_URL) echo "sources.primary_list_url" ;;
+        BLACKLIST_URL) echo "sources.blacklist_url" ;;
+        bot_token) echo "telegram.bot_token" ;;
+        chat_id) echo "telegram.chat_id" ;;
+        admin_ids) echo "telegram.admin_ids" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# Записывает значение, УЖЕ оформленное как YAML ("строка" в кавычках, число, [список])
+_set_yaml_scalar() {
+    local file="$1" key="$2" value="$3"
+    _conf_lib
+    yaml_set "$file" "$(_conf_path "$key")" "$value" raw
+}
+
+# Записывает обычную строку (кавычки добавляются сами)
 _service_conf_set() {
-    local key="$1" value="$2"
-    if grep -q "^${key}=" "$SERVICE_CONF" 2>/dev/null; then
-        sed -i "s#^${key}=.*#${key}=\"${value}\"#" "$SERVICE_CONF"
-    else
-        echo "${key}=\"${value}\"" >> "$SERVICE_CONF"
-    fi
+    _conf_lib
+    yaml_set "$SERVICE_CONF" "$(_conf_path "$1")" "$2"
 }
 
 _service_conf_get() {
-    local key="$1"
     [ -f "$SERVICE_CONF" ] || return 1
-    ( # shellcheck disable=SC1090
-      source "$SERVICE_CONF" 2>/dev/null
-      eval "echo \"\${$key:-}\""
+    _conf_lib
+    yaml_get "$SERVICE_CONF" "$(_conf_path "$1")"
+}
+
+# Раньше у варианта «только сервис» был отдельный service.conf (bash KEY="value").
+# Теперь конфиг один - переносим значения в config.yaml и откладываем старый файл.
+_migrate_legacy_service_conf() {
+    local old="$INSTALL_DIR/service.conf"
+    [ -f "$old" ] || return 0
+    [ -f "$INSTALL_DIR/service/lib-config.sh" ] || return 0
+    if [ -f "$SERVICE_CONF" ]; then
+        warn "Найдены и service.conf, и config.yaml - оставляю config.yaml, старый файл" \
+             "переименован в service.conf.migrated."
+        mv "$old" "$old.migrated"
+        return 0
+    fi
+    cp "$INSTALL_DIR/config.example.yaml" "$SERVICE_CONF" || return 1
+    chmod 600 "$SERVICE_CONF"
+    _conf_lib
+    (
+        # shellcheck source=/dev/null
+        source "$old" 2>/dev/null
+        [ -n "${ACTION_MODE:-}" ]            && yaml_set "$SERVICE_CONF" action.mode "$ACTION_MODE"
+        [ -n "${ACTIVE_LIST:-}" ]            && yaml_set "$SERVICE_CONF" sources.active_list "$ACTIVE_LIST"
+        [ -n "${PRIMARY_LIST_URL:-}" ]       && yaml_set "$SERVICE_CONF" sources.primary_list_url "$PRIMARY_LIST_URL"
+        [ -n "${UPDATE_INTERVAL_DAYS:-}" ]   && yaml_set "$SERVICE_CONF" sources.update_interval_days "$UPDATE_INTERVAL_DAYS" raw
+        [ -n "${LOG_DIR:-}" ]                && yaml_set "$SERVICE_CONF" logging.log_dir "$LOG_DIR"
+        [ -n "${KERNEL_LOG_PREFIX:-}" ]      && yaml_set "$SERVICE_CONF" monitoring.kernel_log_prefix "$KERNEL_LOG_PREFIX"
+        [ -n "${ALERT_COOLDOWN_MINUTES:-}" ] && yaml_set "$SERVICE_CONF" monitoring.alert_cooldown_minutes "$ALERT_COOLDOWN_MINUTES" raw
+        # BLACKLIST_URL мог быть пустым намеренно (источник отключён) - переносим как есть
+        yaml_set "$SERVICE_CONF" sources.blacklist_url "${BLACKLIST_URL-}"
+        if [ -n "${IGNORE_IPS:-}" ]; then
+            local list="" ip
+            for ip in $IGNORE_IPS; do list="${list:+$list, }\"$ip\""; done
+            yaml_set "$SERVICE_CONF" monitoring.ignore_ips "[$list]" raw
+        fi
     )
+    mv "$old" "$old.migrated"
+    ok "service.conf перенесён в config.yaml (старый файл сохранён как service.conf.migrated)."
 }
 
 detection_settings_menu() {
     local mode current_list current_action
     mode="$(_current_mode)"
-    if [ "$mode" = "bot" ]; then
-        current_list="$(grep -oP '(?<=active_list: ").*(?=")' "$INSTALL_DIR/config.yaml" 2>/dev/null || echo '?')"
-        current_action="$(grep -oP '(?<=mode: ").*(?=")' "$INSTALL_DIR/config.yaml" 2>/dev/null || echo '?')"
-    else
-        current_list="$(_service_conf_get ACTIVE_LIST || echo '?')"
-        current_action="$(_service_conf_get ACTION_MODE || echo '?')"
-    fi
+    current_list="$(_service_conf_get ACTIVE_LIST || echo '?')"
+    current_action="$(_service_conf_get ACTION_MODE || echo '?')"
     echo
     echo "Настройки обнаружения:"
     echo "  1) Источник IP-листов (сейчас: ${current_list:-?})"
@@ -847,15 +940,15 @@ select_active_list() {
         3) value="merged" ;;
         *) return ;;
     esac
+    confirm "Переключить источник на '$value' и применить?" || { info "Отменено."; pause; return; }
+    _service_conf_set ACTIVE_LIST "$value"
     if [ "$(_current_mode)" = "bot" ]; then
-        _set_yaml_scalar "$INSTALL_DIR/config.yaml" "active_list" "\"$value\""
         restart_if_running
     else
-        _service_conf_set ACTIVE_LIST "$value"
         info "Пересобираю ipset под новый список..."
         bash "$INSTALL_DIR/service/sync-lists.sh" "$SERVICE_CONF"
     fi
-    ok "active_list -> $value"
+    ok "sources.active_list -> $value"
     pause
 }
 
@@ -877,17 +970,11 @@ select_action_mode() {
         3) value="notify" ;;
         *) return ;;
     esac
-    local mode
-    mode="$(_current_mode)"
-    if [ "$mode" = "bot" ]; then
-        _set_yaml_scalar "$INSTALL_DIR/config.yaml" "mode" "\"$value\""
-        if [ "$value" != "notify" ] && ! firewall_rules_applied; then
-            warn "Блокировка выбрана, но правила SKIPA-BLOCK ещё не настроены - зайдите в пункт" \
-                 "про Docker/Kubernetes в меню."
-        fi
+    confirm "Установить режим '$value' и применить?" || { info "Отменено."; pause; return; }
+    _service_conf_set ACTION_MODE "$value"
+    if [ "$(_current_mode)" = "bot" ]; then
         restart_if_running
     else
-        _service_conf_set ACTION_MODE "$value"
         info "Применяю новый режим к iptables/ipset..."
         apply_firewall_rules
         _sync_notify_service_state "$value"
@@ -898,9 +985,8 @@ select_action_mode() {
 
 restart_if_running() {
     if [ "$(_current_mode 2>/dev/null)" = "bot" ] && systemctl is-active --quiet "$UNIT" 2>/dev/null; then
-        echo "Перезапустить сервис, чтобы применить изменения? [y/N]"
-        read -rp "> " a
-        [[ "$a" =~ ^[Yy] ]] && systemctl restart "$UNIT" && ok "Перезапущено."
+        confirm "Перезапустить сервис, чтобы применить изменения?" \
+            && systemctl restart "$UNIT" && ok "Перезапущено."
     fi
 }
 
@@ -916,14 +1002,11 @@ _migrate_service_to_bot() {
          "бот, а таймер обновления списков и сам ipset НЕ трогаю: список" \
          "продолжает обновляться и блокироваться в ядре независимо от Python."
 
+    # config.yaml один на оба варианта и уже содержит выбранные источник и режим
     if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
         cp "$INSTALL_DIR/config.example.yaml" "$INSTALL_DIR/config.yaml" \
             || { err "Не удалось создать config.yaml."; return 1; }
-        local al am
-        al="$(_service_conf_get ACTIVE_LIST)"
-        am="$(_service_conf_get ACTION_MODE)"
-        [ -n "$al" ] && _set_yaml_scalar "$INSTALL_DIR/config.yaml" "active_list" "\"$al\""
-        [ -n "$am" ] && _set_yaml_scalar "$INSTALL_DIR/config.yaml" "mode" "\"$am\""
+        chmod 600 "$INSTALL_DIR/config.yaml"
     fi
 
     ensure_venv || return 1
@@ -951,21 +1034,27 @@ _migrate_service_to_bot() {
 
 configure_telegram() {
     if [ ! -f "$INSTALL_MODE_FILE" ]; then
-        warn "Сначала установите Skipa Watchdog."; pause; return
+        warn "Сначала установите Skipa Watchdog."; return
     fi
-    if [ "$(_current_mode)" != "bot" ]; then
-        _migrate_service_to_bot || { pause; return; }
-    fi
-    install_telegram_deps || { pause; return; }
     echo
+    echo "Настройка Telegram (на любой вопрос можно ответить 0 - отмена)."
+    local token chat_id admins
     read -rp "Telegram bot_token (от @BotFather): " token
+    { [ -z "$token" ] || [ "$token" = "0" ]; } && { info "Отменено."; return; }
     read -rp "chat_id (куда слать уведомления): " chat_id
-    read -rp "admin_ids через запятую (можно оставить пустым): " admins
+    [ "$chat_id" = "0" ] && { info "Отменено."; return; }
+    read -rp "admin_ids через запятую (Telegram user id; пусто - команды только из чата chat_id): " admins
+    [ "$admins" = "0" ] && { info "Отменено."; return; }
 
-    [ -z "$token" ] && { warn "Токен не введён, отменено."; return; }
+    confirm "Сохранить настройки Telegram и применить?" || { info "Отменено."; return; }
+
+    if [ "$(_current_mode)" != "bot" ]; then
+        _migrate_service_to_bot || return
+    fi
+    install_telegram_deps || return
 
     _set_yaml_scalar "$INSTALL_DIR/config.yaml" "bot_token" "\"$token\""
-    _set_yaml_scalar "$INSTALL_DIR/config.yaml" "chat_id" "$chat_id"
+    _set_yaml_scalar "$INSTALL_DIR/config.yaml" "chat_id" "${chat_id:-0}"
     if [ -n "$admins" ]; then
         local formatted
         formatted="[$(echo "$admins" | tr -d ' ')]"
@@ -981,28 +1070,33 @@ disable_telegram() {
         warn "Telegram и так не подключён (сейчас режим 'только сервис')."
         return
     fi
+    confirm "Отключить Telegram (bot_token будет очищен)?" || { info "Отменено."; return; }
     _set_yaml_scalar "$INSTALL_DIR/config.yaml" "bot_token" '""'
     ok "Telegram отключён (bot_token очищен, venv и python-telegram-bot оставлены на месте)."
 }
 
 telegram_menu() {
-    echo
-    if [ "$(_current_mode 2>/dev/null)" != "bot" ]; then
-        echo "Сейчас установлен режим 'только сервис' (без Python). Подключение"
-        echo "Telegram создаст venv и поставит python-telegram-bot - единственное"
-        echo "место во всём проекте, где используется Python."
+    local c
+    while true; do
         echo
-    fi
-    echo "Telegram:"
-    echo "  1) Подключить/перенастроить"
-    echo "  2) Отключить"
-    echo "  0) Назад"
-    read -rp "> " c
-    case "$c" in
-        1) configure_telegram; pause ;;
-        2) disable_telegram; restart_if_running; pause ;;
-        *) return ;;
-    esac
+        if [ "$(_current_mode 2>/dev/null)" != "bot" ]; then
+            echo "Сейчас установлен режим 'только сервис' (без Python). Подключение"
+            echo "Telegram создаст venv и поставит python-telegram-bot - единственное"
+            echo "место во всём проекте, где используется Python."
+            echo
+        fi
+        echo "Telegram:"
+        echo "  1) Подключить/перенастроить"
+        echo "  2) Отключить"
+        echo "  0) Назад"
+        read -rp "> " c || return
+        case "$c" in
+            1) configure_telegram; pause ;;
+            2) disable_telegram; restart_if_running; pause ;;
+            0) return ;;
+            *) warn "Неизвестный пункт" ;;
+        esac
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -1012,87 +1106,94 @@ blocklist_menu() {
     if [ ! -f "$INSTALL_MODE_FILE" ]; then
         err "Сначала установите Skipa Watchdog."; pause; return
     fi
-    local mode py
+    local mode py c ip
     mode="$(_current_mode)"
-    echo
-    echo "Заблокированные IP:"
-    if [ "$mode" = "bot" ]; then
-        py="$(_python_bin)"
-        (cd "$INSTALL_DIR" && "$py" -c "
+    py="$(_python_bin)"
+    while true; do
+        echo
+        echo "Заблокированные IP:"
+        if [ "$mode" = "bot" ]; then
+            (cd "$INSTALL_DIR" && "$py" -c "
 from bot import blocker
 ips = blocker.list_blocked_ips()
-print('  (никто не заблокирован)' if not ips else '\n'.join(f'  {ip}' for ip in ips))
+print('  (никто не заблокирован вручную или автоматически)' if not ips else '\n'.join(f'  {ip}' for ip in ips))
 ")
-    else
-        bash "$INSTALL_DIR/service/blockctl.sh" list | sed 's/^/  /'
-    fi
-    echo
-    echo "  1) Заблокировать IP вручную"
-    echo "  2) Разблокировать IP"
-    echo "  0) Назад"
-    read -rp "> " c
-    case "$c" in
-        1)
-            read -rp "IP для блокировки: " ip
-            if [ "$mode" = "bot" ]; then
-                (cd "$INSTALL_DIR" && "$py" -c "
+        else
+            bash "$INSTALL_DIR/service/blockctl.sh" list | sed 's/^/  /'
+        fi
+        echo
+        echo "  1) Заблокировать IP вручную"
+        echo "  2) Разблокировать IP"
+        echo "  0) Назад"
+        read -rp "> " c || return
+        case "$c" in
+            1)
+                read -rp "IP или сеть для блокировки (0 - отмена): " ip
+                { [ -z "$ip" ] || [ "$ip" = "0" ]; } && continue
+                confirm "Заблокировать $ip бессрочно?" || { info "Отменено."; continue; }
+                if [ "$mode" = "bot" ]; then
+                    (cd "$INSTALL_DIR" && "$py" -c "
 import sys
 from bot import blocker
-# вручную - бессрочно (второй аргумент 0), IP передаётся через argv, а не
-# подстановкой в код
+# вручную - бессрочно (второй аргумент 0), IP передаётся через argv, а не подстановкой в код
 print('OK' if blocker.block_ip(sys.argv[1], 0) else 'FAIL')
 " "$ip")
-            else
-                bash "$INSTALL_DIR/service/blockctl.sh" block "$ip"
-            fi
-            ;;
-        2)
-            read -rp "IP для разблокировки: " ip
-            if [ "$mode" = "bot" ]; then
-                (cd "$INSTALL_DIR" && "$py" -c "
+                else
+                    bash "$INSTALL_DIR/service/blockctl.sh" block "$ip"
+                fi
+                ;;
+            2)
+                read -rp "IP для разблокировки (0 - отмена): " ip
+                { [ -z "$ip" ] || [ "$ip" = "0" ]; } && continue
+                confirm "Разблокировать $ip?" || { info "Отменено."; continue; }
+                if [ "$mode" = "bot" ]; then
+                    (cd "$INSTALL_DIR" && "$py" -c "
 import sys
 from bot import blocker
 print('OK' if blocker.unblock_ip(sys.argv[1]) else 'FAIL')
 " "$ip")
-            else
-                bash "$INSTALL_DIR/service/blockctl.sh" unblock "$ip"
-            fi
-            ;;
-        *) return ;;
-    esac
-    pause
+                else
+                    bash "$INSTALL_DIR/service/blockctl.sh" unblock "$ip"
+                fi
+                ;;
+            0) return ;;
+            *) warn "Неизвестный пункт" ;;
+        esac
+    done
 }
 
 # ---------------------------------------------------------------------------
 # Прочее: логи, конфиг, обновление базы, обновление проекта
 # ---------------------------------------------------------------------------
 view_logs() {
-    echo
-    local mode
+    local mode c
     mode="$(_current_mode 2>/dev/null || echo service)"
-    echo "Какие логи посмотреть?"
-    if [ "$mode" = "bot" ]; then
-        echo "  1) journalctl бота (последние 50 строк)"
-    else
-        echo "  1) journalctl (sync-lists + notify, последние 50 строк)"
-    fi
-    echo "  2) $LOG_DIR/detections.log (последние 30 строк)"
-    echo "  3) $LOG_DIR/skipa-watchdog.log (последние 30 строк)"
-    echo "  0) Назад"
-    read -rp "> " c
-    case "$c" in
-        1)
-            if [ "$mode" = "bot" ]; then
-                journalctl -u "$UNIT" -n 50 --no-pager
-            else
-                journalctl -u "$SYNC_UNIT" -u "$NOTIFY_UNIT" -n 50 --no-pager
-            fi
-            ;;
-        2) tail -n 30 "$LOG_DIR/detections.log" 2>/dev/null || warn "Файл не найден" ;;
-        3) tail -n 30 "$LOG_DIR/skipa-watchdog.log" 2>/dev/null || warn "Файл не найден" ;;
-        *) return ;;
-    esac
-    pause
+    while true; do
+        echo
+        echo "Какие логи посмотреть?"
+        if [ "$mode" = "bot" ]; then
+            echo "  1) journalctl сервиса (последние 50 строк)"
+        else
+            echo "  1) journalctl (sync-lists + notify, последние 50 строк)"
+        fi
+        echo "  2) $LOG_DIR/detections.log (последние 30 строк)"
+        echo "  3) $LOG_DIR/skipa-watchdog.log (последние 30 строк)"
+        echo "  0) Назад"
+        read -rp "> " c || return
+        case "$c" in
+            1)
+                if [ "$mode" = "bot" ]; then
+                    journalctl -u "$UNIT" -n 50 --no-pager
+                else
+                    journalctl -u "$SYNC_UNIT" -u "$NOTIFY_UNIT" -n 50 --no-pager
+                fi
+                ;;
+            2) tail -n 30 "$LOG_DIR/detections.log" 2>/dev/null || warn "Файл не найден" ;;
+            3) tail -n 30 "$LOG_DIR/skipa-watchdog.log" 2>/dev/null || warn "Файл не найден" ;;
+            0) return ;;
+            *) warn "Неизвестный пункт" ;;
+        esac
+    done
 }
 
 force_update_db() {
@@ -1101,23 +1202,31 @@ force_update_db() {
         pause
         return
     fi
+    confirm "Принудительно обновить базу IP-адресов сейчас?" || { info "Отменено."; pause; return; }
     local mode
     mode="$(_current_mode)"
-    info "Принудительно обновляю базу IP-адресов..."
+    info "Обновляю базу IP-адресов..."
     if [ "$mode" = "bot" ]; then
         local py
         py="$(_python_bin)"
         (cd "$INSTALL_DIR" && "$py" - <<'PYEOF'
 import asyncio
 from bot.config import Config
-from bot.ip_lists import fetch_threat_db, save_cache
+from bot.ip_lists import fetch_threat_db, has_data, load_cache, save_cache
 
 cfg = Config.load("config.yaml")
-db = asyncio.run(fetch_threat_db(cfg.primary_list_url, cfg.blacklist_url, cfg.blacklist_name, cfg.active_list))
-save_cache(db)
-print(f"Готово: {db.source_line_count} записей ({db.per_source_counts})")
+db = asyncio.run(fetch_threat_db(
+    cfg.primary_list_url, cfg.blacklist_url, cfg.blacklist_name, cfg.active_list,
+    previous=load_cache(), extra_sources=cfg.extra_sources,
+))
+if has_data(db):
+    save_cache(db)
+    print(f"Готово: {db.source_line_count} записей ({db.per_source_counts})")
+else:
+    print("Не удалось получить базу - кэш не изменён.")
 PYEOF
         )
+        restart_if_running   # запущенный сервис подхватит свежий кэш и обновит ipset после перезапуска
     else
         bash "$INSTALL_DIR/service/sync-lists.sh" "$SERVICE_CONF"
     fi
@@ -1130,21 +1239,21 @@ edit_config() {
         pause
         return
     fi
-    local target
+    confirm "Открыть $SERVICE_CONF в редакторе (${EDITOR:-nano})?" || { info "Отменено."; return; }
+    "${EDITOR:-nano}" "$SERVICE_CONF"
+    _secure_config
     if [ "$(_current_mode)" = "bot" ]; then
-        target="$INSTALL_DIR/config.yaml"
-    else
-        target="$SERVICE_CONF"
+        restart_if_running
+    elif confirm "Применить изменения (пересобрать ipset и правила iptables)?"; then
+        bash "$INSTALL_DIR/service/sync-lists.sh" "$SERVICE_CONF"
+        apply_firewall_rules
+        _sync_notify_service_state "$(_service_conf_get ACTION_MODE)"
     fi
-    "${EDITOR:-nano}" "$target"
-    if [ "$(_current_mode)" != "bot" ]; then
-        info "Это service.conf (bash) - изменения в источниках/режиме действия" \
-             "применятся после: пункт 7 (обновить базу) и/или пункт 5 (Docker/Kubernetes)."
-    fi
-    restart_if_running
+    pause
 }
 
 update_project() {
+    confirm "Обновить Skipa Watchdog (git pull + зависимости) и перезапустить сервис?" || { info "Отменено."; return; }
     info "Обновляю Skipa Watchdog (git pull + зависимости)..."
     do_install
     pause
@@ -1153,6 +1262,36 @@ update_project() {
 # ---------------------------------------------------------------------------
 # Меню
 # ---------------------------------------------------------------------------
+firewall_menu() {
+    local c chain
+    while true; do
+        echo
+        echo "Docker/Kubernetes (логирование + блокировка):"
+        echo "  1) Применить/обновить правила сейчас"
+        echo "  2) Показать текущие правила проекта"
+        echo "  0) Назад"
+        read -rp "> " c || return
+        case "$c" in
+            1)
+                if confirm "Применить правила iptables/ipset (INPUT, DOCKER-USER, KUBE-*)?"; then
+                    apply_firewall_rules
+                fi
+                pause
+                ;;
+            2)
+                for chain in INPUT DOCKER-USER KUBE-EXTERNAL-SERVICES KUBE-NODEPORTS SKIPA-BLOCK; do
+                    iptables -w 5 -L "$chain" -n >/dev/null 2>&1 || continue
+                    echo "--- $chain"
+                    iptables -w 5 -S "$chain" | grep -E 'SKIPA-BLOCK|skipa-|CONN' | sed 's/^/  /'
+                done
+                pause
+                ;;
+            0) return ;;
+            *) warn "Неизвестный пункт" ;;
+        esac
+    done
+}
+
 main_menu() {
     while true; do
         print_header
@@ -1174,7 +1313,7 @@ main_menu() {
             2) manage_service ;;
             3) detection_settings_menu ;;
             4) telegram_menu ;;
-            5) apply_firewall_rules; pause ;;
+            5) firewall_menu ;;
             6) blocklist_menu ;;
             7) force_update_db ;;
             8) view_logs ;;
@@ -1247,8 +1386,10 @@ main() {
     # first_run_flow) - здесь, при обычном запуске уже установленного
     # Skipa Watchdog, это не повторяется. Донастроить вручную можно из
     # меню (пункт "Docker/Kubernetes") или командой `install.sh fw-rules`.
+    _migrate_legacy_service_conf
     check_list_updates
     main_menu
 }
 
-main "$@"
+# SKIPA_SOURCE_ONLY=1 - только подключить функции (для тестов), меню не запускать
+[ "${SKIPA_SOURCE_ONLY:-0}" = "1" ] || main "$@"

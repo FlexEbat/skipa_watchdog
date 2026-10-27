@@ -126,3 +126,23 @@ class UpdateRepoTests(unittest.TestCase):
         self.assertEqual(self._scenario("y\n"), ["2", "секрет"])
         self.assertEqual(self._scenario("n\n"), ["1", "секрет"])
         self.assertEqual(self._scenario(""), ["1", "секрет"])       # без терминала: ничего не сбрасываем
+
+
+@unittest.skipUnless(shutil.which("bash"), "нужен bash")
+class MonitoringMethodMenuTests(unittest.TestCase):
+    def _run(self, answers, mode="bot"):
+        r, _ = run(
+            'cp "$INSTALL_DIR/config.example.yaml" "$SERVICE_CONF"\n'
+            f'echo {mode} > "$INSTALL_MODE_FILE"\n'
+            f'printf "%b" "{answers}" | select_monitoring_method >/dev/null 2>&1\n'
+            '_conf_lib; yaml_get "$SERVICE_CONF" monitoring.method; yaml_get "$SERVICE_CONF" monitoring.poll_interval_seconds'
+        )
+        return r.stdout.split()
+
+    def test_method_changes_only_after_confirmation(self):
+        """метод обнаружения меняется только после подтверждения и не трогает соседние ключи"""
+        self.assertEqual(self._run("2\\ny\\n\\n"), ["kernel_log", "5"])
+        self.assertEqual(self._run("1\\nn\\n\\n"), ["both", "5"])      # отказ: значение по умолчанию
+        self.assertEqual(self._run("0\\n"), ["both", "5"])             # выход без изменений
+        self.assertEqual(self._run("9\\n"), ["both", "5"])             # неизвестный пункт
+        self.assertEqual(self._run("1\\ny\\n\\n", mode="service"), ["poll", "5"])

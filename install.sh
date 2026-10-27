@@ -922,21 +922,59 @@ _migrate_legacy_service_conf() {
 }
 
 detection_settings_menu() {
-    local mode current_list current_action
-    mode="$(_current_mode)"
-    current_list="$(_service_conf_get ACTIVE_LIST || echo '?')"
-    current_action="$(_service_conf_get ACTION_MODE || echo '?')"
+    local c current_list current_action current_method
+    while true; do
+        current_list="$(_service_conf_get ACTIVE_LIST || echo '?')"
+        current_action="$(_service_conf_get ACTION_MODE || echo '?')"
+        current_method="$(_service_conf_get monitoring.method || echo '?')"
+        echo
+        echo "Настройки обнаружения:"
+        echo "  1) Источник IP-листов (сейчас: ${current_list:-?})"
+        echo "  2) Режим действия (сейчас: ${current_action:-?})"
+        echo "  3) Метод обнаружения (сейчас: ${current_method:-both})"
+        echo "  0) Назад"
+        read -rp "> " c || return
+        case "$c" in
+            1) select_active_list ;;
+            2) select_action_mode ;;
+            3) select_monitoring_method ;;
+            0) return ;;
+            *) warn "Неизвестный пункт" ;;
+        esac
+    done
+}
+
+# Метод обнаружения (monitoring.method в config.yaml). Используется процессом
+# watchdog.py (вариант с Telegram); bash-вариант всегда читает журнал ядра.
+select_monitoring_method() {
+    if [ ! -f "$INSTALL_MODE_FILE" ]; then
+        warn "Сначала установите Skipa Watchdog."; pause; return
+    fi
+    if [ "$(_current_mode)" != "bot" ]; then
+        info "В варианте 'только сервис' метод не используется: обнаружение идёт по журналу ядра."
+        info "Выбранное значение запишется в config.yaml и начнёт действовать после подключения Telegram."
+    fi
     echo
-    echo "Настройки обнаружения:"
-    echo "  1) Источник IP-листов (сейчас: ${current_list:-?})"
-    echo "  2) Режим действия (сейчас: ${current_action:-?})"
+    echo "Метод обнаружения подключений:"
+    echo "  1) poll       - опрос /proc/net/tcp и conntrack (видит и порты Docker, и короткие сканы)"
+    echo "  2) kernel_log - чтение журнала ядра через LOG-правило iptables (мгновенно, нужны правила)"
+    echo "  3) both       - оба метода (по умолчанию, рекомендуется)"
     echo "  0) Назад"
     read -rp "> " c
+    local value=""
     case "$c" in
-        1) select_active_list ;;
-        2) select_action_mode ;;
+        1) value="poll" ;;
+        2) value="kernel_log" ;;
+        3) value="both" ;;
         *) return ;;
     esac
+    confirm "Установить метод '$value' и применить?" || { info "Отменено."; pause; return; }
+    _service_conf_set monitoring.method "$value"
+    if [ "$(_current_mode)" = "bot" ]; then
+        restart_if_running
+    fi
+    ok "monitoring.method -> $value"
+    pause
 }
 
 select_active_list() {

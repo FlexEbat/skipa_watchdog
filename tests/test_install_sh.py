@@ -94,3 +94,35 @@ class InstallShTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(shutil.which("git") and shutil.which("bash"), "нужны git и bash")
+class UpdateRepoTests(unittest.TestCase):
+    def _git(self, cwd, *args):
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, env=env)
+
+    def _scenario(self, answer):
+        """Клон отстаёт от origin, а история origin переписана: быстрое обновление невозможно."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            origin, clone = d / "origin", d / "clone"
+            origin.mkdir()
+            self._git(origin, "init", "-q", "-b", "main")
+            (origin / "a.txt").write_text("1\n")
+            self._git(origin, "add", "."); self._git(origin, "commit", "-q", "-m", "one")
+            subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True, capture_output=True)
+            (clone / "config.yaml").write_text("секрет\n")                     # не отслеживается git
+            (origin / "a.txt").write_text("2\n")                                 # переписываем историю origin
+            self._git(origin, "add", "."); self._git(origin, "commit", "-q", "--amend", "-m", "one (переписан)")
+            r = subprocess.run(
+                ["bash", "-c", f'source "{ROOT / "install.sh"}"\n_update_repo "{clone}" >/dev/null 2>&1; cat "{clone}/a.txt"; cat "{clone}/config.yaml"'],
+                input=answer, capture_output=True, text=True, timeout=30, env={**os.environ, "SKIPA_SOURCE_ONLY": "1"},
+            )
+            return r.stdout.split()
+
+    def test_rewritten_history_is_handled_after_confirmation(self):
+        """после переписанной истории origin обновление идёт только с подтверждением и не трогает config.yaml"""
+        self.assertEqual(self._scenario("y\n"), ["2", "секрет"])
+        self.assertEqual(self._scenario("n\n"), ["1", "секрет"])
+        self.assertEqual(self._scenario(""), ["1", "секрет"])       # без терминала: ничего не сбрасываем

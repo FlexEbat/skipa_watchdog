@@ -17,10 +17,12 @@ def run(coro):
 
 class ParseTests(unittest.TestCase):
     def test_too_wide_networks_dropped(self):
+        """слишком широкие сети отбрасываются при разборе"""
         got = ip_lists._parse_cidr_list("0.0.0.0/0\n8.0.0.0/8\n1.2.3.0/24\n5.5.5.5\nbad\n# c\n")
         self.assertEqual(sorted(str(e.network) for e in got), ["1.2.3.0/24", "5.5.5.5/32"])
 
     def test_mixed_list_sanity(self):
+        """смешанный список: широкие сети и битые диапазоны отбрасываются"""
         nets, ranges = ip_lists._parse_mixed_list(
             "0.0.0.0/0\n1.1.1.0/24\n2.2.2.2-2.2.2.9\n9.9.9.9-1.1.1.1\n0.0.0.0-255.255.255.255\n", "x"
         )
@@ -28,6 +30,7 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(len(ranges), 1)
 
     def test_ipv4_mapped_matches(self):
+        """::ffff:a.b.c.d совпадает с IPv4-записью базы"""
         db = ThreatDB(networks=[NetEntry(ipaddress.ip_network("1.2.3.0/24"), "skipa")])
         self.assertIsNotNone(db.match("1.2.3.4"))
         self.assertIsNotNone(db.match("::ffff:1.2.3.4"))
@@ -35,6 +38,7 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(str(normalize_ip("::ffff:1.2.3.4")), "1.2.3.4")
 
     def test_ipset_entries_expand_ranges(self):
+        """диапазон раскладывается на минимальный набор CIDR"""
         nets, ranges = ip_lists._parse_mixed_list("2.2.2.0-2.2.2.130\n1.1.1.0/24\n", "x")
         db = ThreatDB(networks=nets, ranges=ranges)
         self.assertEqual(sorted(db.ipset_entries()), ["1.1.1.0/24", "2.2.2.0/25", "2.2.2.128/31", "2.2.2.130/32"])
@@ -51,11 +55,13 @@ class FetchTests(unittest.TestCase):
             return run(fetch_threat_db("P", "B", "bl", active, previous=previous))
 
     def test_full_success(self):
+        """оба источника доступны: база полная"""
         db = self._fetch({"P": self.PRIMARY, "B": self.BL})
         self.assertFalse(db.degraded)
         self.assertEqual(db.source_line_count, 7)
 
     def test_one_source_down_keeps_previous_and_marks_degraded(self):
+        """упавший источник берётся из прошлой версии, база помечается degraded"""
         good = self._fetch({"P": self.PRIMARY, "B": self.BL})
         db = self._fetch({"P": self.PRIMARY, "B": ""}, previous=good)
         self.assertTrue(db.degraded)
@@ -63,16 +69,19 @@ class FetchTests(unittest.TestCase):
         self.assertIsNotNone(db.match("7.7.7.7"))
 
     def test_shrunk_source_rejected(self):
+        """источник, сжавшийся вдвое, заменяется прошлой версией"""
         good = self._fetch({"P": self.PRIMARY, "B": self.BL})
         db = self._fetch({"P": "101.1.1.0/24", "B": self.BL}, previous=good)   # 1 из 5 < 50%
         self.assertTrue(db.degraded)
         self.assertEqual(db.per_source_counts["skipa"], 5)
 
     def test_everything_down_without_previous_is_empty(self):
+        """все источники недоступны и прошлой базы нет: база пуста"""
         db = self._fetch({})
         self.assertFalse(has_data(db))
 
     def test_degraded_retried_within_hour(self):
+        """неполная база перепроверяется через час"""
         db = ThreatDB(networks=[NetEntry(ipaddress.ip_network("1.2.3.0/24"), "s")],
                       last_update_ts=time.time() - 3700, degraded=True)
         self.assertTrue(needs_update(db, 7))
@@ -80,12 +89,14 @@ class FetchTests(unittest.TestCase):
         self.assertFalse(needs_update(db, 7))
 
     def test_cache_roundtrip_keeps_degraded(self):
+        """кэш сохраняет признак degraded"""
         db = ThreatDB(networks=[NetEntry(ipaddress.ip_network("1.2.3.0/24"), "s")], degraded=True)
         self.assertTrue(ThreatDB.from_json(json.loads(json.dumps(db.to_json()))).degraded)
 
 
 class DbUpdateTests(unittest.TestCase):
     def test_refresh_keeps_old_data_when_sources_down(self):
+        """обновление не стирает старые данные при недоступных источниках"""
         from bot import dbupdate
         old = ThreatDB(networks=[NetEntry(ipaddress.ip_network("1.2.3.0/24"), "skipa")])
         state = {"db": old}
@@ -100,6 +111,7 @@ class DbUpdateTests(unittest.TestCase):
         self.assertIn("недоступна", msg)
 
     def test_refresh_without_any_data_leaves_state_alone(self):
+        """без данных обновление не меняет состояние"""
         from bot import dbupdate
         state = {"db": None}
         cfg = mock.Mock(primary_list_url="P", blacklist_url="B", blacklist_name="bl", active_list="merged", extra_sources=[])
@@ -113,11 +125,13 @@ class DbUpdateTests(unittest.TestCase):
 
 class MonitorTests(unittest.TestCase):
     def test_hex_decode_ipv4_and_mapped(self):
+        """разбор адресов из /proc/net/tcp и tcp6"""
         self.assertEqual(monitor._hex_to_ip_port("0100A8C0:0050", False), ("192.168.0.1", 80))
         # 1.2.3.4 как ::ffff:1.2.3.4 в /proc/net/tcp6
         self.assertEqual(monitor._hex_to_ip_port("0000000000000000FFFF000004030201:01BB", True), ("1.2.3.4", 443))
 
     def test_only_inbound_connections(self):
+        """учитываются только входящие соединения"""
         table = [
             ("0A", "0.0.0.0", 0, 443),             # LISTEN :443
             ("01", "1.2.3.4", 55000, 443),         # входящее -> да
@@ -129,10 +143,12 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(got, {"1.2.3.4", "5.6.7.8"})
 
     def test_established_peers(self):
+        """адреса SSH-сессий берутся по локальному порту"""
         with mock.patch.object(monitor, "read_tcp_table", lambda: [("01", "7.7.7.7", 5000, 22), ("01", "8.8.8.8", 5000, 80)]):
             self.assertEqual(monitor.established_peers({22}), {"7.7.7.7"})
 
     def test_dedup_retry_after_failure(self):
+        """после сбоя повтор разрешается через минуту"""
         d = monitor.Deduper(60)
         self.assertTrue(d.should_alert("1.2.3.4"))
         self.assertFalse(d.should_alert("1.2.3.4"))
@@ -142,6 +158,7 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(d.should_alert("1.2.3.4"))
 
     def test_dispatch_survives_handler_error_and_penalizes(self):
+        """ошибка обработчика не ломает цикл и разрешает повтор"""
         d = monitor.Deduper(60)
         hit = monitor.Hit(ip="1.2.3.4", matched_source="x", local_port=1, method="poll")
         async def boom(h):
@@ -163,6 +180,7 @@ class FallbackTests(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def test_drain_then_requeue_keeps_alerts_added_meanwhile(self):
+        """очередь: алерты, добавленные во время отправки, не теряются"""
         fallback.queue_pending_alert(1, "a")
         fallback.queue_pending_alert(1, "b")
         records = fallback.drain_pending()
@@ -172,6 +190,7 @@ class FallbackTests(unittest.TestCase):
         self.assertEqual([r["text"] for r in fallback.load_pending()], ["c", "b"])
 
     def test_ttl_and_cap(self):
+        """очередь: срок хранения и максимальный размер"""
         old = time.time() - fallback.PENDING_TTL_SECONDS - 10
         fallback.queue_pending_alert(1, "old", ts=old)
         for i in range(fallback.MAX_PENDING + 5):
@@ -181,6 +200,7 @@ class FallbackTests(unittest.TestCase):
         self.assertNotIn("old", [r["text"] for r in got])
 
     def test_strip_html_unescapes(self):
+        """из HTML для журнала убираются теги и сущности"""
         self.assertEqual(fallback._strip_html("<b>A &amp; B</b>"), "A & B")
 
 

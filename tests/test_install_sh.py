@@ -49,15 +49,18 @@ def run(script: str, stdin: str = "", env_extra=None):
 @unittest.skipUnless(shutil.which("bash"), "нужен bash")
 class InstallShTests(unittest.TestCase):
     def test_rule_detection_understands_current_rule_form(self):
+        """проверка правил узнаёт текущую форму правил и не падает по SIGPIPE"""
         r, _ = run('_chain_has_skipa_rules INPUT && echo yes || echo no; _chain_has_skipa_rules DOCKER-USER && echo yes || echo no')
         self.assertEqual(r.stdout.split(), ["yes", "no"])
 
     def test_confirm(self):
+        """подтверждение принимает y и д, остальное считает отказом"""
         for answer, expected in (("y\n", "0"), ("д\n", "0"), ("n\n", "1"), ("\n", "1"), ("", "1")):
             r, _ = run('confirm "Точно?" >/dev/null; echo $?', stdin=answer)
             self.assertEqual(r.stdout.strip().splitlines()[-1], expected, repr(answer))
 
     def test_single_config_get_set(self):
+        """чтение и запись единого config.yaml из install.sh"""
         r, inst = run(
             'cp "$INSTALL_DIR/config.example.yaml" "$SERVICE_CONF"\n'
             '_service_conf_get ACTIVE_LIST\n_service_conf_set ACTIVE_LIST list2\n_service_conf_get ACTIVE_LIST\n'
@@ -67,6 +70,7 @@ class InstallShTests(unittest.TestCase):
         self.assertEqual(r.stdout.split(), ["merged", "list2", "block_notify", "123"], r.stderr)
 
     def test_legacy_service_conf_migrates_into_config_yaml(self):
+        """старый service.conf переносится в config.yaml"""
         r, inst = run(
             'cat > "$INSTALL_DIR/service.conf" <<EOF\n'
             'ACTION_MODE="block"\nACTIVE_LIST="list1"\nUPDATE_INTERVAL_DAYS=3\nIGNORE_IPS="1.2.3.4 5.6.7.0/24"\nBLACKLIST_URL=""\nEOF\n'

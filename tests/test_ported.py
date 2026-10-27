@@ -35,16 +35,19 @@ class ExtraSourceTests(unittest.TestCase):
             return run(fetch_threat_db("P", "", "bl", "merged", previous=previous, extra_sources=extra))
 
     def test_generic_parser_comments_and_sanity(self):
+        """разбор внешнего списка: комментарии и широкие сети"""
         got = ip_lists._parse_generic_cidr_list(self.DROP, "Spamhaus DROP")
         self.assertEqual(sorted(str(e.network) for e in got), ["198.51.100.0/24", "203.0.113.0/24"])
 
     def test_extra_source_labelled_and_matches(self):
+        """дополнительный источник получает свою метку и совпадает"""
         extra = [{"name": "drop", "display_name": "Spamhaus DROP", "type": "cidr_list", "url": "D", "enabled": True}]
         db = self._fetch({"P": "101.1.1.0/24", "D": self.DROP}, extra)
         self.assertEqual(db.per_source_counts["Spamhaus DROP"], 2)
         self.assertEqual(db.match("203.0.113.9"), "Spamhaus DROP: 203.0.113.0/24")
 
     def test_disabled_extra_ignored_and_abuseipdb_needs_key(self):
+        """выключенный источник и AbuseIPDB без ключа пропускаются"""
         extra = [
             {"name": "d", "type": "cidr_list", "url": "D", "enabled": False},
             {"name": "a", "display_name": "AbuseIPDB", "type": "abuseipdb", "api_key": "", "enabled": True},
@@ -54,12 +57,14 @@ class ExtraSourceTests(unittest.TestCase):
         self.assertFalse(db.degraded)
 
     def test_abuseipdb_json(self):
+        """AbuseIPDB: IP из JSON становятся /32"""
         extra = [{"name": "a", "display_name": "AbuseIPDB", "type": "abuseipdb", "api_key": "k", "enabled": True}]
         db = self._fetch({"P": "101.1.1.0/24"}, extra,
                          json_data={"data": [{"ipAddress": "8.8.4.4"}, {"ipAddress": "oops"}, {}]})
         self.assertEqual(db.match("8.8.4.4"), "AbuseIPDB: 8.8.4.4/32")
 
     def test_extra_down_uses_previous(self):
+        """недоступный дополнительный источник берётся из прошлой версии"""
         extra = [{"name": "drop", "display_name": "Spamhaus DROP", "type": "cidr_list", "url": "D"}]
         good = self._fetch({"P": "101.1.1.0/24", "D": self.DROP}, extra)
         db = self._fetch({"P": "101.1.1.0/24"}, extra, previous=good)
@@ -82,6 +87,7 @@ class EventsAndStatsTests(unittest.TestCase):
         return mock.Mock(country_code="DE", country_name="Germany", asn="AS1", org_name="Hoster <b>GmbH</b>")
 
     def test_record_load_prune(self):
+        """события: запись, чтение, обрезка"""
         for i in range(5):
             events_store.record_event(f"1.2.3.{i}", "1.2.3.0/24", "skipa", "poll", self._enriched(), 22)
         self.assertEqual(len(events_store.load_events()), 5)
@@ -90,6 +96,7 @@ class EventsAndStatsTests(unittest.TestCase):
         self.assertEqual(len(events_store.load_events(since_ts=time.time() + 10)), 0)
 
     def test_summary_text_escapes_html_and_histogram_without_matplotlib(self):
+        """статистика экранирует HTML и даёт гистограмму без matplotlib"""
         events_store.record_event("1.2.3.4", "x", "skipa", "poll", self._enriched(), 22)
         events_store.record_event("1.2.3.4", "x", "skipa", "poll", self._enriched(), 80)
         with mock.patch.dict("sys.modules", {"matplotlib": None, "matplotlib.pyplot": None}):
@@ -101,6 +108,7 @@ class EventsAndStatsTests(unittest.TestCase):
         self.assertIn("█", hist)
 
     def test_empty_period(self):
+        """статистика за пустой период"""
         summary, chart, hist = stats.stats_for_period(7)
         self.assertEqual(summary["total_hits"], 0)
         self.assertIsNone(chart)
@@ -131,6 +139,7 @@ class BanningTests(unittest.TestCase):
         self.d = d
 
     def test_ban_unban_history_and_timeout(self):
+        """бан и разбан: таймаут, история, список"""
         ok, _ = run(banning.ban_ip("185.224.228.5", duration_minutes=30, reason="t", by="@admin"))
         self.assertTrue(ok)
         self.assertEqual(self.nf.sets["skipa-dyn"]["185.224.228.5"], 1800)
@@ -141,12 +150,14 @@ class BanningTests(unittest.TestCase):
         self.assertEqual(actions, ["ban", "unban"])
 
     def test_ban_refuses_unsafe_target(self):
+        """бан отказывает для небезопасной цели"""
         ok, reason = run(banning.ban_ip("10.0.0.5"))
         self.assertFalse(ok)
         self.assertTrue(reason)
         self.assertFalse((self.d / "bans.jsonl").exists())
 
     def test_fail2ban_mirror_called(self):
+        """бан зеркалируется в fail2ban"""
         calls = []
 
         async def fake_run(*args):
@@ -160,6 +171,7 @@ class BanningTests(unittest.TestCase):
 
 class PendingMarkupTests(unittest.TestCase):
     def test_markup_roundtrip(self):
+        """очередь сохраняет клавиатуру с кнопкой бана"""
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             with mock.patch.object(fallback, "DATA_DIR", d), mock.patch.object(fallback, "PENDING_FILE", d / "p.jsonl"):
@@ -170,6 +182,7 @@ class PendingMarkupTests(unittest.TestCase):
 
 class HealthcheckTests(unittest.TestCase):
     def test_heartbeat(self):
+        """heartbeat мониторов"""
         self.assertIsNone(healthcheck.seconds_since_last("nope"))
         healthcheck.heartbeat("x")
         self.assertLess(healthcheck.seconds_since_last("x"), 1)
@@ -178,6 +191,7 @@ class HealthcheckTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     def test_new_sections_and_derived_flags(self):
+        """новые секции конфига и производные признаки"""
         from bot.config import Config
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "c.yaml"
@@ -196,6 +210,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(c.extra_sources), 1)
 
     def test_ban_button_alone_needs_firewall_but_not_auto_drop(self):
+        """одна кнопка бана требует firewall, но не включает автоблокировку"""
         c = make_config(action_mode="notify", method="poll", ban_enabled=True)
         self.assertTrue(c.firewall_needed)
         self.assertFalse(c.drop_enabled)
@@ -224,6 +239,7 @@ class DashboardTests(unittest.TestCase):
         return run(go())
 
     def test_auth_and_routes(self):
+        """дашборд: авторизация и маршруты"""
         cfg = make_config(dashboard_username="u", dashboard_password="p")
         self.assertIn("401", self._request(cfg, "/api/status").split("\r\n")[0])
         bad = "Basic " + base64.b64encode(b"u:wrong").decode()
@@ -239,11 +255,13 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("405", self._request(cfg, "/", good, method="POST").split("\r\n")[0])
 
     def test_open_when_no_credentials_configured(self):
+        """дашборд без логина открыт"""
         cfg = make_config()
         with mock.patch("bot.blocker.list_blocked_ips", return_value=[]):
             self.assertIn("200 OK", self._request(cfg, "/api/status").split("\r\n")[0])
 
     def test_html_escapes_external_fields(self):
+        """страница дашборда экранирует внешние поля"""
         from bot import webapp
         self.assertIn("esc(e.org_name)", webapp.DASHBOARD_HTML)
         self.assertNotIn("${e.org_name", webapp.DASHBOARD_HTML)
@@ -265,6 +283,7 @@ class ConntrackTests(unittest.TestCase):
     )
 
     def test_parse_lines(self):
+        """разбор строк conntrack"""
         from bot import monitor
         got = [monitor.parse_conntrack_line(l) for l in self.LINES.splitlines()]
         self.assertEqual(got[0], ("185.224.228.5", 51234, 443))      # DNAT на контейнер: видим клиента
@@ -274,6 +293,7 @@ class ConntrackTests(unittest.TestCase):
         self.assertIsNone(got[4])
 
     def test_poll_finds_docker_published_port_via_conntrack(self):
+        """poll находит соединения к портам Docker через conntrack"""
         from bot import monitor
         db = ip_lists.ThreatDB(networks=[ip_lists.NetEntry(ipaddress.ip_network("185.224.228.0/24"), "skipa")])
         hits = []

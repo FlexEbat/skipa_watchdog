@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover
 
 class ConfigTests(unittest.TestCase):
     def test_example_config_loads(self):
+        """config.example.yaml загружается со значениями по умолчанию"""
         from bot.config import Config
         cfg = Config.load(ROOT / "config.example.yaml")
         self.assertEqual(cfg.action_mode, "block_notify")
@@ -29,6 +30,7 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(cfg.telegram_enabled)
 
     def test_null_sections_and_bad_values(self):
+        """пустые секции и неверные значения приводятся к допустимым"""
         from bot.config import Config
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "c.yaml"
@@ -46,6 +48,7 @@ class TelegramTests(unittest.TestCase):
         return make_config(bot_token="1:x", chat_id=-100, **kw)
 
     def test_admin_gate_fails_closed(self):
+        """команды закрыты по умолчанию: пустой admin_ids пускает только чат chat_id"""
         from bot.telegram_layer import _is_admin
         c = self.cfg(admin_ids=[])
         self.assertFalse(_is_admin(c, 555, 999))        # посторонний, чужой чат
@@ -56,6 +59,7 @@ class TelegramTests(unittest.TestCase):
         self.assertFalse(_is_admin(c2, 8, -100))        # при заданных admin_ids чат не даёт прав
 
     def test_ip_arg_parsing(self):
+        """IP из команды разбирается строго, мусор отклоняется"""
         from bot.telegram_layer import _parse_ip_arg
         self.assertEqual(_parse_ip_arg("1.2.3.4"), "1.2.3.4")
         self.assertEqual(_parse_ip_arg("::ffff:1.2.3.4"), "1.2.3.4")
@@ -63,6 +67,7 @@ class TelegramTests(unittest.TestCase):
             self.assertIsNone(_parse_ip_arg(bad))
 
     def test_application_builds_with_proxy(self):
+        """приложение Telegram собирается с прокси"""
         from bot.telegram_layer import build_application
         c = self.cfg(telegram_proxy="http://127.0.0.1:3128")
         app = asyncio.run(build_application(c, {}))
@@ -83,6 +88,7 @@ class HitHandlerTests(unittest.TestCase):
         return Hit(ip=ip, matched_source="skipa: 185.224.228.0/24", local_port=22, method="kernel_log")
 
     def test_block_and_notify(self):
+        """срабатывание: блокировка, затем уведомление"""
         wd, cfg, q, log = self.make()
         with mock.patch.object(wd.blocker, "block_ip", return_value=True) as b:
             ok = asyncio.run(wd._make_hit_handler(cfg, {}, log, q)(self.hit()))
@@ -94,11 +100,13 @@ class HitHandlerTests(unittest.TestCase):
         self.assertIn("185.224.228.5", log.read_text())
 
     def test_failed_block_returns_false_for_fast_retry(self):
+        """сбой блокировки возвращает False для повтора через минуту"""
         wd, cfg, q, log = self.make()
         with mock.patch.object(wd.blocker, "block_ip", return_value=False):
             self.assertFalse(asyncio.run(wd._make_hit_handler(cfg, {}, log, q)(self.hit())))
 
     def test_refusal_is_not_an_error(self):
+        """отказ validate_target не считается ошибкой и не повторяется"""
         wd, cfg, q, log = self.make()
         with mock.patch.object(wd.blocker, "block_ip") as b:
             ok = asyncio.run(wd._make_hit_handler(cfg, {}, log, q)(self.hit("10.0.0.5")))
@@ -107,6 +115,7 @@ class HitHandlerTests(unittest.TestCase):
         self.assertIn("Не блокирую", q.get_nowait()[1])
 
     def test_block_mode_still_writes_audit_log(self):
+        """в режиме block журнал обнаружений пишется"""
         wd, cfg, q, log = self.make("block")
         with mock.patch.object(wd.blocker, "block_ip", return_value=True):
             asyncio.run(wd._make_hit_handler(cfg, {}, log, q)(self.hit()))
@@ -114,6 +123,7 @@ class HitHandlerTests(unittest.TestCase):
         self.assertTrue(q.empty())
 
     def test_notify_mode_does_not_block(self):
+        """в режиме notify блокировки нет"""
         wd, cfg, q, log = self.make("notify")
         with mock.patch.object(wd.blocker, "block_ip") as b:
             self.assertTrue(asyncio.run(wd._make_hit_handler(cfg, {}, log, q)(self.hit())))
@@ -125,15 +135,18 @@ class SmokeTests(unittest.TestCase):
     Telegram, корректная остановка по SIGTERM."""
 
     def test_runs_without_telegram_and_stops_on_sigterm(self):
+        """процесс работает без Telegram и останавливается по SIGTERM"""
         self._run(telegram=False)
 
     @unittest.skipUnless(HAVE_PTB, "python-telegram-bot не установлен")
     def test_unreachable_telegram_does_not_kill_process(self):
+        """недоступный Telegram не останавливает процесс"""
         logs = self._run(telegram=True)
         self.assertIn("Telegram недоступен", logs)
         self.assertIn("Skipa Watchdog остановлен", logs)
 
     def test_dashboard_healthcheck_and_events_run_in_real_process(self):
+        """дашборд и health-check работают в настоящем процессе"""
         import socket
         import urllib.request
 
@@ -216,6 +229,7 @@ if __name__ == "__main__":
 
 class SecretsInLogsTests(unittest.TestCase):
     def test_bot_token_and_keys_never_reach_the_log_file(self):
+        """токен бота и ключи не попадают в файл журнала"""
         import logging
         import watchdog
         from tests.helpers import make_config

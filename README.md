@@ -2,6 +2,7 @@
 
 [![tests](https://github.com/FlexEbat/skipa_watchdog/actions/workflows/tests.yml/badge.svg)](https://github.com/FlexEbat/skipa_watchdog/actions/workflows/tests.yml)
 [![license: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/FlexEbat/badge.svg)](https://hub.xerj.org/contributors/FlexEbat)
 
 Skipa Watchdog находит на вашем сервере подключения от известных сканеров
 (CyberOK/Skipa, ГРЧЦ, НКЦКИ и дополнительные списки), блокирует их и/или присылает

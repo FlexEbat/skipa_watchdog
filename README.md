@@ -1,5 +1,7 @@
 # Skipa Watchdog
 
+[English](README.en.md) · **Русский** · [简体中文](README.zh-CN.md)
+
 [![tests](https://github.com/FlexEbat/skipa_watchdog/actions/workflows/tests.yml/badge.svg)](https://github.com/FlexEbat/skipa_watchdog/actions/workflows/tests.yml)
 [![license: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 [![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/FlexEbat/badge.svg)](https://hub.xerj.org/contributors/FlexEbat)
@@ -19,18 +21,19 @@ Kubernetes.
 
 ## Содержание
 
-[Варианты установки](#варианты-установки) ·
-[Быстрый старт](#быстрый-старт) ·
-[Как это работает](#как-это-работает) ·
-[Конфигурация](#конфигурация) ·
-[Защита от самоблокировки](#защита-от-самоблокировки) ·
-[Docker и Kubernetes](#docker-и-kubernetes) ·
-[Telegram](#telegram) ·
-[Дополнительные возможности](#дополнительные-возможности) ·
-[Эксплуатация](#эксплуатация) ·
-[Безопасность](#безопасность) ·
-[Вопросы и проблемы](#вопросы-и-проблемы) ·
-[Разработка](#разработка)
+- [Варианты установки](#варианты-установки)
+- [Быстрый старт](#быстрый-старт)
+- [Как это работает](#как-это-работает)
+- [Конфигурация](#конфигурация)
+- [Защита от самоблокировки](#защита-от-самоблокировки)
+- [Docker и Kubernetes](#docker-и-kubernetes)
+- [Telegram](#telegram)
+- [Дополнительные возможности](#дополнительные-возможности)
+- [Эксплуатация](#эксплуатация)
+- [Безопасность](#безопасность)
+- [Вопросы и проблемы](#вопросы-и-проблемы)
+- [Разработка](#разработка)
+- [Лицензия](#лицензия)
 
 ## Варианты установки
 

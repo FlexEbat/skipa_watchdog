@@ -74,6 +74,9 @@ print_header() {
     echo " Skipa Watchdog"
     if [ -f "$INSTALL_DIR/VERSION" ]; then
         echo " Версия: $(cat "$INSTALL_DIR/VERSION")"
+        # напоминание, если обновление было доступно, а его отложили
+        [ "${UPD_STATE:-}" = "available" ] \
+            && echo -e " ${C_YELLOW}Доступна версия ${UPD_REMOTE:-новее}: пункт 10 меню${C_RESET}"
     else
         echo " Версия установщика: $INSTALLER_VERSION (проект ещё не установлен)"
     fi
@@ -1323,6 +1326,39 @@ update_project() {
     pause
 }
 
+# При КАЖДОМ запуске меню: проверяем, не вышла ли новая версия проекта, и предлагаем
+# установить. Отказ не навсегда: напоминание остаётся в шапке меню и повторится при
+# следующем запуске. После успешного обновления панель перезапускается из новой версии.
+# lib-update.sh лежит в самом репозитории; в очень старой установке его ещё нет -
+# тогда проверка появится сразу после первого обновления.
+_load_update_lib() {
+    [ -f "$INSTALL_DIR/service/lib-update.sh" ] || return 1
+    # shellcheck source=service/lib-update.sh
+    source "$INSTALL_DIR/service/lib-update.sh"
+}
+
+offer_project_update() {
+    _load_update_lib || return 0
+    update_check "$INSTALL_DIR"
+    [ "$UPD_STATE" = "available" ] || return 0
+    echo
+    warn "Доступна новая версия Skipa Watchdog: ${UPD_LOCAL:-?} -> ${UPD_REMOTE:-?} (новых коммитов: $UPD_BEHIND)"
+    [ -n "$UPD_LOG" ] && printf '%s\n' "$UPD_LOG"
+    if confirm "Установить обновление сейчас?"; then
+        if do_install; then
+            ok "Обновление установлено."
+            if [ "${SKIPA_SOURCE_ONLY:-0}" != "1" ]; then
+                SKIPA_NO_UPDATE_CHECK=1 exec bash "$INSTALL_DIR/install.sh"   # меню уже из новой версии
+            fi
+        else
+            warn "Обновление не завершилось, продолжаю с текущей версией."
+            UPD_STATE=available
+        fi
+    else
+        info "Хорошо, напомню при следующем запуске (или пункт 10 меню)."
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Меню
 # ---------------------------------------------------------------------------
@@ -1421,6 +1457,7 @@ usage() {
   sudo bash install.sh status    краткий статус (без меню)
   sudo bash install.sh fw-rules  поставить правила логирования/блокировки docker/k8s
   sudo bash install.sh check-lists  проверить обновления листов прямо сейчас
+  sudo bash install.sh check-update проверить, вышла ли новая версия проекта (код 10 - да)
 EOF
 }
 
@@ -1433,6 +1470,16 @@ main() {
             status) print_header; health_check ;;
             fw-rules) apply_firewall_rules ;;
             check-lists) check_list_updates ;;
+            check-update)
+                # неинтерактивно: код возврата 0 - актуальная версия, 10 - есть обновление, 2 - не удалось проверить
+                _load_update_lib || { echo "Проверка обновлений недоступна: нет $INSTALL_DIR/service/lib-update.sh"; exit 2; }
+                update_check "$INSTALL_DIR"
+                case "$UPD_STATE" in
+                    available) echo "Доступно обновление: ${UPD_LOCAL:-?} -> ${UPD_REMOTE:-?} (коммитов: $UPD_BEHIND)"
+                               [ -n "$UPD_LOG" ] && printf '%s\n' "$UPD_LOG"; exit 10 ;;
+                    none) echo "Установлена актуальная версия ${UPD_LOCAL:-?}"; exit 0 ;;
+                    *) echo "Не удалось проверить обновления (нет git-клона, сети или upstream)"; exit 2 ;;
+                esac ;;
             -h|--help) usage ;;
             *) usage; exit 1 ;;
         esac
@@ -1451,6 +1498,7 @@ main() {
     # Skipa Watchdog, это не повторяется. Донастроить вручную можно из
     # меню (пункт "Docker/Kubernetes") или командой `install.sh fw-rules`.
     _migrate_legacy_service_conf
+    offer_project_update
     check_list_updates
     main_menu
 }

@@ -29,7 +29,7 @@ from pathlib import Path
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-from bot import banning, blocker
+from bot import banning, blocker, updater
 from bot.events_store import load_events
 from bot.stats import format_summary_text as format_stats_text
 from bot.stats import stats_for_period
@@ -151,9 +151,63 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "НКЦКИ + доп. списки) будут приходить сюда. Текущий режим действия: {mode}.\n"
         "Команды: /menu, /status, /update, /testalert [ip], /pending, /env, "
         "/stats [дней], /export [дней], /blocklist (/banlist), /block <ip> [часы], "
-        "/unblock (/unban) <ip>"
+        "/unblock (/unban) <ip>, /version (обновления)"
     ).replace("{mode}", config.action_mode)
     await update.message.reply_text(text)
+
+
+def _update_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬆️ Установить", callback_data="upd:install"),
+        InlineKeyboardButton("Позже", callback_data="upd:later"),
+    ]])
+
+
+async def _reply_update_status(message) -> None:
+    """Версия + есть ли обновление (с кнопкой «Установить»)."""
+    await message.reply_text(f"Skipa Watchdog, версия: {updater.read_version() or '?'}. Проверяю обновления...")
+    info = await updater.check_update()
+    if info:
+        await message.reply_text(updater.format_update_text(info), parse_mode="HTML",
+                                 reply_markup=_update_keyboard())
+    else:
+        await message.reply_text("Установлена актуальная версия (или репозиторий сейчас недоступен).")
+
+
+async def cmd_version(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _guard(update, context) is None:
+        return
+    await _reply_update_status(update.message)
+
+
+async def on_update_callback(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки обновления: upd:check / upd:install / upd:later (только администраторам)."""
+    query = update.callback_query
+    config: Config = context.bot_data["config"]
+    chat_id = query.message.chat.id if query.message else None
+    if not _is_admin(config, query.from_user.id, chat_id):
+        await query.answer()
+        return
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    if action == "check":
+        await _reply_update_status(query.message)
+        return
+    try:  # кнопки убираем, чтобы не нажали дважды
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+    if action == "later":
+        await query.message.reply_text("Хорошо, напомню при следующем запуске службы.")
+        return
+    if action == "install":
+        info = await updater.check_update()
+        if not info:
+            await query.message.reply_text("Уже установлена актуальная версия.")
+            return
+        await query.message.reply_text(f"Устанавливаю {info.local or '?'} → {info.remote or '?'}...")
+        ok, text = await updater.start_update(info)
+        await query.message.reply_text(("⏳ " if ok else "⚠️ ") + text)
 
 
 async def cmd_menu(update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -173,6 +227,7 @@ async def cmd_menu(update, context: ContextTypes.DEFAULT_TYPE) -> None:
             InlineKeyboardButton("📈 Статистика", callback_data="stats"),
         ],
         [
+            InlineKeyboardButton("⬆️ Обновления", callback_data="upd:check"),
             InlineKeyboardButton("❓ Помощь", callback_data="help"),
         ],
     ]
@@ -432,7 +487,7 @@ async def menu_callback(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif query.data == "help":
         await query.message.reply_text(
             "/status, /update, /testalert [ip], /pending, /env, /stats [дней], /export [дней], "
-            "/blocklist (/banlist), /block <ip> [часы], /unblock (/unban) <ip> - подробности в README."
+            "/blocklist (/banlist), /block <ip> [часы], /unblock (/unban) <ip>, /version - подробности в README."
         )
 
 
@@ -460,7 +515,9 @@ async def build_application(config: Config, shared_state: dict) -> Application:
     app.add_handler(CommandHandler(["unblock", "unban"], cmd_unblock))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler(["version", "upgrade"], cmd_version))
     app.add_handler(CallbackQueryHandler(on_ban_callback, pattern=r"^ban:"))
+    app.add_handler(CallbackQueryHandler(on_update_callback, pattern=r"^upd:"))
     app.add_handler(CallbackQueryHandler(menu_callback))
     return app
 

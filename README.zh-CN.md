@@ -146,6 +146,8 @@ IP 名单 ──► 数据库（缓存 data/ip_cache.json）──► ipset skip
 | `sources.active_list` | `merged` | 使用哪些名单：`list1`、`list2`、`merged` | 是 |
 | `sources.primary_list_url` / `blacklist_url` | 见模板 | 名单地址 | 是 |
 | `sources.update_interval_days` | `7` | 数据库更新频率 | 是 |
+| `sources.min_prefix` | `20` | 名单中接受的最大网段（前缀长度）；Spamhaus DROP 请设为 `16` | 是 |
+| `sources.allow_insecure_http` | `false` | 允许通过明文 http 下载名单（默认仅 https） | 是 |
 | `sources.extra` | 空 | 附加来源 | 否 |
 | `monitoring.method` | `both` | `poll`、`kernel_log`、`both` | 否 |
 | `monitoring.ignore_ips` | 空 | 永不封锁的地址 | 是 |
@@ -164,7 +166,7 @@ IP 名单 ──► 数据库（缓存 data/ip_cache.json）──► ipset skip
   （CIDR、地址范围和单个 IP；包含 Censys 等扫描器的网段）。
 
 两份名单始终都会下载，`active_list` 决定哪些条目进入数据库。如果某个来源不可用，或返回的条目数只有
-之前的一半，则使用其上一个版本，并在一小时后重新检查不完整的数据库。名单中比 `/16` 更大的网段会被丢弃。
+之前的一半，则使用其上一个版本，并在一小时后重新检查不完整的数据库。比 `sources.min_prefix`（默认 `/20`）更大的网段会被丢弃；整体覆盖超过约 400 万个地址的来源会被拒绝，以免被篡改的名单封锁半个互联网。名单只通过 https 下载，重定向到 http 会被拒绝。
 
 可以通过菜单修改设置（第 3 项：名单来源、动作模式、检测方式；第 9 项：编辑文件），也可以手动修改；
 修改后请通过菜单应用，或执行 `sudo systemctl restart skipa-watchdog`。
@@ -175,7 +177,7 @@ IP 名单 ──► 数据库（缓存 data/ip_cache.json）──► ipset skip
 
 - 回环地址、私有网络（`10/8`、`172.16/12`、`192.168/16`）和链路本地地址；
 - `monitoring.ignore_ips` 中的地址；
-- 在 `monitoring.ssh_ports` 上有打开的 SSH 会话的 IP（`monitoring.auto_allowlist`）；
+- 在 `monitoring.ssh_ports` 上有打开的 SSH 会话的 IP（`monitoring.auto_allowlist`）；在“仅服务”方式中由 `skipa-watchdog-allow-ssh.timer` 每分钟添加；
 - 前缀短于 `/16` 的网段（包括 `0.0.0.0/0`）、IPv6，以及与白名单有交集的任何内容。
 
 `poll` 方法只统计入站连接：服务器自己发起的出站连接不会被当作扫描。
@@ -193,8 +195,8 @@ IP 名单 ──► 数据库（缓存 data/ip_cache.json）──► ipset skip
 ## Telegram
 
 可以通过菜单（第 4 项）接入，或在 `config.yaml` 中设置：`telegram.bot_token`（从
-[@BotFather](https://t.me/BotFather) 获取）、`chat_id` 和 `admin_ids`。`admin_ids` 为空表示只接受来自
-`chat_id` 聊天的命令。如果无法直接访问 Telegram，请设置 `telegram.proxy`（使用 `socks5://` 需要
+[@BotFather](https://t.me/BotFather) 获取）、`chat_id` 和 `admin_ids`。`admin_ids` 为空表示只接受 `chat_id`
+用户的私聊命令；在群组中命令被关闭，需先在 `admin_ids` 中列出管理员。如果无法直接访问 Telegram，请设置 `telegram.proxy`（使用 `socks5://` 需要
 `pip install "python-telegram-bot[socks]"`）。
 
 Telegram 不可用不会中断防护：该层在后台启动并重试，未发送的告警会进入队列等待（最多 500 条，最长一周）。
@@ -260,8 +262,10 @@ AS64500 / Example Hosting GmbH
 `sudo bash /opt/skipa_watchdog/service/blockctl.sh {block|unblock|list} [ip]`。
 Telegram 方式下的封锁保存在 `data/blocked_ips.json` 中，并在启动时恢复。
 
-**服务。** `skipa-watchdog.service` 以 root 身份运行，不使用沙箱：它需要 `iptables`、`ipset`、
-读取 conntrack 的权限，以及对安装目录和日志的写权限。
+**服务。** `skipa-watchdog.service` 以 root 身份运行：它需要 `iptables`、`ipset`、
+读取 conntrack 的权限，以及对安装目录和日志的写权限。仅启用了安全的限制（`NoNewPrivileges`、`PrivateTmp`、
+`ProtectSystem=full`、`RestrictAddressFamilies` 等）；不使用严格沙箱（`ProtectSystem=strict`、
+`ProtectKernelModules`）：iptables 需要加载内核模块，严格沙箱曾在部分系统上导致无法启动。
 
 **更新。** 菜单第 10 项或 `sudo bash install.sh install`。如果 `git pull` 失败（仓库历史被改写），
 安装程序会提示切换到最新版本：`config.yaml` 和 `data/` 不受影响。
@@ -272,7 +276,7 @@ Telegram 方式下的封锁保存在 `data/blocked_ips.json` 中，并在启动�
 
 - `config.yaml` 包含机器人令牌：安装程序会将权限设置为 `600`。
 - 机器人令牌和 API 密钥在日志中会被屏蔽（`skipa-watchdog.log`、`journalctl`）。
-- 机器人命令只接受管理员（`admin_ids`，或 `chat_id` 聊天）的指令。
+- 机器人命令只接受管理员（`admin_ids`，或与 `chat_id` 的私聊）的指令。
 - 防止自我封锁的机制见上文。如果你仍然被挡在外面，请通过主机控制台登录并运行 `sudo skipa-watchdog`：
   第 6 项可解除指定 IP 的封锁，第 11 项会连同规则一起删除项目。
 - 来自外部 API 的数据（组织、ASN）在 Telegram 和仪表盘页面中会被转义，写入文本日志前还会去除换行和控制字符（否则网络所有者可向 fail2ban 注入带有他人 IP 的伪造行）。

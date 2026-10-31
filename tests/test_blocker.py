@@ -81,7 +81,7 @@ class IpsetModeTests(BlockerBase):
         blocker.ensure_wiring()
         self.nf.chains["INPUT"].clear()            # ufw reload и т.п.
         self.assertEqual(blocker.ensure_wiring()["INPUT"], "fixed")
-        self.assertTrue(blocker.is_wired_into_input())
+        self.assertTrue(blocker.wiring_status()["INPUT"])
 
     def test_docker_user_appears_later(self):
         """DOCKER-USER, появившийся позже, подключается"""
@@ -211,3 +211,25 @@ class LegacyModeTests(BlockerBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ПорядокПравилTests(BlockerBase):
+    def test_пропавшее_log_правило_встаёт_перед_drop(self):
+        """восстановленное LOG-правило занимает своё место, а не дописывается после DROP"""
+        blocker.configure(preload_db=True, drop_enabled=True)
+        blocker.ensure_wiring()
+        chain = self.nf.chains["SKIPA-BLOCK"]
+        log_rule = next(r for r in chain if "LOG" in r)
+        chain.remove(log_rule)                      # правило потеряно (ручной сброс и т.п.)
+        blocker.ensure_wiring()
+        kinds = ["LOG" if "LOG" in r else "DROP" if "DROP" in r else "RETURN" for r in chain]
+        self.assertEqual(kinds, ["RETURN", "LOG", "DROP", "DROP"])
+
+    def test_пропавшее_allow_правило_встаёт_первым(self):
+        """восстановленный RETURN для allowlist снова первый"""
+        blocker.configure(preload_db=True, drop_enabled=True)
+        blocker.ensure_wiring()
+        chain = self.nf.chains["SKIPA-BLOCK"]
+        chain.remove(next(r for r in chain if "RETURN" in r))
+        blocker.ensure_wiring()
+        self.assertIn("RETURN", chain[0])

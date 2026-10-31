@@ -155,6 +155,8 @@ marked in the last column.
 | `sources.active_list` | `merged` | which lists to use: `list1`, `list2`, `merged` | yes |
 | `sources.primary_list_url` / `blacklist_url` | see template | list URLs | yes |
 | `sources.update_interval_days` | `7` | how often to refresh the database | yes |
+| `sources.min_prefix` | `20` | widest network accepted from lists (prefix length); use `16` for Spamhaus DROP | yes |
+| `sources.allow_insecure_http` | `false` | allow downloading lists over plain http (https only by default) | yes |
 | `sources.extra` | empty | additional sources | no |
 | `monitoring.method` | `both` | `poll`, `kernel_log`, `both` | no |
 | `monitoring.ignore_ips` | empty | addresses that are never blocked | yes |
@@ -174,8 +176,10 @@ Default sources:
 
 Both are always downloaded; `active_list` selects which entries go into the database. If a
 source is unavailable or returns half as many entries as before, its previous version is
-used, and an incomplete database is rechecked after an hour. Networks wider than `/16` are
-discarded from the lists.
+used, and an incomplete database is rechecked after an hour. Networks wider than
+`sources.min_prefix` (`/20` by default) are discarded, and a source that covers more than ~4 million
+addresses in total is rejected, so an inflated third-party list cannot block half the internet.
+Lists are downloaded over https only; a redirect to http is refused.
 
 You can change settings from the menu (item 3: list source, action mode, detection method;
 item 9: edit the file) or by hand; after editing, apply the changes through the menu or with
@@ -187,7 +191,8 @@ The lists are external and blocking is automatic, so the following can never be 
 
 - loopback, private networks (`10/8`, `172.16/12`, `192.168/16`) and link-local;
 - addresses from `monitoring.ignore_ips`;
-- IPs with open SSH sessions on `monitoring.ssh_ports` (`monitoring.auto_allowlist`);
+- IPs with open SSH sessions on `monitoring.ssh_ports` (`monitoring.auto_allowlist`); in the
+  "service only" variant `skipa-watchdog-allow-ssh.timer` adds them every minute;
 - networks shorter than `/16` (including `0.0.0.0/0`), IPv6, and anything that overlaps the
   allowlist.
 
@@ -209,7 +214,8 @@ Such traffic is not visible in the host's `/proc/net/tcp`, so `poll` reads kerne
 
 Enable it from the menu (item 4) or in `config.yaml`: `telegram.bot_token` (from
 [@BotFather](https://t.me/BotFather)), `chat_id` and `admin_ids`. An empty `admin_ids` means
-commands are accepted only from the `chat_id` chat. If Telegram is not reachable directly,
+commands are accepted only in the private chat of the `chat_id` user; in a group they are closed until
+administrators are listed in `admin_ids`. If Telegram is not reachable directly,
 set `telegram.proxy` (`socks5://` requires `pip install "python-telegram-bot[socks]"`).
 
 An unreachable Telegram does not stop protection: the layer starts in the background with
@@ -283,8 +289,11 @@ be persisted by the system (`iptables-persistent`) or restored by running
 `sudo bash /opt/skipa_watchdog/service/blockctl.sh {block|unblock|list} [ip]`.
 Blocks in the Telegram variant are saved in `data/blocked_ips.json` and restored on start.
 
-**Service.** `skipa-watchdog.service` runs as root without a sandbox: it needs `iptables`,
-`ipset`, access to conntrack and write access to the install directory and logs.
+**Service.** `skipa-watchdog.service` runs as root: it needs `iptables`, `ipset`, access to
+conntrack and write access to the install directory and logs. Only safe restrictions are enabled
+(`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`, `RestrictAddressFamilies`, etc.); a strict
+sandbox (`ProtectSystem=strict`, `ProtectKernelModules`) is not used: iptables loads kernel modules
+and it broke startup on some systems.
 
 **Updating.** Menu item 10 or `sudo bash install.sh install`. If `git pull` fails (the
 repository history changed), the installer offers to switch to the current version;
@@ -297,7 +306,7 @@ repository history changed), the installer offers to switch to the current versi
 
 - `config.yaml` contains the bot token: the installer sets permissions to `600`.
 - The bot token and API keys are masked in logs (`skipa-watchdog.log`, `journalctl`).
-- Bot commands are accepted only from administrators (`admin_ids`, or the `chat_id` chat).
+- Bot commands are accepted only from administrators (`admin_ids`, or the private chat with `chat_id`).
 - Self-lockout protection is described above. If you still got cut off, log in through the
   host console and run `sudo skipa-watchdog`: item 6 unblocks a specific IP, item 11 removes
   the project along with its rules.

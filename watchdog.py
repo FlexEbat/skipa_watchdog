@@ -40,7 +40,7 @@ import time
 from html import escape
 from pathlib import Path
 
-from bot import blocker, http_client, ip_lists
+from bot import blocker, confedit, http_client, ip_lists
 from bot.allowlist import build_allowlist
 from bot.config import Config
 from bot.dbupdate import apply_db_to_firewall, preload_effective, refresh_db
@@ -579,6 +579,7 @@ async def _init_firewall(config: Config, state: dict) -> None:
 
 async def async_main() -> None:
     config = Config.load(CONFIG_PATH)
+    confedit.CONFIG_FILE = Path(CONFIG_PATH).resolve()
     log_dir = _setup_logging(config)
     detections_log = log_dir / "detections.log"
 

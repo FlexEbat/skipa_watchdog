@@ -21,15 +21,18 @@ from __future__ import annotations
 import asyncio
 import datetime
 import io
+import ipaddress
 import logging
+import re
 import tempfile
 import time
+from html import escape
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-from bot import banning, blocker, updater
+from bot import banning, blocker, confedit, updater
 from bot.events_store import load_events
 from bot.stats import format_summary_text as format_stats_text
 from bot.stats import stats_for_period
@@ -37,6 +40,7 @@ from bot.config import Config
 from bot.dbupdate import refresh_db
 from bot.env_detect import format_summary_text, summarize_environment
 from bot.fallback import pending_count
+from bot.allowlist import build_allowlist
 from bot.ip_lists import normalize_ip
 
 log = logging.getLogger("skipa_watchdog.telegram")
@@ -148,12 +152,202 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = (
         "Skipa Watchdog подключён к Telegram: уведомления о сканерах (CyberOK/Skipa, ГРЧЦ, "
-        "НКЦКИ + доп. списки) будут приходить сюда. Текущий режим действия: {mode}.\n"
-        "Команды: /menu, /status, /update, /testalert [ip], /pending, /env, "
-        "/stats [дней], /export [дней], /blocklist (/banlist), /block <ip> [часы], "
-        "/unblock (/unban) <ip>, /version (обновления)"
-    ).replace("{mode}", config.action_mode)
+        f"НКЦКИ + доп. списки) будут приходить сюда. Текущий режим действия: {config.action_mode}.\n"
+        + HELP_TEXT
+    )
     await update.message.reply_text(text)
+
+
+_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b")
+
+
+def _tail_lines(path: Path, n: int, max_bytes: int = 256 * 1024) -> list[str]:
+    """Последние n строк файла без чтения всего файла."""
+    try:
+        with path.open("rb") as f:
+            size = f.seek(0, 2)
+            f.seek(max(0, size - max_bytes))
+            data = f.read()
+    except OSError:
+        return []
+    return data.decode("utf-8", errors="replace").splitlines()[-n:]
+
+
+async def cmd_logs(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Последние строки журнала службы (то же, что пункт «Просмотр логов» панели)."""
+    config = await _guard(update, context)
+    if config is None:
+        return
+    try:
+        n = max(1, min(100, int(context.args[0]))) if context.args else 30
+    except ValueError:
+        n = 30
+    lines = await asyncio.to_thread(_tail_lines, Path(config.log_dir) / "skipa-watchdog.log", n)
+    if not lines:
+        await update.message.reply_text("Журнал пуст или недоступен.")
+        return
+    text = _TOKEN_RE.sub("<токен скрыт>", "\n".join(lines))
+    while len(text) > 3500:                       # лимит Telegram - 4096 символов на сообщение
+        text = text[text.index("\n") + 1:]
+    await update.message.reply_text(f"<pre>{escape(text)}</pre>", parse_mode="HTML")
+
+
+# ---------- белый список (monitoring.ignore_ips) ----------
+
+def _parse_allow_arg(arg: str) -> str | None:
+    """Канонический вид IP/сети для записи в конфиг или None."""
+    try:
+        if "/" in arg:
+            return str(ipaddress.ip_network(arg, strict=False))
+        return str(ipaddress.ip_address(arg))
+    except ValueError:
+        return None
+
+
+async def _apply_allowlist(config: Config) -> None:
+    """Сразу в ядро (ipset skipa-allow), не дожидаясь очередного цикла проверки."""
+    nets = await asyncio.to_thread(build_allowlist, config.ignore_networks, config.auto_allowlist, config.ssh_ports)
+    await asyncio.to_thread(blocker.sync_allowlist, nets)
+
+
+async def cmd_allowlist(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _guard(update, context) is None:
+        return
+    items = await confedit.ignore_list()
+    body = "\n".join(f"• <code>{escape(i)}</code>" for i in items) or "(пусто)"
+    await update.message.reply_text(
+        "<b>Белый список</b> (monitoring.ignore_ips): эти адреса никогда не блокируются.\n" + body +
+        "\nДобавить: /allow &lt;ip|сеть&gt;, убрать: /unallow &lt;ip|сеть&gt;. "
+        "Свои SSH-сессии защищаются автоматически (monitoring.auto_allowlist).",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_allow(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config = await _guard(update, context)
+    if config is None:
+        return
+    arg = context.args[0] if context.args else ""
+    value = _parse_allow_arg(arg)
+    if value is None:
+        await update.message.reply_text("Использование: /allow <ip|сеть>, например /allow 203.0.113.5 или /allow 198.51.100.0/24")
+        return
+    result = await confedit.ignore_add(value)
+    if result.startswith("error"):
+        await update.message.reply_text(f"Не удалось записать в config.yaml: {escape(result)}")
+        return
+    net = ipaddress.ip_network(value, strict=False)
+    if net not in config.ignore_networks:
+        config.ignore_networks.append(net)    # тот же список читают циклы мониторинга - действует сразу
+    await _apply_allowlist(config)
+    # если адрес уже был заблокирован - снимаем блокировку, иначе они противоречат друг другу
+    unblocked = False
+    if net.num_addresses == 1 and await asyncio.to_thread(blocker.is_blocked, str(net.network_address)):
+        by = f"@{update.effective_user.username or update.effective_user.id}"
+        unblocked = await banning.unban_ip(str(net.network_address), fail2ban_jail=config.fail2ban_jail, by=by)
+    text = f"✅ {value} добавлен в белый список." if result == "added" else f"ℹ️ {value} уже в белом списке."
+    if unblocked:
+        text += " Блокировка снята."
+    await update.message.reply_text(text)
+
+
+async def cmd_unallow(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config = await _guard(update, context)
+    if config is None:
+        return
+    arg = context.args[0] if context.args else ""
+    value = _parse_allow_arg(arg)
+    if value is None:
+        await update.message.reply_text("Использование: /unallow <ip|сеть>")
+        return
+    # в конфиге адрес мог быть записан иначе (1.2.3.4 и 1.2.3.4/32) - пробуем оба вида
+    result = await confedit.ignore_del(value)
+    if result == "missing" and "/" not in arg:
+        result = await confedit.ignore_del(value + ("/32" if ":" not in value else "/128"))
+    if result.startswith("error"):
+        await update.message.reply_text(f"Не удалось записать в config.yaml: {escape(result)}")
+        return
+    if result == "missing":
+        await update.message.reply_text(f"{value} нет в monitoring.ignore_ips.")
+        return
+    net = ipaddress.ip_network(value, strict=False)
+    config.ignore_networks[:] = [n for n in config.ignore_networks if n != net]
+    await _apply_allowlist(config)
+    await update.message.reply_text(f"✅ {value} убран из белого списка.")
+
+
+# ---------- настройки (режим действия, список, метод) ----------
+
+def _settings_keyboard(current: dict[str, str]) -> InlineKeyboardMarkup:
+    rows = []
+    for key, meta in confedit.SETTINGS.items():
+        rows.append([InlineKeyboardButton(
+            f"{'✓ ' if current.get(key) == value else ''}{title}",
+            callback_data=f"cfg:ask:{key}:{value}",
+        ) for value, title in meta["values"].items()][:3])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _settings_text(config: Config) -> tuple[str, dict[str, str]]:
+    current = {key: await confedit.get_value(key) or "?" for key in confedit.SETTINGS}
+    lines = ["<b>Настройки</b> (нажмите значение, затем подтвердите; служба перезапустится):"]
+    for key, meta in confedit.SETTINGS.items():
+        shown = meta["values"].get(current[key], current[key])
+        lines.append(f"• {meta['title']}: <b>{escape(shown)}</b> (<code>{key}</code>)")
+    return "\n".join(lines), current
+
+
+async def cmd_settings(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config = await _guard(update, context)
+    if config is None:
+        return
+    text, current = await _settings_text(config)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=_settings_keyboard(current))
+
+
+async def on_settings_callback(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """cfg:ask:<ключ>:<значение> -> подтверждение; cfg:do:... -> запись и перезапуск; cfg:no -> отмена."""
+    query = update.callback_query
+    config: Config = context.bot_data["config"]
+    chat_id = query.message.chat.id if query.message else None
+    if not _is_admin(config, query.from_user.id, chat_id):
+        await query.answer()
+        return
+    await query.answer()
+    parts = query.data.split(":", 3)
+    action = parts[1]
+    if action == "no":
+        await query.message.reply_text("Отменено.")
+        return
+    if len(parts) != 4 or parts[2] not in confedit.SETTINGS or parts[3] not in confedit.SETTINGS[parts[2]]["values"]:
+        return
+    key, value = parts[2], parts[3]
+    meta = confedit.SETTINGS[key]
+    if action == "ask":
+        warn = "\n⚠️ Начнётся блокировка новых IP." if key == "action.mode" and value in ("block", "block_notify") else ""
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Применить и перезапустить", callback_data=f"cfg:do:{key}:{value}"),
+            InlineKeyboardButton("Отмена", callback_data="cfg:no"),
+        ]])
+        await query.message.reply_text(
+            f"Изменить «{meta['title']}» на «{meta['values'][value]}»?{warn}", reply_markup=keyboard)
+    elif action == "do":
+        ok, err = await confedit.set_value(key, value)
+        if not ok:
+            await query.message.reply_text(f"Не удалось записать настройку: {err}")
+            return
+        await query.message.reply_text(f"✅ {meta['title']}: {meta['values'][value]}. Перезапускаю службу...")
+        _ok, text = await confedit.restart_service()
+        if not _ok:
+            await query.message.reply_text(f"⚠️ {text}")
+
+
+HELP_TEXT = (
+    "Команды: /menu, /status, /update (база IP), /testalert [ip], /pending, /env, "
+    "/stats [дней], /export [дней], /logs [строк], /blocklist (/banlist), /block <ip> [часы], "
+    "/unblock (/unban) <ip>, /allowlist, /allow <ip|сеть>, /unallow <ip|сеть>, /settings, "
+    "/version (обновления проекта). Подробности - в README."
+)
 
 
 def _update_keyboard() -> InlineKeyboardMarkup:
@@ -225,6 +419,10 @@ async def cmd_menu(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [
             InlineKeyboardButton("🚫 Блокировки", callback_data="blocklist"),
             InlineKeyboardButton("📈 Статистика", callback_data="stats"),
+        ],
+        [
+            InlineKeyboardButton("✅ Белый список", callback_data="allowlist"),
+            InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
         ],
         [
             InlineKeyboardButton("⬆️ Обновления", callback_data="upd:check"),
@@ -442,7 +640,6 @@ async def on_ban_callback(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await query.answer()
     duration = "навсегда" if config.manual_ban_duration_minutes == 0 else f"на {config.manual_ban_duration_minutes} мин."
-    from html import escape
 
     await query.edit_message_text(
         query.message.text_html + f"\n\n✅ <b>Забанен ({duration})</b> — {escape(query.from_user.first_name or '')}",
@@ -484,11 +681,16 @@ async def menu_callback(update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.message.reply_photo(photo=io.BytesIO(chart_png), caption=text[:1024], parse_mode="HTML")
         else:
             await query.message.reply_text(text, parse_mode="HTML")
-    elif query.data == "help":
+    elif query.data == "allowlist":
+        items = await confedit.ignore_list()
+        body = "\n".join(f"• <code>{escape(i)}</code>" for i in items) or "(пусто)"
         await query.message.reply_text(
-            "/status, /update, /testalert [ip], /pending, /env, /stats [дней], /export [дней], "
-            "/blocklist (/banlist), /block <ip> [часы], /unblock (/unban) <ip>, /version - подробности в README."
-        )
+            "<b>Белый список</b>:\n" + body + "\n/allow &lt;ip|сеть&gt;, /unallow &lt;ip|сеть&gt;", parse_mode="HTML")
+    elif query.data == "settings":
+        text, current = await _settings_text(config)
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=_settings_keyboard(current))
+    elif query.data == "help":
+        await query.message.reply_text(HELP_TEXT)
 
 
 async def build_application(config: Config, shared_state: dict) -> Application:
@@ -516,6 +718,12 @@ async def build_application(config: Config, shared_state: dict) -> Application:
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler(["version", "upgrade"], cmd_version))
+    app.add_handler(CommandHandler("allowlist", cmd_allowlist))
+    app.add_handler(CommandHandler("allow", cmd_allow))
+    app.add_handler(CommandHandler("unallow", cmd_unallow))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("logs", cmd_logs))
+    app.add_handler(CallbackQueryHandler(on_settings_callback, pattern=r"^cfg:"))
     app.add_handler(CallbackQueryHandler(on_ban_callback, pattern=r"^ban:"))
     app.add_handler(CallbackQueryHandler(on_update_callback, pattern=r"^upd:"))
     app.add_handler(CallbackQueryHandler(menu_callback))

@@ -3,11 +3,16 @@
 # Работает с отдельным ipset "skipa-manual" - НЕ с автообновляемым
 # "skipa-scanners" (тот целиком пересобирается при каждом обновлении списка,
 # поэтому ручные блокировки хранятся отдельно и не теряются при sync).
-# Использование: blockctl.sh {block|unblock|list} [ip]
+# Использование: blockctl.sh {block|unblock|list|allow|unallow|allowlist} [ip]
+#   allow / unallow / allowlist - белый список (monitoring.ignore_ips): запись в
+#   config.yaml (общий для панели и бота код confctl.sh) и сразу в ipset skipa-allow.
 set -uo pipefail
 
 MANUAL_SET="skipa-manual"
 SCANNERS_SET="skipa-scanners"
+ALLOW_SET="skipa-allow"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF="${SKIPA_CONFIG:-$HERE/../config.yaml}"
 ERR_LOG="$(mktemp)"
 
 # Проверка цели: только IPv4/CIDR, не шире /16, не частная/служебная сеть.
@@ -70,8 +75,8 @@ case "${1:-}" in
         fi
         if ipset test "$SCANNERS_SET" "$2" >/dev/null 2>&1; then
             echo "ПРИМЕЧАНИЕ: $2 также входит в автообновляемый список skipa-scanners -" \
-                 "останется заблокирован через него. Чтобы исключить насовсем, добавьте" \
-                 "IP в monitoring.ignore_ips в config.yaml." >&2
+                 "останется заблокирован через него. Чтобы исключить насовсем, выполните:" \
+                 "blockctl.sh allow $2 (запишет IP в monitoring.ignore_ips)." >&2
         fi
         ;;
     list)
@@ -80,8 +85,39 @@ case "${1:-}" in
         echo "# Из базового списка (skipa-scanners), всего:"
         ipset list "$SCANNERS_SET" 2>/dev/null | awk '/^Number of entries:/{print $NF}'
         ;;
+    allow)
+        [ -n "${2:-}" ] || { echo "Использование: $0 allow <ip|сеть>" >&2; exit 1; }
+        bash "$HERE/confctl.sh" "$CONF" ignore-add "$2"
+        rc=$?
+        [ "$rc" -eq 3 ] && echo "Уже в белом списке: $2" && rc=0
+        [ "$rc" -eq 0 ] || { echo "FAIL" >&2; exit 1; }
+        # сразу в ядро: без ожидания следующей синхронизации списков. Если адрес уже заблокирован
+        # вручную - снимаем эту блокировку: иначе ручная блокировка и allowlist спорят.
+        if ipset add "$ALLOW_SET" "$2" -exist 2>"$ERR_LOG"; then
+            ipset del "$MANUAL_SET" "$2" -exist 2>/dev/null
+            echo "OK"
+        else
+            echo "Записано в config.yaml, но в ipset добавить не удалось (набор $ALLOW_SET создаётся при" \
+                 "первой синхронизации): $(cat "$ERR_LOG")" >&2
+        fi
+        ;;
+    unallow)
+        [ -n "${2:-}" ] || { echo "Использование: $0 unallow <ip|сеть>" >&2; exit 1; }
+        bash "$HERE/confctl.sh" "$CONF" ignore-del "$2"
+        rc=$?
+        if [ "$rc" -eq 3 ]; then echo "Такого адреса нет в monitoring.ignore_ips: $2" >&2; exit 1; fi
+        [ "$rc" -eq 0 ] || { echo "FAIL" >&2; exit 1; }
+        # из ядра убираем только записи, добавленные из конфига; частные сети и SSH-сессии
+        # вернутся при ближайшей синхронизации allowlist
+        ipset del "$ALLOW_SET" "$2" -exist 2>/dev/null
+        echo "OK"
+        ;;
+    allowlist)
+        echo "# Белый список (monitoring.ignore_ips):"
+        bash "$HERE/confctl.sh" "$CONF" ignore-list
+        ;;
     *)
-        echo "Использование: $0 {block|unblock|list} [ip]" >&2
+        echo "Использование: $0 {block|unblock|list|allow|unallow|allowlist} [ip]" >&2
         exit 1
         ;;
 esac

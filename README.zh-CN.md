@@ -61,7 +61,7 @@ sudo skipa-watchdog
 ```
 
 菜单的每一项都可以退出（`0`），每个会修改系统的操作都会要求确认。菜单项包括：运行状况检查、服务管理、
-检测设置、Telegram、Docker/Kubernetes、已封锁的 IP、更新数据库、日志、编辑配置、更新项目、卸载。
+检测设置、Telegram、Docker/Kubernetes、已封锁的 IP、白名单、检测统计、更新数据库、日志、编辑配置、更新项目、卸载。每次启动菜单时还会检查是否有新版本并提示安装。
 
 不使用菜单：
 
@@ -168,7 +168,7 @@ IP 名单 ──► 数据库（缓存 data/ip_cache.json）──► ipset skip
 两份名单始终都会下载，`active_list` 决定哪些条目进入数据库。如果某个来源不可用，或返回的条目数只有
 之前的一半，则使用其上一个版本，并在一小时后重新检查不完整的数据库。比 `sources.min_prefix`（默认 `/20`）更大的网段会被丢弃；整体覆盖超过约 400 万个地址的来源会被拒绝，以免被篡改的名单封锁半个互联网。名单只通过 https 下载，重定向到 http 会被拒绝。
 
-可以通过菜单修改设置（第 3 项：名单来源、动作模式、检测方式；第 9 项：编辑文件），也可以手动修改；
+可以通过菜单修改设置（第 3 项：名单来源、动作模式、检测方式；第 11 项：编辑文件），也可以手动修改；
 修改后请通过菜单应用，或执行 `sudo systemctl restart skipa-watchdog`。
 
 ## 防止自我封锁
@@ -267,10 +267,10 @@ Telegram 方式下的封锁保存在 `data/blocked_ips.json` 中，并在启动�
 `ProtectSystem=full`、`RestrictAddressFamilies` 等）；不使用严格沙箱（`ProtectSystem=strict`、
 `ProtectKernelModules`）：iptables 需要加载内核模块，严格沙箱曾在部分系统上导致无法启动。
 
-**更新。** 菜单第 10 项或 `sudo bash install.sh install`。如果 `git pull` 失败（仓库历史被改写），
+**更新。** 菜单第 12 项或 `sudo bash install.sh install`。如果 `git pull` 失败（仓库历史被改写），
 安装程序会提示切换到最新版本：`config.yaml` 和 `data/` 不受影响。
 
-**卸载。** 菜单第 11 项。安装程序会单独询问是否移除 `iptables` 规则和 `ipset` 集合。
+**卸载。** 菜单第 13 项。安装程序会单独询问是否移除 `iptables` 规则和 `ipset` 集合。
 
 ## 安全
 
@@ -278,7 +278,7 @@ Telegram 方式下的封锁保存在 `data/blocked_ips.json` 中，并在启动�
 - 机器人令牌和 API 密钥在日志中会被屏蔽（`skipa-watchdog.log`、`journalctl`）。
 - 机器人命令只接受管理员（`admin_ids`，或与 `chat_id` 的私聊）的指令。
 - 防止自我封锁的机制见上文。如果你仍然被挡在外面，请通过主机控制台登录并运行 `sudo skipa-watchdog`：
-  第 6 项可解除指定 IP 的封锁，第 11 项会连同规则一起删除项目。
+  第 6 项可解除指定 IP 的封锁，第 13 项会连同规则一起删除项目。
 - 来自外部 API 的数据（组织、ASN）在 Telegram 和仪表盘页面中会被转义，写入文本日志前还会去除换行和控制字符（否则网络所有者可向 fail2ban 注入带有他人 IP 的伪造行）。
 - 未设置 `username` 的仪表盘对任何能访问该端口的人开放：请勿将其发布到互联网。若 `dashboard.host` 不是回环地址且未设置登录，仪表盘只会监听 `127.0.0.1` 并在日志中说明。
 - 发现漏洞请私下联系仓库所有者，不要发布到公开的 issue 中。
@@ -296,7 +296,7 @@ sudo ipset test skipa-db 66.132.186.215              # 服务 + Telegram（ipset
 命中的网段会显示在告警和 `detections.log` 中。扫描器的任何数据包都会产生记录：在“仅服务”方式下，
 LOG 规则对所有协议生效（在 `detections.log` 中可以看到 `proto=UDP port=3478`），数据包在记录后被丢弃。
 
-**菜单提示 INPUT 未连接，但规则已经存在。** 请更新项目（第 10 项）。之前的检查只查找旧格式的规则，
+**菜单提示 INPUT 未连接，但规则已经存在。** 请更新项目（第 12 项）。之前的检查只查找旧格式的规则，
 现在会查找该链中项目的任何规则。
 
 **服务无法启动。** 执行 `journalctl -u skipa-watchdog -n 50`。常见原因：没有 `ipset`

@@ -67,8 +67,9 @@ sudo skipa-watchdog
 
 Every menu item has an exit (`0`), and every action that changes something asks for
 confirmation. Menu items: health check, service management, detection settings, Telegram,
-Docker/Kubernetes, blocked IPs, database update, logs, config editing, project update,
-uninstall.
+Docker/Kubernetes, blocked IPs, allowlist, detection statistics, database update, logs, config
+editing, project update, uninstall. On every launch the menu also checks whether a new project
+version is out and offers to install it.
 
 Without the menu:
 
@@ -182,7 +183,7 @@ addresses in total is rejected, so an inflated third-party list cannot block hal
 Lists are downloaded over https only; a redirect to http is refused.
 
 You can change settings from the menu (item 3: list source, action mode, detection method;
-item 9: edit the file) or by hand; after editing, apply the changes through the menu or with
+item 11: edit the file) or by hand; after editing, apply the changes through the menu or with
 `sudo systemctl restart skipa-watchdog`.
 
 ## Self-lockout protection
@@ -295,11 +296,11 @@ conntrack and write access to the install directory and logs. Only safe restrict
 sandbox (`ProtectSystem=strict`, `ProtectKernelModules`) is not used: iptables loads kernel modules
 and it broke startup on some systems.
 
-**Updating.** Menu item 10 or `sudo bash install.sh install`. If `git pull` fails (the
+**Updating.** Menu item 12 or `sudo bash install.sh install`. If `git pull` fails (the
 repository history changed), the installer offers to switch to the current version;
 `config.yaml` and `data/` are not touched.
 
-**Uninstalling.** Menu item 11. The installer separately asks whether to remove the
+**Uninstalling.** Menu item 13. The installer separately asks whether to remove the
 `iptables` rules and `ipset` sets.
 
 ## Security
@@ -308,7 +309,7 @@ repository history changed), the installer offers to switch to the current versi
 - The bot token and API keys are masked in logs (`skipa-watchdog.log`, `journalctl`).
 - Bot commands are accepted only from administrators (`admin_ids`, or the private chat with `chat_id`).
 - Self-lockout protection is described above. If you still got cut off, log in through the
-  host console and run `sudo skipa-watchdog`: item 6 unblocks a specific IP, item 11 removes
+  host console and run `sudo skipa-watchdog`: item 6 unblocks a specific IP, item 13 removes
   the project along with its rules.
 - Data from external APIs (organization, ASN) is escaped in Telegram and on the dashboard page, and
   newlines and control characters are stripped from it before it reaches text logs (otherwise a network
@@ -335,7 +336,7 @@ the "service only" variant the LOG rule fires on all protocols (you will see
 `proto=UDP port=3478` in `detections.log`), and the packet is dropped after being logged.
 
 **The menu says INPUT is not connected although the rules are in place.** Update the project
-(item 10). The check used to look only for rules in the old form; now it looks for any
+(item 12). The check used to look only for rules in the old form; now it looks for any
 project rules in the chain.
 
 **The service does not start.** `journalctl -u skipa-watchdog -n 50`. Common causes: no

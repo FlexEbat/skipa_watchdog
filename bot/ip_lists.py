@@ -104,8 +104,39 @@ class ThreatDB:
     # True, если при последнем обновлении не удалось получить один из
     # активных источников (используется его предыдущая версия)
     degraded: bool = False
+    # индекс для быстрого поиска: {(версия, длина префикса): {адрес сети: (позиция, запись)}}
+    _index: dict | None = field(default=None, init=False, repr=False, compare=False)
+    _index_len: int = field(default=-1, init=False, repr=False, compare=False)
 
     # ---------- матчинг ----------
+
+    def _build_index(self) -> dict:
+        """Строит словарь по длинам префиксов. Раньше match() перебирал ВСЕ сети
+        подряд: при 10-20 тыс. записей (AbuseIPDB, FireHOL) и сотнях соединений
+        за цикл опроса это секунды блокировки event loop - и повод для атакующего
+        с ботнетом вывести мониторинг из строя. Теперь - не более 33 поисков."""
+        index: dict = {}
+        for pos, entry in enumerate(self.networks):
+            net = entry.network
+            bucket = index.setdefault((net.version, net.prefixlen), {})
+            # при дублях остаётся первое вхождение (как и при линейном обходе)
+            bucket.setdefault(int(net.network_address), (pos, entry))
+        self._index, self._index_len = index, len(self.networks)
+        return index
+
+    def _match_network(self, ip_obj) -> "NetEntry | None":
+        index = self._index if self._index is not None and self._index_len == len(self.networks) \
+            else self._build_index()
+        bits = ip_obj.max_prefixlen
+        ip_int = int(ip_obj)
+        best = None
+        for (version, prefix), bucket in index.items():
+            if version != ip_obj.version:
+                continue
+            hit = bucket.get(ip_int >> (bits - prefix) << (bits - prefix))
+            if hit is not None and (best is None or hit[0] < best[0]):
+                best = hit  # как и раньше, побеждает запись, стоящая в списке раньше
+        return best[1] if best else None
 
     def match(self, ip_str: str) -> str | None:
         """Возвращает 'label: CIDR/диапазон' по которому сработало совпадение,
@@ -114,9 +145,9 @@ class ThreatDB:
         if ip_obj is None:
             return None
 
-        for entry in self.networks:
-            if ip_obj in entry.network:
-                return f"{entry.label}: {entry.network}"
+        entry = self._match_network(ip_obj)
+        if entry is not None:
+            return f"{entry.label}: {entry.network}"
 
         ip_int = int(ip_obj)
         for r in self.ranges:

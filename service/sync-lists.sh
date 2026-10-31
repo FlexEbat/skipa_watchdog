@@ -40,7 +40,8 @@ log() {
 fetch() {
     # --max-filesize: источник не должен отдавать десятки мегабайт
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time 30 --max-filesize 20971520 "$1" 2>/dev/null
+        curl -fsSL --proto '=http,https' --proto-redir '=http,https' \
+            --max-time 30 --max-filesize 20971520 "$1" 2>/dev/null
     elif command -v wget >/dev/null 2>&1; then
         wget -qO- --timeout=30 "$1" 2>/dev/null | head -c 20971520
     fi

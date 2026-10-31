@@ -30,6 +30,9 @@ PENDING_FILE = DATA_DIR / "pending_telegram.jsonl"
 
 # Очередь не должна расти бесконечно, если Telegram недоступен неделями
 MAX_PENDING = 500
+# Пока Telegram недоступен, очередь только пополняется (чистится она при успешной
+# отправке). Шторм сканов с множества адресов не должен забить диск.
+MAX_PENDING_BYTES = 5 * 1024 * 1024
 PENDING_TTL_SECONDS = 7 * 86400
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -65,6 +68,12 @@ def queue_pending_alert(
     reply_markup_json - инлайн-клавиатура (через .to_dict()) с кнопкой "Забанить",
     если она была на исходном сообщении."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if PENDING_FILE.stat().st_size > MAX_PENDING_BYTES:
+            log.error("Очередь повторов превысила %d байт - алерт остался только в логе", MAX_PENDING_BYTES)
+            return
+    except OSError:
+        pass
     record = {
         "ts": ts if ts is not None else time.time(),
         "chat_id": chat_id,

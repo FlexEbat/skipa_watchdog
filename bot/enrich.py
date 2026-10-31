@@ -20,6 +20,21 @@ from . import http_client
 log = logging.getLogger("skipa_watchdog.enrich")
 
 
+_MAX_FIELD_LEN = 120
+
+
+def clean_text(value):
+    """Строки из внешних сервисов (ipinfo, RIPE) попадают в detections.log, который
+    читает fail2ban по построчному regex. Владелец сети мог бы подставить в такое поле
+    перевод строки и поддельную строку «===== ... | IP=<чужой адрес> | ... =====» -
+    fail2ban забанил бы произвольный IP. Поэтому убираем управляющие символы,
+    схлопываем пробелы и ограничиваем длину."""
+    if value is None:
+        return None
+    text = "".join(ch if ch.isprintable() else " " for ch in str(value))
+    return " ".join(text.split())[:_MAX_FIELD_LEN] or None
+
+
 @dataclass
 class EnrichedIP:
     ip: str
@@ -98,11 +113,11 @@ async def enrich_ip(ip: str, ipinfo_token: str = "", ipregistry_key: str = "") -
     )
 
     if ipinfo_data:
-        result.country_code = ipinfo_data.get("country")
+        result.country_code = clean_text(ipinfo_data.get("country"))
         result.country_name = _COUNTRY_NAMES.get(result.country_code, result.country_code)
-        result.region = ipinfo_data.get("region")
-        result.city = ipinfo_data.get("city")
-        org = ipinfo_data.get("org", "")  # формат "AS64500 Example Hosting GmbH"
+        result.region = clean_text(ipinfo_data.get("region"))
+        result.city = clean_text(ipinfo_data.get("city"))
+        org = clean_text(ipinfo_data.get("org", "")) or ""  # формат "AS64500 Example Hosting GmbH"
         if org:
             parts = org.split(" ", 1)
             result.asn = parts[0]
@@ -129,12 +144,12 @@ def _parse_ripe_whois(result: EnrichedIP, whois_data: dict) -> None:
         return
     for record in records:
         for field in record:
-            key = field.get("key", "").lower()
-            value = field.get("value", "")
+            key = str(field.get("key", "")).lower()
+            value = clean_text(field.get("value", "")) or ""
             if key == "netname" and not result.ripe_ip_netname:
-                result.ripe_ip_netname = value
+                result.ripe_ip_netname = value or None
             elif key == "country" and not result.ripe_country:
-                result.ripe_country = value.upper()
+                result.ripe_country = value.upper() or None
 
 
 def _parse_ripe_as_overview(result: EnrichedIP, as_overview: dict) -> None:
@@ -142,7 +157,7 @@ def _parse_ripe_as_overview(result: EnrichedIP, as_overview: dict) -> None:
         data = as_overview["data"]
     except (KeyError, TypeError):
         return
-    holder = data.get("holder", "")  # обычно вида "EXAMPLE-AS, DE" или "EXAMPLE-AS example-hosting.example"
+    holder = clean_text(data.get("holder", "")) or ""  # обычно вида "EXAMPLE-AS, DE" или "EXAMPLE-AS example-hosting.example"
     if holder:
         result.ripe_as_name = holder
     # страна AS иногда можно вытащить из holder (последние 2 буквы после запятой)

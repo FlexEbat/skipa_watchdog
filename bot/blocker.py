@@ -558,7 +558,15 @@ def _load_persisted(path: Path) -> dict[str, float]:
         return {}
     if isinstance(data, list):  # старый формат: просто список IP (бессрочно)
         return {str(ip): 0.0 for ip in data}
-    return {str(k): float(v) for k, v in (data.get("ips") or {}).items()}
+    try:
+        return {str(k): float(v) for k, v in (data.get("ips") or {}).items()}
+    except (AttributeError, TypeError, ValueError) as e:
+        try:
+            path.replace(path.with_name(path.name + ".corrupt"))
+            log.error("Файл блокировок %s имеет неверную структуру (%s), сохранён как .corrupt", path, e)
+        except OSError:
+            pass
+        return {}
 
 
 def _save_persisted(path: Path, ips: dict[str, float]) -> None:

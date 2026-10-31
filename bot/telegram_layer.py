@@ -278,7 +278,7 @@ async def cmd_block(update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if hours < 0:
                 raise ValueError
             timeout_s = int(hours * 3600)
-        except ValueError:
+        except (ValueError, OverflowError):
             await update.message.reply_text("Число часов должно быть неотрицательным числом.")
             return
     ok = await asyncio.to_thread(blocker.block_ip, target, timeout_s)

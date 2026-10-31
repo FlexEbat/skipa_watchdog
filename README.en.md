@@ -301,9 +301,12 @@ repository history changed), the installer offers to switch to the current versi
 - Self-lockout protection is described above. If you still got cut off, log in through the
   host console and run `sudo skipa-watchdog`: item 6 unblocks a specific IP, item 11 removes
   the project along with its rules.
-- Data from external APIs (organization, ASN) is escaped in Telegram and on the dashboard page.
+- Data from external APIs (organization, ASN) is escaped in Telegram and on the dashboard page, and
+  newlines and control characters are stripped from it before it reaches text logs (otherwise a network
+  owner could feed fail2ban a forged line with someone else's IP).
 - A dashboard without `username` is open to anyone who can reach the port: do not expose it
-  to the internet.
+  to the internet. If `dashboard.host` is not a loopback address and there is no login, the dashboard
+  listens on `127.0.0.1` only and logs that.
 - Report vulnerabilities to the repository owner privately, not in public issues.
 
 ## Troubleshooting

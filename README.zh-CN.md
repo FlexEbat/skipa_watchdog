@@ -39,10 +39,31 @@ Skipa Watchdog 能发现已知扫描器（CyberOK/Skipa、GRChTs、NKTsKI 及其
 | Python | 不需要 | 需要 |
 | 封锁 | 在内核中，名单由 systemd 定时器更新 | 在内核中，进程自行更新并修复规则 |
 | 通知 | 写入 `detections.log` | `detections.log` 以及 Telegram 消息 |
-| “封禁”按钮、`/stats`、仪表盘、健康检查 | 无 | 有 |
+| “封禁”按钮、`/stats` 图表、仪表盘、健康检查 | 无 | 有 |
 | 附加来源（`sources.extra`） | 无 | 有 |
 
 可以先用第一种方式，之后再从菜单中接入 Telegram。无法切换回纯 bash 方式：需要卸载后重新安装。
+
+### 各方式的功能对照
+
+控制面板（`sudo skipa-watchdog`）、机器人和服务脚本能做的事情相同，区别只在调用方式。无论从哪里修改
+`config.yaml`，使用的都是同一段代码（`service/confctl.sh`）。
+
+| 功能 | 面板 | 机器人 | 不含 Python 的服务 |
+| --- | --- | --- | --- |
+| 状态与检查 | 第 1 项，`install.sh status` | `/status` | 第 1 项，`install.sh status` |
+| 更新 IP 数据库 | 第 9 项 | `/update` | 第 9 项，`sync-lists` 定时器 |
+| 封锁 / 解除 | 第 6 项（可指定小时数或永久） | `/block <ip> [小时]`、`/unblock` | 第 6 项，`blockctl.sh block\|unblock`（永久） |
+| 封锁列表 | 第 6 项 | `/blocklist` | 第 6 项，`blockctl.sh list` |
+| 白名单 | 第 7 项 | `/allowlist`、`/allow`、`/unallow` | 第 7 项，`blockctl.sh allow\|unallow\|allowlist` |
+| 动作模式、名单来源、检测方式 | 第 3 项 | `/settings` | 第 3 项 |
+| 检测统计 | 第 8 项，`install.sh stats` | `/stats`（含图表）、`/export` | 第 8 项，`service/stats.sh` |
+| 日志 | 第 10 项 | `/logs [行数]` | 第 10 项 |
+| Docker/Kubernetes | 第 5 项 | `/env` | 第 5 项 |
+| 项目更新检查 | 每次启动菜单时，第 12 项 | 服务启动时：“安装”按钮，`/version` | 写入日志；在面板中安装 |
+
+仅 Python 方式具备（由其性质决定）：测试通知 `/testalert`、队列 `/pending`、告警中的“封禁”按钮、仪表盘、
+附加来源、限时自动封锁。
 
 ## 快速开始
 
@@ -148,6 +169,7 @@ IP 名单 ──► 数据库（缓存 data/ip_cache.json）──► ipset skip
 | `sources.update_interval_days` | `7` | 数据库更新频率 | 是 |
 | `sources.min_prefix` | `20` | 名单中接受的最大网段（前缀长度）；Spamhaus DROP 请设为 `16` | 是 |
 | `sources.allow_insecure_http` | `false` | 允许通过明文 http 下载名单（默认仅 https） | 是 |
+| `updates.check_on_start` | `true` | 启动面板和服务时检查项目更新 | 是 |
 | `sources.extra` | 空 | 附加来源 | 否 |
 | `monitoring.method` | `both` | `poll`、`kernel_log`、`both` | 否 |
 | `monitoring.ignore_ips` | 空 | 永不封锁的地址 | 是 |
@@ -211,6 +233,10 @@ Telegram 不可用不会中断防护：该层在后台启动并重试，未发�
 | `/stats [天数]`、`/export [天数]` | 带图表的统计，以及事件导出 |
 | `/testalert [ip]` | 测试通知 |
 | `/pending`、`/env` | 未发送告警的队列、Docker/Kubernetes 环境 |
+| `/allowlist`、`/allow <ip 或网段>`、`/unallow <ip 或网段>` | 白名单（`monitoring.ignore_ips`）：立即生效并写入 `config.yaml` |
+| `/settings` | 动作模式、名单来源、检测方式（需确认并重启服务） |
+| `/logs [行数]` | 日志的最后几行（机器人令牌会被隐藏） |
+| `/version` | 版本及更新检查，带“安装”按钮 |
 
 通知示例（数值取自文档专用地址段，RFC 5737 和 RFC 5398；机器人的消息文本为俄语）：
 
@@ -267,7 +293,7 @@ Telegram 方式下的封锁保存在 `data/blocked_ips.json` 中，并在启动�
 `ProtectSystem=full`、`RestrictAddressFamilies` 等）；不使用严格沙箱（`ProtectSystem=strict`、
 `ProtectKernelModules`）：iptables 需要加载内核模块，严格沙箱曾在部分系统上导致无法启动。
 
-**更新。** 菜单第 12 项或 `sudo bash install.sh install`。如果 `git pull` 失败（仓库历史被改写），
+**更新。** 每次启动面板（`sudo skipa-watchdog`）时都会检查是否有新版本并提示安装；拒绝后并不会就此作罢：菜单顶部会保留提醒。服务启动时，机器人会向聊天发送带“安装”按钮的消息（也可用 `/version` 随时查询）；未启用 Telegram 或仅服务方式下，新版本信息会写入日志。`updates.check_on_start: false` 可关闭检查（单次可用 `SKIPA_NO_UPDATE_CHECK=1`）；`sudo bash install.sh check-update` 不带提示地检查（退出码 10 表示有更新）。手动更新：菜单第 12 项或 `sudo bash install.sh install`。如果 `git pull` 失败（仓库历史被改写），
 安装程序会提示切换到最新版本：`config.yaml` 和 `data/` 不受影响。
 
 **卸载。** 菜单第 13 项。安装程序会单独询问是否移除 `iptables` 规则和 `ipset` 集合。

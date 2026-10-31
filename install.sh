@@ -220,13 +220,22 @@ check_list_updates() {
     # shellcheck disable=SC1090
     [ -f "$LIST_HASH_STATE" ] && source "$LIST_HASH_STATE"
 
+    # Адреса берём из config.yaml (как и бот с сервисом), а не зашиваем в скрипт: иначе
+    # при своём списке проверялся бы чужой. Пустой blacklist_url - источник отключён.
     local primary_url="https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
     local blacklist_url="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/37cde2b27a560c647d0e8eb9d274e3409082d3e7/blacklist.txt"
+    if [ -f "$SERVICE_CONF" ] && [ -f "$INSTALL_DIR/service/lib-config.sh" ]; then
+        _conf_lib
+        local v
+        v="$(yaml_get "$SERVICE_CONF" sources.primary_list_url)";  [ -n "$v" ] && primary_url="$v"
+        # blacklist_url: пустое значение в конфиге значит «источник отключён»
+        if grep -qE '^  blacklist_url:' "$SERVICE_CONF"; then blacklist_url="$(yaml_get "$SERVICE_CONF" sources.blacklist_url)"; fi
+    fi
 
     info "Проверяю обновления списков IP..."
-    local new_primary new_blacklist
+    local new_primary new_blacklist=""
     new_primary="$(url_hash "$primary_url")"
-    new_blacklist="$(url_hash "$blacklist_url")"
+    [ -n "$blacklist_url" ] && new_blacklist="$(url_hash "$blacklist_url")"
 
     local any_new=0
     if [ -n "${HASH_PRIMARY:-}" ] && [ -n "$new_primary" ] && [ "$HASH_PRIMARY" != "$new_primary" ]; then

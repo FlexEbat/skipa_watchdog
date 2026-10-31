@@ -365,3 +365,31 @@ class PanelMenusTests(_Conf):
         text = (ROOT / "install.sh").read_text(encoding="utf-8")
         for needle in ('7) allowlist_menu ;;', '8) view_stats ;;', '12) update_project ;;', '13) do_uninstall; pause ;;'):
             self.assertIn(needle, text)
+
+
+@unittest.skipUnless(HAVE_BASH, "нужен bash")
+class ListUpdateCheckUsesConfigTests(_Conf):
+    def test_проверка_списков_берёт_адреса_из_конфига(self):
+        """check_list_updates качает именно настроенные источники; пустой blacklist_url - не качает"""
+        inst = self.d / "inst"
+        shutil.copytree(ROOT / "service", inst / "service")
+        text = self.conf.read_text(encoding="utf-8")
+        import re
+        text = re.sub(r'(?m)^  primary_list_url:.*$', '  primary_list_url: "https://example.org/my-list.txt"', text)
+        text = re.sub(r'(?m)^  blacklist_url:.*$', '  blacklist_url: ""', text)
+        (inst / "config.yaml").write_text(text, encoding="utf-8")
+        bindir = self.d / "bin"
+        bindir.mkdir()
+        for name, body in (("curl", 'echo "$@" >> "$OUT"; echo data'), ("sha256sum", "cat; echo")):
+            f = bindir / name
+            f.write_text("#!/usr/bin/env bash\n" + body + "\n", encoding="utf-8")
+            f.chmod(0o755)
+        env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", OUT=str(self.d / "curl.log"),
+                   SKIPA_SOURCE_ONLY="1", SKIPA_INSTALL_DIR=str(inst))
+        script = f'source "{ROOT / "install.sh"}"; LIST_HASH_STATE="{self.d}/hashes.env"; check_list_updates'
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = (self.d / "curl.log").read_text(encoding="utf-8")
+        self.assertIn("https://example.org/my-list.txt", calls)
+        self.assertNotIn("gist.githubusercontent.com", calls)
+        self.assertEqual(len(calls.strip().splitlines()), 1)

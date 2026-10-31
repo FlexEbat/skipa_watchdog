@@ -42,11 +42,33 @@ works on the host and for services published through Docker and Kubernetes.
 | Python | not needed | required |
 | Blocking | in the kernel, list refreshed by a systemd timer | in the kernel, the process refreshes and repairs rules itself |
 | Notifications | entries in `detections.log` | `detections.log` and Telegram messages |
-| "Ban" button, `/stats`, dashboard, health-check | no | yes |
+| "Ban" button, charts in `/stats`, dashboard, health-check | no | yes |
 | Extra sources (`sources.extra`) | no | yes |
 
 You can start with the first variant and add Telegram later from the menu. Switching back
 to plain bash is not possible: uninstall and install again.
+
+### What is available where
+
+The panel (`sudo skipa-watchdog`), the bot and the service scripts do the same things; only the
+way to invoke them differs. Edits to `config.yaml` from any of them go through the same code
+(`service/confctl.sh`).
+
+| Feature | Panel | Bot | Service without Python |
+| --- | --- | --- | --- |
+| Status, health check | item 1, `install.sh status` | `/status` | item 1, `install.sh status` |
+| Update the IP database | item 9 | `/update` | item 9, `sync-lists` timer |
+| Block / unblock | item 6 (for N hours or permanent) | `/block <ip> [hours]`, `/unblock` | item 6, `blockctl.sh block\|unblock` (permanent) |
+| List of blocks | item 6 | `/blocklist` | item 6, `blockctl.sh list` |
+| Allowlist | item 7 | `/allowlist`, `/allow`, `/unallow` | item 7, `blockctl.sh allow\|unallow\|allowlist` |
+| Action mode, list source, method | item 3 | `/settings` | item 3 |
+| Detection statistics | item 8, `install.sh stats` | `/stats` (with a chart), `/export` | item 8, `service/stats.sh` |
+| Logs | item 10 | `/logs [lines]` | item 10 |
+| Docker/Kubernetes | item 5 | `/env` | item 5 |
+| Project update check | on every menu launch, item 12 | on service start: an "Install" button, `/version` | a log line; install from the panel |
+
+Python-only by nature: the `/testalert` test notification, the `/pending` queue, the "Ban"
+button in alerts, the dashboard, extra sources, time-limited auto-blocking.
 
 ## Quick start
 
@@ -158,6 +180,7 @@ marked in the last column.
 | `sources.update_interval_days` | `7` | how often to refresh the database | yes |
 | `sources.min_prefix` | `20` | widest network accepted from lists (prefix length); use `16` for Spamhaus DROP | yes |
 | `sources.allow_insecure_http` | `false` | allow downloading lists over plain http (https only by default) | yes |
+| `updates.check_on_start` | `true` | check for project updates when the panel and the service start | yes |
 | `sources.extra` | empty | additional sources | no |
 | `monitoring.method` | `both` | `poll`, `kernel_log`, `both` | no |
 | `monitoring.ignore_ips` | empty | addresses that are never blocked | yes |
@@ -232,6 +255,10 @@ retries, and unsent alerts wait in a queue (up to 500 items, up to a week).
 | `/stats [days]`, `/export [days]` | statistics with a chart, and event export |
 | `/testalert [ip]` | test notification |
 | `/pending`, `/env` | queue of unsent alerts, Docker/Kubernetes environment |
+| `/allowlist`, `/allow <ip or network>`, `/unallow <ip or network>` | allowlist (`monitoring.ignore_ips`): applied immediately, written to `config.yaml` |
+| `/settings` | action mode, list source, detection method (with confirmation and a service restart) |
+| `/logs [lines]` | last lines of the log (the bot token is masked) |
+| `/version` | version and update check with an "Install" button |
 
 Example notification (values from documentation ranges, RFC 5737 and RFC 5398; the bot's
 message text is in Russian):
@@ -296,7 +323,7 @@ conntrack and write access to the install directory and logs. Only safe restrict
 sandbox (`ProtectSystem=strict`, `ProtectKernelModules`) is not used: iptables loads kernel modules
 and it broke startup on some systems.
 
-**Updating.** Menu item 12 or `sudo bash install.sh install`. If `git pull` fails (the
+**Updating.** On every launch the panel (`sudo skipa-watchdog`) checks whether a new version is out and offers to install it; declining is not permanent: a reminder stays in the menu header. When the service starts, the bot sends a message with an "Install" button to the chat (and `/version` on demand); without Telegram and in service-only mode a new version is noted in the log. `updates.check_on_start: false` turns the check off (`SKIPA_NO_UPDATE_CHECK=1` for a single run); `sudo bash install.sh check-update` checks without prompting (exit code 10 means an update is available). Manually: menu item 12 or `sudo bash install.sh install`. If `git pull` fails (the
 repository history changed), the installer offers to switch to the current version;
 `config.yaml` and `data/` are not touched.
 

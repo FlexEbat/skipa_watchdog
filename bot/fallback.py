@@ -17,7 +17,6 @@ from __future__ import annotations
 import html
 import json
 import logging
-import os
 import re
 import time
 from pathlib import Path
@@ -139,19 +138,6 @@ def requeue(records: list[dict]) -> None:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
     except Exception as e:  # noqa: BLE001
         log.error("Не удалось вернуть алерты в очередь %s: %s", PENDING_FILE, e)
-
-
-def save_pending(records: list[dict]) -> None:
-    """Атомарная перезапись очереди (оставлено для совместимости)."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        tmp = PENDING_FILE.with_name(PENDING_FILE.name + ".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            for r in records:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        os.replace(tmp, PENDING_FILE)
-    except Exception as e:  # noqa: BLE001
-        log.error("Не удалось перезаписать очередь %s: %s", PENDING_FILE, e)
 
 
 def pending_count() -> int:

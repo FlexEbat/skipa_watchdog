@@ -97,10 +97,6 @@ def configure(**kwargs) -> None:
         setattr(_settings, k, v)
 
 
-def settings() -> Settings:
-    return _settings
-
-
 # ---------------------------------------------------------------------------
 # Низкоуровневые вызовы
 # ---------------------------------------------------------------------------
@@ -313,11 +309,14 @@ def _desired_rules() -> list[tuple[str, list[str], bool]]:
     ]
 
 
-def _ensure_rule(args: list[str], present: bool, insert_first: bool = False) -> bool:
+def _ensure_rule(args: list[str], present: bool, position: int = 0) -> bool:
+    """position - желаемая позиция правила в цепочке (с 1) среди наших правил;
+    0 - в конец. Раньше пропавшее правило дописывалось в конец и могло оказаться
+    ПОСЛЕ DROP (тогда LOG-правило уже никогда не срабатывало)."""
     exists, _ = _ipt("-C", CHAIN, *args)
     if present and not exists:
-        if insert_first:
-            ok, out = _ipt("-I", CHAIN, "1", *args)
+        if position:
+            ok, out = _ipt("-I", CHAIN, str(position), *args)
         else:
             ok, out = _ipt("-A", CHAIN, *args)
         if not ok:
@@ -344,8 +343,11 @@ def ensure_chain() -> bool:
                 return False
 
         if using_ipset():
-            for key, args, wanted in _desired_rules():
-                _ensure_rule(args, wanted, insert_first=(key == "allow"))
+            position = 0
+            for _key, args, wanted in _desired_rules():
+                if wanted:
+                    position += 1  # правила идут по порядку, поэтому нужная позиция = номер среди нужных
+                _ensure_rule(args, wanted, position if wanted else 0)
         return True
 
 
@@ -416,11 +418,6 @@ def ensure_wiring() -> dict[str, str]:
 def db_set_size() -> int | None:
     """Сколько записей сейчас в наборе skipa-db (None - нет ipset-режима)."""
     return _set_size(SET_DB) if using_ipset() else None
-
-
-def is_wired_into_input() -> bool:
-    ok, _ = _ipt("-C", "INPUT", "-j", CHAIN)
-    return ok
 
 
 def log_rule_present() -> bool:

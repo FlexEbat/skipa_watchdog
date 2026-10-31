@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hmac
+import ipaddress
 import json
 import logging
 import time
@@ -129,13 +130,28 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ge
             pass
 
 
+def _is_loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
 async def serve_dashboard(get_db, config) -> None:
     """Запускает HTTP-сервер дашборда и работает, пока задачу не отменят."""
+    host = config.dashboard_host
+    if not config.dashboard_username and not _is_loopback(host):
+        # без логина дашборд показывает IP, страны и организации всем, кто достучался до порта
+        log.error(
+            "dashboard.host=%s без username/password: открывать дашборд наружу без авторизации "
+            "нельзя, слушаю только 127.0.0.1 (задайте логин и пароль или используйте SSH-туннель)", host,
+        )
+        host = "127.0.0.1"
     server = await asyncio.start_server(
         lambda r, w: _handle(r, w, get_db, config),
-        host=config.dashboard_host, port=config.dashboard_port, limit=MAX_HEADER_BYTES,
+        host=host, port=config.dashboard_port, limit=MAX_HEADER_BYTES,
     )
-    log.info("Веб-дашборд запущен на http://%s:%s/", config.dashboard_host, config.dashboard_port)
+    log.info("Веб-дашборд запущен на http://%s:%s/", host, config.dashboard_port)
     async with server:
         await server.serve_forever()
 

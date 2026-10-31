@@ -11,9 +11,9 @@ config.yaml заполнен, watchdog.py поднимает это поверх
 обработчики команд здесь (мутации в одном месте сразу видны в другом).
 
 Безопасность: команды принимаются только от администраторов. Если
-telegram.admin_ids пуст, администратором считается только тот, кто пишет из
-чата telegram.chat_id (раньше при пустом списке командами мог пользоваться
-любой, кто нашёл бота). Все IP, пришедшие в командах, проверяются перед
+telegram.admin_ids пуст, администратором считается только пользователь, чей
+личный чат с ботом совпадает с telegram.chat_id (в группе без admin_ids команды
+закрыты: иначе ими мог бы пользоваться любой участник группы). Все IP, пришедшие в командах, проверяются перед
 использованием.
 """
 from __future__ import annotations
@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import datetime
 import io
-import ipaddress
 import logging
 import tempfile
 import time
@@ -50,8 +49,10 @@ def _is_admin(config: Config, user_id: int | None, chat_id: int | None = None) -
         return False
     if config.admin_ids:
         return user_id in config.admin_ids
-    # admin_ids не задан: доверяем только настроенному чату (личка или группа)
-    return bool(config.chat_id) and chat_id == config.chat_id
+    # admin_ids не задан: доверяем только личной переписке с настроенным пользователем
+    # (в личке id чата равен id пользователя). В группе командовать мог бы любой её
+    # участник, поэтому для группы нужно явно перечислить администраторов в admin_ids.
+    return bool(config.chat_id) and chat_id == config.chat_id and user_id == chat_id
 
 
 def _read_version() -> str:
@@ -245,7 +246,7 @@ async def cmd_env(update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _blocklist_text() -> str:
-    ips = await asyncio.to_thread(blocker.list_blocked_ips)
+    ips = await banning.list_banned()
     if not ips:
         return "Сейчас никто не заблокирован."
     text = "🚫 Заблокированные IP:\n" + "\n".join(ips[:50])
@@ -290,7 +291,8 @@ async def cmd_block(update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_unblock(update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await _guard(update, context) is None:
+    config = await _guard(update, context)
+    if config is None:
         return
     if not context.args:
         await update.message.reply_text("Использование: /unblock <ip>")
@@ -300,7 +302,9 @@ async def cmd_unblock(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Некорректный IP.")
         return
     arg = context.args[0] if "/" in context.args[0] else ip
-    if await asyncio.to_thread(blocker.unblock_ip, arg):
+    by = f"@{update.effective_user.username or update.effective_user.id}"
+    # через banning: запись в bans.jsonl и снятие бана в fail2ban (раньше они терялись)
+    if await banning.unban_ip(arg, fail2ban_jail=config.fail2ban_jail, by=by):
         text = f"{arg} разблокирован."
         if await asyncio.to_thread(blocker.is_in_db_set, ip):
             text += (

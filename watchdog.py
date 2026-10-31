@@ -40,7 +40,7 @@ import time
 from html import escape
 from pathlib import Path
 
-from bot import blocker
+from bot import blocker, http_client, ip_lists
 from bot.allowlist import build_allowlist
 from bot.config import Config
 from bot.dbupdate import apply_db_to_firewall, preload_effective, refresh_db
@@ -546,6 +546,8 @@ async def async_main() -> None:
     )
 
     state: dict = {"db": None, "telegram_app": None}
+    ip_lists.configure_limits(config.min_list_prefix)
+    http_client.configure(config.allow_insecure_http)
 
     # Если кэш есть, но устарел, а сети нет - остаёмся на старом кэше, а не
     # подменяем его пустой базой (раньше так терялась вся защита на час).

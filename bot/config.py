@@ -104,6 +104,10 @@ class Config:
 
     # ---- дополнительные источники (Spamhaus DROP, FireHOL, AbuseIPDB, ...) ----
     extra_sources: list[dict] = field(default_factory=list)
+    # самая широкая сеть из внешних списков (длина префикса); шире - отбрасывается
+    min_list_prefix: int = 20
+    # разрешить скачивание списков по обычному http (по умолчанию только https)
+    allow_insecure_http: bool = False
 
     # ---- бан: кнопка под алертом, автобан, зеркалирование в fail2ban ----
     ban_enabled: bool = False
@@ -263,6 +267,8 @@ class Config:
             ssh_ports=ssh_ports or [22],
             guard_interval_seconds=max(10, int(mon.get("guard_interval_seconds", 60))),
             extra_sources=[e for e in (src.get("extra") or []) if isinstance(e, dict)],
+            min_list_prefix=min(32, max(8, int(src.get("min_prefix", 20)))),
+            allow_insecure_http=bool(src.get("allow_insecure_http", False)),
             ban_enabled=bool(banning.get("enabled", False)),
             auto_ban_new_hits=bool(banning.get("auto_ban_new_hits", False)),
             auto_ban_duration_minutes=max(0, int(banning.get("auto_ban_duration_minutes", 60))),
@@ -299,8 +305,9 @@ class Config:
                 print("[config] telegram.bot_token задан, а chat_id=0 - уведомления некуда отправлять")
             if not self.admin_ids:
                 print(
-                    "[config] telegram.admin_ids пуст - команды бота будут приняты только из чата "
-                    "telegram.chat_id. Укажите свой Telegram user id в admin_ids."
+                    "[config] telegram.admin_ids пуст - команды бота работают только в личной "
+                    "переписке пользователя telegram.chat_id (в группе они закрыты). "
+                    "Укажите свой Telegram user id в admin_ids."
                 )
             try:
                 mode = path.stat().st_mode

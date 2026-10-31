@@ -27,14 +27,41 @@ MAX_BYTES = 20 * 1024 * 1024
 USER_AGENT = "skipa-watchdog (+https://github.com/FlexEbat/skipa_watchdog)"
 
 
+# Списки IP блокируются автоматически, поэтому подмена по пути (MITM) по обычному http
+# равна управлению блокировками. По умолчанию разрешён только https; http включается
+# явно (sources.allow_insecure_http) - например, для списка во внутренней сети.
+_allow_insecure_http = False
+
+
+def configure(allow_insecure_http: bool = False) -> None:
+    global _allow_insecure_http
+    _allow_insecure_http = bool(allow_insecure_http)
+
+
+class _NoDowngradeRedirect(urllib.request.HTTPRedirectHandler):
+    """Редирект не должен менять схему на менее защищённую или на не-http(s)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = newurl.lower()
+        if not new.startswith("https://") and not (_allow_insecure_http and new.startswith("http://")):
+            raise urllib.error.URLError(f"редирект на небезопасный адрес отклонён: {_safe_url(newurl)}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_NoDowngradeRedirect)
+
+
 def _get_bytes(url: str, timeout: float, headers: dict | None = None) -> bytes | None:
-    # urllib умеет file:// и ftp:// - разрешаем только http(s)
-    if not url.lower().startswith(("https://", "http://")):
-        log.warning("Пропускаю URL с неподдерживаемой схемой: %s", _safe_url(url))
+    low = url.lower()
+    if not (low.startswith("https://") or (_allow_insecure_http and low.startswith("http://"))):
+        log.warning(
+            "Пропускаю URL %s: разрешён только https (для http задайте sources.allow_insecure_http: true)",
+            _safe_url(url),
+        )
         return None
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (схема проверена выше)
+        with _opener.open(req, timeout=timeout) as resp:
             if resp.status != 200:
                 log.debug("GET %s -> HTTP %s", _safe_url(url), resp.status)
                 return None

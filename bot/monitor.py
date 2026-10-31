@@ -179,6 +179,9 @@ def read_tcp_table() -> list[tuple[str, str, int, int]]:
 
 _CONNTRACK_PATHS = ("/proc/net/nf_conntrack", "/proc/net/ip_conntrack")
 _MAX_CONNTRACK_LINES = 300_000
+# Типовая TCP-строка: "ipv4 2 tcp 6 431999 ESTABLISHED src=A dst=B sport=P dport=Q ...".
+# Регулярка заметно быстрее split() по всей строке (в таблице бывают сотни тысяч записей).
+_CT_TCP_RE = re.compile(r"^\S+\s+\d+\s+tcp\s+\d+\s+\d+\s+\S+\s+src=(\S+)\s+dst=\S+\s+sport=(\d+)\s+dport=(\d+)")
 
 
 def parse_conntrack_line(line: str) -> tuple[str, int, int] | None:
@@ -219,12 +222,27 @@ def read_conntrack() -> list[tuple[str, int, int]]:
     for path in _CONNTRACK_PATHS:
         try:
             out = []
+            seen: set[str] = set()   # один адрес - одна запись: дальше всё равно проверяется по уникальным IP
             with open(path, encoding="ascii", errors="replace") as f:
                 for i, line in enumerate(f):
                     if i >= _MAX_CONNTRACK_LINES:
                         break
-                    parsed = parse_conntrack_line(line)
-                    if parsed:
+                    if " tcp " not in line:
+                        continue  # UDP/ICMP и прочее нас не интересует
+                    m = _CT_TCP_RE.match(line)
+                    if m:
+                        raw_src = m.group(1)
+                        if raw_src in seen:
+                            continue
+                        seen.add(raw_src)
+                        # IPv4 в conntrack уже в каноническом виде; разбирать через ipaddress
+                        # нужно только IPv6 (в т.ч. ::ffff:a.b.c.d)
+                        src = raw_src if ":" not in raw_src else str(normalize_ip(raw_src) or raw_src)
+                        out.append((src, int(m.group(2)), int(m.group(3))))
+                        continue
+                    parsed = parse_conntrack_line(line)  # нестандартный формат - общий разбор
+                    if parsed and parsed[0] not in seen:
+                        seen.add(parsed[0])
                         out.append(parsed)
             return out
         except FileNotFoundError:

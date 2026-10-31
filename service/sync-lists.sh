@@ -7,7 +7,10 @@
 #   sudo bash sync-lists.sh /opt/skipa_watchdog/config.yaml
 #
 # Защита от сбоев источников:
-#   - слишком широкие сети (короче /16) и битые строки отбрасываются;
+#   - слишком широкие сети (короче sources.min_prefix, по умолчанию /20) и битые
+#     строки отбрасываются; источник, покрывающий больше ~4 млн адресов, не принимается;
+#   - скачивание только по https (sources.allow_insecure_http: true разрешает http);
+#   - текущие SSH-сессии администратора попадают в allowlist (monitoring.auto_allowlist);
 #   - если источник не скачался - используется его последняя удачная копия;
 #   - если источник внезапно "похудел" больше чем вдвое - тоже;
 #   - ipset подменяется (swap) только если restore прошёл без ошибок.
@@ -22,7 +25,7 @@ fi
 # shellcheck source=lib-config.sh
 source "$HERE/lib-config.sh"
 load_service_config "$CONF"   # единый config.yaml, тот же, что читает watchdog.py
-STATE_DIR="/var/lib/skipa_watchdog"
+STATE_DIR="${SKIPA_STATE_DIR:-/var/lib/skipa_watchdog}"
 mkdir -p "$LOG_DIR" "$STATE_DIR"
 
 SETNAME="skipa-scanners"
@@ -30,19 +33,26 @@ TMPSET="skipa-scanners-tmp"
 ALLOWSET="skipa-allow"
 MAXELEM=200000
 MAXELEM_ALLOW=4096
-MIN_PREFIX=16
+# MIN_PREFIX приходит из config.yaml (sources.min_prefix) через load_service_config
 MAX_RANGE=1048576
+MAX_COVERAGE=4194304   # столько адресов (~0,1% IPv4) максимум может покрывать один источник
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [sync-lists] $*" | tee -a "$LOG_DIR/skipa-watchdog.log" >&2
 }
 
 fetch() {
-    # --max-filesize: источник не должен отдавать десятки мегабайт
+    # --max-filesize: источник не должен отдавать десятки мегабайт. Только https: списки
+    # блокируются автоматически, подмена по пути равна управлению блокировками.
+    local protos="https"
+    [ "${ALLOW_INSECURE_HTTP:-false}" = "true" ] && protos="http,https"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --proto '=http,https' --proto-redir '=http,https' \
+        curl -fsSL --proto "=$protos" --proto-redir "=$protos" \
             --max-time 30 --max-filesize 20971520 "$1" 2>/dev/null
     elif command -v wget >/dev/null 2>&1; then
+        if [ "$protos" = "https" ] && [[ "$1" != https://* ]]; then
+            return 0
+        fi
         wget -qO- --timeout=30 "$1" 2>/dev/null | head -c 20971520
     fi
 }
@@ -79,6 +89,15 @@ normalize_list() {
     }'
 }
 
+# Сколько IPv4-адресов покрывает нормализованный список (грубая верхняя оценка).
+coverage() {
+    awk '
+        index($0, "/") { split($0, p, "/"); total += 2 ^ (32 - p[2]); next }
+        index($0, "-") { split($0, p, "-"); split(p[1], a, "."); split(p[2], b, ".")
+                         total += (b[1]*16777216 + b[2]*65536 + b[3]*256 + b[4]) - (a[1]*16777216 + a[2]*65536 + a[3]*256 + a[4]) + 1 }
+        END { printf "%d\n", total }'
+}
+
 # Скачивает один источник с откатом на последнюю удачную копию.
 # $1 - имя (для файла кэша и лога), $2 - URL. Результат - в stdout.
 get_source() {
@@ -95,6 +114,11 @@ get_source() {
         else
             log "Источник $name недоступен, копии нет"
         fi
+        return 0
+    fi
+    if [ "$(printf '%s\n' "$fresh" | coverage)" -gt "$MAX_COVERAGE" ]; then
+        log "Источник $name покрывает больше $MAX_COVERAGE адресов - похоже на подмену, использую прошлую копию"
+        [ "$n_old" -gt 0 ] && cat "$cache"
         return 0
     fi
     if [ "$n_old" -gt 0 ] && [ $((n_new * 2)) -lt "$n_old" ]; then
@@ -169,7 +193,12 @@ fi
         [[ "$ign" == */* ]] || ign="${ign}/32"
         echo "$ign"
     done
-} | normalize_list | sort -u > "$ALLOW_FILE"
+    # текущие SSH-сессии: свой адрес, попавший во внешний список, не должен отрезать от сервера
+    if [ "${AUTO_ALLOWLIST:-true}" != "false" ]; then
+        # shellcheck disable=SC2086
+        ssh_peers ${SSH_PORTS:-22} | sed 's#$#/32#'
+    fi
+} | MIN_PREFIX=1 normalize_list | sort -u > "$ALLOW_FILE"
 
 if ! replace_set "$ALLOWSET" "$ALLOWSET-tmp" "$MAXELEM_ALLOW" "$ALLOW_FILE"; then
     log "Не удалось обновить ipset $ALLOWSET - список сканеров НЕ обновляю, чтобы не заблокировать своих"

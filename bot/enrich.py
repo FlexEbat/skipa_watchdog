@@ -52,7 +52,6 @@ class EnrichedIP:
     ripe_ip_netname: str | None = None
     ripe_as_country: str | None = None
     ripe_as_name: str | None = None
-    ripe_as_org: str | None = None
 
     # ipregistry.co (privacy)
     is_proxy: bool | None = None

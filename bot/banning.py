@@ -106,7 +106,3 @@ async def list_banned() -> list[str]:
     """Список сейчас заблокированных IP (ipset сам убирает протухшие по timeout)."""
     return await asyncio.to_thread(blocker.list_blocked_ips)
 
-
-async def is_ready() -> bool:
-    """Есть ли цепочка SKIPA-BLOCK (watchdog создаёт её при старте сам)."""
-    return await asyncio.to_thread(blocker.chain_exists)

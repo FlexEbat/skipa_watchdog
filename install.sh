@@ -24,6 +24,7 @@ UNIT="skipa-watchdog"                       # systemd-юнит python-бота (
 FW_UNIT="skipa-watchdog-fw-rules"           # применяет правила python-режима после старта Docker
 SYNC_UNIT="skipa-watchdog-sync-lists"       # bash-режим: таймер обновления ipset
 NOTIFY_UNIT="skipa-watchdog-notify"         # bash-режим: демон записи detections.log
+ALLOW_UNIT="skipa-watchdog-allow-ssh"       # bash-режим: таймер, добавляющий SSH-сессии в allowlist
 SERVICE_CONF="$INSTALL_DIR/config.yaml"      # единый конфиг для обоих вариантов (bash читает его через service/lib-config.sh)
 
 # Содержит "service" (чистый bash + ipset/iptables, без Python вообще) или
@@ -595,8 +596,13 @@ _do_install_service() {
     cp "$INSTALL_DIR/service/skipa-watchdog-notify.service" "$SYSTEMD_DIR/${NOTIFY_UNIT}.service"
     sed -i "s#/opt/skipa_watchdog#$INSTALL_DIR#g" "$SYSTEMD_DIR/${NOTIFY_UNIT}.service"
 
+    cp "$INSTALL_DIR/service/skipa-watchdog-allow-ssh.service" "$SYSTEMD_DIR/${ALLOW_UNIT}.service"
+    sed -i "s#/opt/skipa_watchdog#$INSTALL_DIR#g" "$SYSTEMD_DIR/${ALLOW_UNIT}.service"
+    cp "$INSTALL_DIR/service/skipa-watchdog-allow-ssh.timer" "$SYSTEMD_DIR/${ALLOW_UNIT}.timer"
+
     systemctl daemon-reload || { err "systemctl daemon-reload не удался."; return 1; }
     systemctl enable --now "${SYNC_UNIT}.timer" >/dev/null 2>&1
+    systemctl enable --now "${ALLOW_UNIT}.timer" >/dev/null 2>&1
     _sync_notify_service_state
 
     install_cli_link
@@ -616,11 +622,13 @@ do_uninstall() {
     local mode
     mode="$(_current_mode 2>/dev/null || echo service)"
 
-    systemctl stop "$UNIT" "$FW_UNIT" "${SYNC_UNIT}.timer" "$SYNC_UNIT" "$NOTIFY_UNIT" 2>/dev/null
-    systemctl disable "$UNIT" "$FW_UNIT" "${SYNC_UNIT}.timer" "$NOTIFY_UNIT" 2>/dev/null
+    systemctl stop "$UNIT" "$FW_UNIT" "${SYNC_UNIT}.timer" "$SYNC_UNIT" "$NOTIFY_UNIT" \
+        "${ALLOW_UNIT}.timer" "$ALLOW_UNIT" 2>/dev/null
+    systemctl disable "$UNIT" "$FW_UNIT" "${SYNC_UNIT}.timer" "$NOTIFY_UNIT" "${ALLOW_UNIT}.timer" 2>/dev/null
     rm -f "$SYSTEMD_DIR/${UNIT}.service" "$SYSTEMD_DIR/${FW_UNIT}.service" \
           "$SYSTEMD_DIR/${SYNC_UNIT}.service" "$SYSTEMD_DIR/${SYNC_UNIT}.timer" \
-          "$SYSTEMD_DIR/${NOTIFY_UNIT}.service"
+          "$SYSTEMD_DIR/${NOTIFY_UNIT}.service" \
+          "$SYSTEMD_DIR/${ALLOW_UNIT}.service" "$SYSTEMD_DIR/${ALLOW_UNIT}.timer"
     systemctl daemon-reload
     rm -f "$CLI_LINK"
     rm -rf "$INSTALL_DIR"
@@ -641,14 +649,15 @@ do_uninstall() {
 # какой версией они были созданы.
 _remove_firewall_rules() {
     command -v iptables >/dev/null 2>&1 || return 0
-    local chain rule
-    for chain in INPUT DOCKER-USER KUBE-EXTERNAL-SERVICES KUBE-NODEPORTS SKIPA-BLOCK; do
+    local chain num
+    for chain in INPUT DOCKER-USER KUBE-EXTERNAL-SERVICES KUBE-NODEPORTS; do
         iptables -w 5 -L "$chain" -n >/dev/null 2>&1 || continue
-        [ "$chain" = "SKIPA-BLOCK" ] && continue
-        while IFS= read -r rule; do
-            # shellcheck disable=SC2086
-            eval "iptables -w 5 ${rule/#-A /-D }" 2>/dev/null
-        done < <(iptables -w 5 -S "$chain" 2>/dev/null | grep -E 'SKIPA-BLOCK|skipa-(scanners|manual|allow|dyn|db)')
+        # Удаляем по номерам строк, начиная с последней: так номера оставшихся правил не
+        # сдвигаются, и не нужно собирать команду из текста `iptables -S` через eval.
+        while IFS= read -r num; do
+            iptables -w 5 -D "$chain" "$num" 2>/dev/null
+        done < <(iptables -w 5 -L "$chain" -n --line-numbers 2>/dev/null \
+                    | grep -E 'SKIPA-BLOCK|skipa-(scanners|manual|allow|dyn|db)' | awk '{print $1}' | sort -rn)
     done
     if iptables -w 5 -L SKIPA-BLOCK -n >/dev/null 2>&1; then
         iptables -w 5 -F SKIPA-BLOCK 2>/dev/null
@@ -1070,8 +1079,8 @@ _migrate_service_to_bot() {
         || { err "Не удалось поставить базовые зависимости в venv."; return 1; }
     install_telegram_deps || return 1
 
-    systemctl stop "$NOTIFY_UNIT" 2>/dev/null
-    systemctl disable "$NOTIFY_UNIT" 2>/dev/null
+    systemctl stop "$NOTIFY_UNIT" "${ALLOW_UNIT}.timer" 2>/dev/null
+    systemctl disable "$NOTIFY_UNIT" "${ALLOW_UNIT}.timer" 2>/dev/null
 
     [ -f "$INSTALL_DIR/skipa-watchdog.service" ] || { err "skipa-watchdog.service не найден."; return 1; }
     cp "$INSTALL_DIR/skipa-watchdog.service" "$SYSTEMD_DIR/${UNIT}.service"

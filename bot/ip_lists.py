@@ -47,9 +47,25 @@ LABEL_PRIMARY = "skipa"
 # Предохранители от "отравленного" или битого списка (источники внешние, а
 # блокировка автоматическая): слишком широкая сеть вроде 0.0.0.0/0 заблокировала
 # бы всех, включая администратора. Такие записи отбрасываются при разборе.
-MIN_PREFIX_V4 = 16
+# Реальные списки сканеров состоят из /24 и одиночных адресов, поэтому по умолчанию
+# сети шире /20 (4096 адресов) отбрасываются; sources.min_prefix позволяет ослабить
+# предел (например, до 16 для Spamhaus DROP). Дополнительно каждый источник целиком
+# не может покрывать больше MAX_SOURCE_ADDRESSES адресов (~0,1% IPv4): иначе
+# "раздутый" враждебный список заблокировал бы пол-интернета, а охват, в отличие
+# от числа строк, защита от усыхания не ловит.
+DEFAULT_MIN_PREFIX_V4 = 20
 MIN_PREFIX_V6 = 32
 MAX_RANGE_SIZE = 1 << 20
+MAX_SOURCE_ADDRESSES = 1 << 22
+
+_min_prefix_v4 = DEFAULT_MIN_PREFIX_V4
+
+
+def configure_limits(min_prefix_v4: int | None = None) -> None:
+    """Применяет sources.min_prefix из config.yaml (вызывается из watchdog.py)."""
+    global _min_prefix_v4
+    if min_prefix_v4 is not None:
+        _min_prefix_v4 = min(32, max(8, int(min_prefix_v4)))
 # Если источник внезапно "похудел" больше чем вдвое - считаем это сбоем
 # источника и оставляем предыдущую версию этого списка.
 SHRINK_GUARD_RATIO = 0.5
@@ -72,7 +88,7 @@ def normalize_ip(ip_str: str):
 
 
 def network_is_acceptable(net) -> bool:
-    min_prefix = MIN_PREFIX_V4 if net.version == 4 else MIN_PREFIX_V6
+    min_prefix = _min_prefix_v4 if net.version == 4 else MIN_PREFIX_V6
     return net.prefixlen >= min_prefix
 
 
@@ -323,6 +339,13 @@ async def _fetch_extra_source(extra: dict) -> tuple[str, list[NetEntry]]:
     return label, []
 
 
+def _coverage(nets: list, ranges: list) -> int:
+    """Сколько IPv4-адресов покрывает набор записей (перекрытия не вычитаются -
+    это грубая верхняя оценка для предохранителя)."""
+    total = sum(e.network.num_addresses for e in nets if e.network.version == 4)
+    return total + sum(r.end - r.start + 1 for r in ranges)
+
+
 def _previous_entries(previous: "ThreatDB | None", label: str):
     if previous is None:
         return [], []
@@ -389,8 +412,14 @@ async def fetch_threat_db(
     per_source: dict[str, int] = {}
     degraded = False
 
-    def _guard(label: str, new_count: int) -> bool:
-        """True, если новое число записей выглядит нормально."""
+    def _guard(label: str, new_count: int, covered: int = 0) -> bool:
+        """True, если новое число записей и охват адресов выглядят нормально."""
+        if covered > MAX_SOURCE_ADDRESSES:
+            log.warning(
+                "Источник %s покрывает %d адресов (предел %d) - похоже на подмену или ошибку списка, "
+                "оставляю прошлую версию", label, covered, MAX_SOURCE_ADDRESSES,
+            )
+            return False
         old = (previous.per_source_counts.get(label, 0) if previous else 0)
         if old and new_count < old * SHRINK_GUARD_RATIO:
             log.warning(
@@ -403,7 +432,7 @@ async def fetch_threat_db(
     # ---- primary ----
     if use_list1 and primary_url:
         new_nets = _parse_cidr_list(primary_text) if primary_text else []
-        if new_nets and _guard(LABEL_PRIMARY, len(new_nets)):
+        if new_nets and _guard(LABEL_PRIMARY, len(new_nets), _coverage(new_nets, [])):
             networks.extend(new_nets)
             per_source[LABEL_PRIMARY] = len(new_nets)
         else:
@@ -420,7 +449,7 @@ async def fetch_threat_db(
     if use_list2 and blacklist_url:
         bl_nets, bl_ranges = _parse_mixed_list(blacklist_text, blacklist_label) if blacklist_text else ([], [])
         count = len(bl_nets) + len(bl_ranges)
-        if count and _guard(blacklist_label, count):
+        if count and _guard(blacklist_label, count, _coverage(bl_nets, bl_ranges)):
             networks.extend(bl_nets)
             ranges.extend(bl_ranges)
             per_source[blacklist_label] = count
@@ -440,7 +469,7 @@ async def fetch_threat_db(
 
     # ---- дополнительные источники (sources.extra) ----
     for (label, entries), extra in zip(extra_results, enabled_extras):
-        if entries and _guard(label, len(entries)):
+        if entries and _guard(label, len(entries), _coverage(entries, [])):
             networks.extend(entries)
             per_source[label] = len(entries)
         else:

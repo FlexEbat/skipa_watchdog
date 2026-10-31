@@ -1,7 +1,6 @@
 import asyncio
 import ipaddress
 import logging
-import os
 import signal
 import tempfile
 import unittest
@@ -48,12 +47,17 @@ class TelegramTests(unittest.TestCase):
         return make_config(bot_token="1:x", chat_id=-100, **kw)
 
     def test_admin_gate_fails_closed(self):
-        """команды закрыты по умолчанию: пустой admin_ids пускает только чат chat_id"""
+        """команды закрыты по умолчанию: пустой admin_ids пускает только личку chat_id"""
+        from tests.helpers import make_config
         from bot.telegram_layer import _is_admin
-        c = self.cfg(admin_ids=[])
+        c = self.cfg(admin_ids=[])                      # chat_id=-100 - это группа
         self.assertFalse(_is_admin(c, 555, 999))        # посторонний, чужой чат
-        self.assertTrue(_is_admin(c, 555, -100))        # настроенный чат
+        self.assertFalse(_is_admin(c, 555, -100))       # в группе без admin_ids командовать нельзя
         self.assertFalse(_is_admin(c, None, -100))
+        private = make_config(bot_token="1:x", chat_id=555, admin_ids=[])
+        self.assertTrue(_is_admin(private, 555, 555))   # личная переписка настроенного пользователя
+        self.assertFalse(_is_admin(private, 556, 555))  # чужой пользователь в том же чате
+        self.assertFalse(_is_admin(private, 555, 777))  # тот же пользователь, но другой чат
         c2 = self.cfg(admin_ids=[7])
         self.assertTrue(_is_admin(c2, 7, 1))
         self.assertFalse(_is_admin(c2, 8, -100))        # при заданных admin_ids чат не даёт прав

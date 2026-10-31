@@ -16,7 +16,10 @@
 #   load_service_config <файл>                выставить переменные для скриптов:
 #       ACTION_MODE PRIMARY_LIST_URL BLACKLIST_URL ACTIVE_LIST UPDATE_INTERVAL_DAYS
 #       LOG_DIR KERNEL_LOG_PREFIX ALERT_COOLDOWN_MINUTES IGNORE_IPS (через пробел)
-#       LOG_LIMIT LOG_BURST SKIP_DOCKER SKIP_K8S
+#       LOG_LIMIT LOG_BURST SKIP_DOCKER SKIP_K8S MIN_PREFIX ALLOW_INSECURE_HTTP
+#       AUTO_ALLOWLIST SSH_PORTS (через пробел)
+#   ssh_peers <порт>...                       IPv4-адреса, с которых сейчас открыты
+#                                             SSH-сессии на этих портах (по одному в строке)
 
 yaml_get() {
     local file="$1" path="$2" sec key
@@ -116,9 +119,31 @@ load_service_config() {
     IGNORE_IPS="$(yaml_list "$file" monitoring.ignore_ips | tr '\n' ' ' | sed 's/ *$//')"
     LOG_LIMIT="$(yaml_get "$file" firewall.log_limit)";                 LOG_LIMIT="${LOG_LIMIT:-30/second}"
     LOG_BURST="$(yaml_get "$file" firewall.log_burst)";                 LOG_BURST="${LOG_BURST:-40}"
+    MIN_PREFIX="$(yaml_get "$file" sources.min_prefix)";                 MIN_PREFIX="${MIN_PREFIX:-20}"
+    [[ "$MIN_PREFIX" =~ ^[0-9]+$ ]] || MIN_PREFIX=20
+    [ "$MIN_PREFIX" -lt 8 ] && MIN_PREFIX=8
+    [ "$MIN_PREFIX" -gt 32 ] && MIN_PREFIX=32
+    ALLOW_INSECURE_HTTP="$(yaml_get "$file" sources.allow_insecure_http)"; ALLOW_INSECURE_HTTP="${ALLOW_INSECURE_HTTP:-false}"
+    AUTO_ALLOWLIST="$(yaml_get "$file" monitoring.auto_allowlist)";      AUTO_ALLOWLIST="${AUTO_ALLOWLIST:-true}"
+    SSH_PORTS="$(yaml_list "$file" monitoring.ssh_ports | grep -E '^[0-9]+$' | tr '\n' ' ' | sed 's/ *$//')"
+    SSH_PORTS="${SSH_PORTS:-22}"
     SKIP_DOCKER=0; SKIP_K8S=0
     v="$(yaml_get "$file" environment.docker_scan)"; [ "$v" = "false" ] && SKIP_DOCKER=1
     v="$(yaml_get "$file" environment.k8s_scan)";    [ "$v" = "false" ] && SKIP_K8S=1
     export ACTION_MODE PRIMARY_LIST_URL BLACKLIST_URL ACTIVE_LIST UPDATE_INTERVAL_DAYS LOG_DIR \
-        KERNEL_LOG_PREFIX ALERT_COOLDOWN_MINUTES IGNORE_IPS LOG_LIMIT LOG_BURST SKIP_DOCKER SKIP_K8S
+        KERNEL_LOG_PREFIX ALERT_COOLDOWN_MINUTES IGNORE_IPS LOG_LIMIT LOG_BURST SKIP_DOCKER SKIP_K8S \
+        MIN_PREFIX ALLOW_INSECURE_HTTP AUTO_ALLOWLIST SSH_PORTS
+}
+
+# IPv4-адреса администраторов с живыми SSH-сессиями: их нельзя блокировать, даже если
+# адрес попал во внешний список (так же работает allowlist в Python-варианте).
+ssh_peers() {
+    local p
+    command -v ss >/dev/null 2>&1 || return 0
+    for p in "$@"; do
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
+        ss -Htn state established "( sport = :$p )" 2>/dev/null
+    done | awk '
+        { peer = $4; sub(/:[0-9]+$/, "", peer); gsub(/[\[\]]/, "", peer); sub(/^::ffff:/, "", peer)
+          if (peer ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print peer }' | sort -u
 }

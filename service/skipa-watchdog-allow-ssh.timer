@@ -1,0 +1,10 @@
+[Unit]
+Description=Every minute: keep current SSH sessions in the skipa-allow ipset (service mode)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

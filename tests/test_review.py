@@ -253,7 +253,8 @@ class _BashStubs(unittest.TestCase):
     def _env(self) -> dict:
         import os
         env = dict(os.environ)
-        env.update(PATH=f"{self.bin}:{env['PATH']}", OUT=str(self.out), SKIPA_STATE_DIR=str(self.d / "state"))
+        env.update(PATH=f"{self.bin}:{env['PATH']}", OUT=str(self.out), SKIPA_STATE_DIR=str(self.d / "state"),
+                   SKIPA_NO_UPDATE_CHECK="1")
         return env
 
     def _sync(self, listing: str, ss: str = "") -> tuple[str, str]:  # noqa: D401

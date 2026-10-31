@@ -42,11 +42,33 @@ works on the host and for services published through Docker and Kubernetes.
 | Python | not needed | required |
 | Blocking | in the kernel, list refreshed by a systemd timer | in the kernel, the process refreshes and repairs rules itself |
 | Notifications | entries in `detections.log` | `detections.log` and Telegram messages |
-| "Ban" button, `/stats`, dashboard, health-check | no | yes |
+| "Ban" button, charts in `/stats`, dashboard, health-check | no | yes |
 | Extra sources (`sources.extra`) | no | yes |
 
 You can start with the first variant and add Telegram later from the menu. Switching back
 to plain bash is not possible: uninstall and install again.
+
+### What is available where
+
+The panel (`sudo skipa-watchdog`), the bot and the service scripts do the same things; only the
+way to invoke them differs. Edits to `config.yaml` from any of them go through the same code
+(`service/confctl.sh`).
+
+| Feature | Panel | Bot | Service without Python |
+| --- | --- | --- | --- |
+| Status, health check | item 1, `install.sh status` | `/status` | item 1, `install.sh status` |
+| Update the IP database | item 9 | `/update` | item 9, `sync-lists` timer |
+| Block / unblock | item 6 (for N hours or permanent) | `/block <ip> [hours]`, `/unblock` | item 6, `blockctl.sh block\|unblock` (permanent) |
+| List of blocks | item 6 | `/blocklist` | item 6, `blockctl.sh list` |
+| Allowlist | item 7 | `/allowlist`, `/allow`, `/unallow` | item 7, `blockctl.sh allow\|unallow\|allowlist` |
+| Action mode, list source, method | item 3 | `/settings` | item 3 |
+| Detection statistics | item 8, `install.sh stats` | `/stats` (with a chart), `/export` | item 8, `service/stats.sh` |
+| Logs | item 10 | `/logs [lines]` | item 10 |
+| Docker/Kubernetes | item 5 | `/env` | item 5 |
+| Project update check | on every menu launch, item 12 | on service start: an "Install" button, `/version` | a log line; install from the panel |
+
+Python-only by nature: the `/testalert` test notification, the `/pending` queue, the "Ban"
+button in alerts, the dashboard, extra sources, time-limited auto-blocking.
 
 ## Quick start
 
@@ -67,8 +89,9 @@ sudo skipa-watchdog
 
 Every menu item has an exit (`0`), and every action that changes something asks for
 confirmation. Menu items: health check, service management, detection settings, Telegram,
-Docker/Kubernetes, blocked IPs, database update, logs, config editing, project update,
-uninstall.
+Docker/Kubernetes, blocked IPs, allowlist, detection statistics, database update, logs, config
+editing, project update, uninstall. On every launch the menu also checks whether a new project
+version is out and offers to install it.
 
 Without the menu:
 
@@ -157,6 +180,7 @@ marked in the last column.
 | `sources.update_interval_days` | `7` | how often to refresh the database | yes |
 | `sources.min_prefix` | `20` | widest network accepted from lists (prefix length); use `16` for Spamhaus DROP | yes |
 | `sources.allow_insecure_http` | `false` | allow downloading lists over plain http (https only by default) | yes |
+| `updates.check_on_start` | `true` | check for project updates when the panel and the service start | yes |
 | `sources.extra` | empty | additional sources | no |
 | `monitoring.method` | `both` | `poll`, `kernel_log`, `both` | no |
 | `monitoring.ignore_ips` | empty | addresses that are never blocked | yes |
@@ -182,7 +206,7 @@ addresses in total is rejected, so an inflated third-party list cannot block hal
 Lists are downloaded over https only; a redirect to http is refused.
 
 You can change settings from the menu (item 3: list source, action mode, detection method;
-item 9: edit the file) or by hand; after editing, apply the changes through the menu or with
+item 11: edit the file) or by hand; after editing, apply the changes through the menu or with
 `sudo systemctl restart skipa-watchdog`.
 
 ## Self-lockout protection
@@ -231,6 +255,10 @@ retries, and unsent alerts wait in a queue (up to 500 items, up to a week).
 | `/stats [days]`, `/export [days]` | statistics with a chart, and event export |
 | `/testalert [ip]` | test notification |
 | `/pending`, `/env` | queue of unsent alerts, Docker/Kubernetes environment |
+| `/allowlist`, `/allow <ip or network>`, `/unallow <ip or network>` | allowlist (`monitoring.ignore_ips`): applied immediately, written to `config.yaml` |
+| `/settings` | action mode, list source, detection method (with confirmation and a service restart) |
+| `/logs [lines]` | last lines of the log (the bot token is masked) |
+| `/version` | version and update check with an "Install" button |
 
 Example notification (values from documentation ranges, RFC 5737 and RFC 5398; the bot's
 message text is in Russian):
@@ -295,11 +323,11 @@ conntrack and write access to the install directory and logs. Only safe restrict
 sandbox (`ProtectSystem=strict`, `ProtectKernelModules`) is not used: iptables loads kernel modules
 and it broke startup on some systems.
 
-**Updating.** Menu item 10 or `sudo bash install.sh install`. If `git pull` fails (the
+**Updating.** On every launch the panel (`sudo skipa-watchdog`) checks whether a new version is out and offers to install it; declining is not permanent: a reminder stays in the menu header. When the service starts, the bot sends a message with an "Install" button to the chat (and `/version` on demand); without Telegram and in service-only mode a new version is noted in the log. `updates.check_on_start: false` turns the check off (`SKIPA_NO_UPDATE_CHECK=1` for a single run); `sudo bash install.sh check-update` checks without prompting (exit code 10 means an update is available). Manually: menu item 12 or `sudo bash install.sh install`. If `git pull` fails (the
 repository history changed), the installer offers to switch to the current version;
 `config.yaml` and `data/` are not touched.
 
-**Uninstalling.** Menu item 11. The installer separately asks whether to remove the
+**Uninstalling.** Menu item 13. The installer separately asks whether to remove the
 `iptables` rules and `ipset` sets.
 
 ## Security
@@ -308,7 +336,7 @@ repository history changed), the installer offers to switch to the current versi
 - The bot token and API keys are masked in logs (`skipa-watchdog.log`, `journalctl`).
 - Bot commands are accepted only from administrators (`admin_ids`, or the private chat with `chat_id`).
 - Self-lockout protection is described above. If you still got cut off, log in through the
-  host console and run `sudo skipa-watchdog`: item 6 unblocks a specific IP, item 11 removes
+  host console and run `sudo skipa-watchdog`: item 6 unblocks a specific IP, item 13 removes
   the project along with its rules.
 - Data from external APIs (organization, ASN) is escaped in Telegram and on the dashboard page, and
   newlines and control characters are stripped from it before it reaches text logs (otherwise a network
@@ -335,7 +363,7 @@ the "service only" variant the LOG rule fires on all protocols (you will see
 `proto=UDP port=3478` in `detections.log`), and the packet is dropped after being logged.
 
 **The menu says INPUT is not connected although the rules are in place.** Update the project
-(item 10). The check used to look only for rules in the old form; now it looks for any
+(item 12). The check used to look only for rules in the old form; now it looks for any
 project rules in the chain.
 
 **The service does not start.** `journalctl -u skipa-watchdog -n 50`. Common causes: no

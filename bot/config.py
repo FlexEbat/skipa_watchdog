@@ -118,6 +118,8 @@ class Config:
 
     # ---- health-check самих мониторов ----
     healthcheck_enabled: bool = True
+    # проверять обновления проекта при каждом запуске (бот присылает кнопку «Установить»)
+    update_check: bool = True
     healthcheck_stale_after_minutes: int = 15
     healthcheck_check_interval_minutes: int = 5
 
@@ -194,6 +196,7 @@ class Config:
         fw = sect("firewall")
         banning = sect("banning")
         healthcheck = sect("healthcheck")
+        updates = sect("updates")
         dashboard = sect("dashboard")
         digest = sect("digest")
 
@@ -275,6 +278,7 @@ class Config:
             manual_ban_duration_minutes=max(0, int(banning.get("manual_ban_duration_minutes", 1440))),
             fail2ban_jail=str(banning.get("fail2ban_jail", "") or ""),
             healthcheck_enabled=bool(healthcheck.get("enabled", True)),
+            update_check=bool(updates.get("check_on_start", True)),
             healthcheck_stale_after_minutes=max(1, int(healthcheck.get("stale_after_minutes", 15))),
             healthcheck_check_interval_minutes=max(1, int(healthcheck.get("check_interval_minutes", 5))),
             dashboard_enabled=bool(dashboard.get("enabled", False)),

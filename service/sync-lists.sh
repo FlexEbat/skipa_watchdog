@@ -212,4 +212,15 @@ if ! replace_set "$SETNAME" "$TMPSET" "$MAXELEM" "$RAW_FILE"; then
 fi
 
 date +%s > "$STATE_DIR/last-sync"
+
+# Сервис-режим работает без постоянного процесса и без чата, поэтому о новой версии
+# сообщаем в журнал; установить её предложит панель при ближайшем запуске.
+# shellcheck source=lib-update.sh
+if [ -f "$HERE/lib-update.sh" ]; then
+    source "$HERE/lib-update.sh"
+    update_check "$HERE/.."
+    if [ "$UPD_STATE" = "available" ]; then
+        log "Доступна новая версия: ${UPD_LOCAL:-?} -> ${UPD_REMOTE:-?}. Установить: sudo skipa-watchdog (предложит обновиться при запуске)"
+    fi
+fi
 log "Обновлено: $COUNT записей в ipset $SETNAME (active_list=${ACTIVE_LIST:-merged})"

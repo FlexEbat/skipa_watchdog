@@ -74,6 +74,9 @@ print_header() {
     echo " Skipa Watchdog"
     if [ -f "$INSTALL_DIR/VERSION" ]; then
         echo " Версия: $(cat "$INSTALL_DIR/VERSION")"
+        # напоминание, если обновление было доступно, а его отложили
+        [ "${UPD_STATE:-}" = "available" ] \
+            && echo -e " ${C_YELLOW}Доступна версия ${UPD_REMOTE:-новее}: пункт 12 меню${C_RESET}"
     else
         echo " Версия установщика: $INSTALLER_VERSION (проект ещё не установлен)"
     fi
@@ -189,7 +192,7 @@ _apply_bot_firewall_rules() {
 _apply_service_firewall_rules() {
     local script="$INSTALL_DIR/service/setup-ipset-rules.sh"
     if [ ! -f "$script" ]; then
-        err "service/setup-ipset-rules.sh не найден - переустановите (пункт 10)."
+        err "service/setup-ipset-rules.sh не найден - переустановите (пункт 12)."
         return 1
     fi
     local mode
@@ -217,13 +220,22 @@ check_list_updates() {
     # shellcheck disable=SC1090
     [ -f "$LIST_HASH_STATE" ] && source "$LIST_HASH_STATE"
 
+    # Адреса берём из config.yaml (как и бот с сервисом), а не зашиваем в скрипт: иначе
+    # при своём списке проверялся бы чужой. Пустой blacklist_url - источник отключён.
     local primary_url="https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
     local blacklist_url="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/37cde2b27a560c647d0e8eb9d274e3409082d3e7/blacklist.txt"
+    if [ -f "$SERVICE_CONF" ] && [ -f "$INSTALL_DIR/service/lib-config.sh" ]; then
+        _conf_lib
+        local v
+        v="$(yaml_get "$SERVICE_CONF" sources.primary_list_url)";  [ -n "$v" ] && primary_url="$v"
+        # blacklist_url: пустое значение в конфиге значит «источник отключён»
+        if grep -qE '^  blacklist_url:' "$SERVICE_CONF"; then blacklist_url="$(yaml_get "$SERVICE_CONF" sources.blacklist_url)"; fi
+    fi
 
     info "Проверяю обновления списков IP..."
-    local new_primary new_blacklist
+    local new_primary new_blacklist=""
     new_primary="$(url_hash "$primary_url")"
-    new_blacklist="$(url_hash "$blacklist_url")"
+    [ -n "$blacklist_url" ] && new_blacklist="$(url_hash "$blacklist_url")"
 
     local any_new=0
     if [ -n "${HASH_PRIMARY:-}" ] && [ -n "$new_primary" ] && [ "$HASH_PRIMARY" != "$new_primary" ]; then
@@ -757,7 +769,7 @@ print(int(json.load(open('$INSTALL_DIR/data/ip_cache.json')).get('last_update_ts
                 ok "Список обновлялся $age_days дн. назад (ожидается раз в $interval дн.)."
             fi
         else
-            warn "Список ещё ни разу не обновлялся успешно - запустите пункт 7."
+            warn "Список ещё ни разу не обновлялся успешно - запустите пункт 9."
         fi
 
         action_mode="$(_service_conf_get ACTION_MODE)"
@@ -1170,18 +1182,14 @@ blocklist_menu() {
     if [ ! -f "$INSTALL_MODE_FILE" ]; then
         err "Сначала установите Skipa Watchdog."; pause; return
     fi
-    local mode py c ip
+    local mode py c ip hours
     mode="$(_current_mode)"
     py="$(_python_bin)"
     while true; do
         echo
         echo "Заблокированные IP:"
         if [ "$mode" = "bot" ]; then
-            (cd "$INSTALL_DIR" && "$py" -c "
-from bot import blocker
-ips = blocker.list_blocked_ips()
-print('  (никто не заблокирован вручную или автоматически)' if not ips else '\n'.join(f'  {ip}' for ip in ips))
-")
+            (cd "$INSTALL_DIR" && SKIPA_CONFIG="$SERVICE_CONF" "$py" -m bot.cli list)
         else
             bash "$INSTALL_DIR/service/blockctl.sh" list | sed 's/^/  /'
         fi
@@ -1194,14 +1202,15 @@ print('  (никто не заблокирован вручную или авт�
             1)
                 read -rp "IP или сеть для блокировки (0 - отмена): " ip
                 { [ -z "$ip" ] || [ "$ip" = "0" ]; } && continue
-                confirm "Заблокировать $ip бессрочно?" || { info "Отменено."; continue; }
+                hours=""
                 if [ "$mode" = "bot" ]; then
-                    (cd "$INSTALL_DIR" && "$py" -c "
-import sys
-from bot import blocker
-# вручную - бессрочно (второй аргумент 0), IP передаётся через argv, а не подстановкой в код
-print('OK' if blocker.block_ip(sys.argv[1], 0) else 'FAIL')
-" "$ip")
+                    read -rp "На сколько часов (Enter - бессрочно): " hours
+                    [[ -z "$hours" || "$hours" =~ ^[0-9]+([.][0-9]+)?$ ]] || { warn "Нужно число часов."; continue; }
+                fi
+                confirm "Заблокировать $ip ${hours:+на $hours ч}${hours:-бессрочно}?" || { info "Отменено."; continue; }
+                if [ "$mode" = "bot" ]; then
+                    # та же логика, что у команды /block в боте (bot/cli.py)
+                    (cd "$INSTALL_DIR" && SKIPA_CONFIG="$SERVICE_CONF" "$py" -m bot.cli block "$ip" $hours)
                 else
                     bash "$INSTALL_DIR/service/blockctl.sh" block "$ip"
                 fi
@@ -1211,11 +1220,7 @@ print('OK' if blocker.block_ip(sys.argv[1], 0) else 'FAIL')
                 { [ -z "$ip" ] || [ "$ip" = "0" ]; } && continue
                 confirm "Разблокировать $ip?" || { info "Отменено."; continue; }
                 if [ "$mode" = "bot" ]; then
-                    (cd "$INSTALL_DIR" && "$py" -c "
-import sys
-from bot import blocker
-print('OK' if blocker.unblock_ip(sys.argv[1]) else 'FAIL')
-" "$ip")
+                    (cd "$INSTALL_DIR" && SKIPA_CONFIG="$SERVICE_CONF" "$py" -m bot.cli unblock "$ip")
                 else
                     bash "$INSTALL_DIR/service/blockctl.sh" unblock "$ip"
                 fi
@@ -1224,6 +1229,74 @@ print('OK' if blocker.unblock_ip(sys.argv[1]) else 'FAIL')
             *) warn "Неизвестный пункт" ;;
         esac
     done
+}
+
+# Белый список (monitoring.ignore_ips): адреса, которые не блокируются никогда. Те же
+# операции есть в боте (/allow, /unallow, /allowlist) и в сервисных скриптах
+# (blockctl.sh allow|unallow|allowlist); запись в config.yaml везде делает confctl.sh.
+allowlist_menu() {
+    if [ ! -f "$INSTALL_MODE_FILE" ]; then
+        err "Сначала установите Skipa Watchdog."; pause; return
+    fi
+    local mode c ip rc
+    mode="$(_current_mode)"
+    while true; do
+        echo
+        echo "Белый список (monitoring.ignore_ips):"
+        bash "$INSTALL_DIR/service/confctl.sh" "$SERVICE_CONF" ignore-list | sed 's/^/  /'
+        echo "  (текущие SSH-сессии защищаются автоматически: monitoring.auto_allowlist)"
+        echo
+        echo "  1) Добавить IP или сеть"
+        echo "  2) Убрать IP или сеть"
+        echo "  0) Назад"
+        read -rp "> " c || return
+        case "$c" in
+            1)
+                read -rp "IP или сеть (0 - отмена): " ip
+                { [ -z "$ip" ] || [ "$ip" = "0" ]; } && continue
+                if [ "$mode" = "service" ]; then
+                    bash "$INSTALL_DIR/service/blockctl.sh" allow "$ip"            # конфиг + ipset сразу
+                else
+                    bash "$INSTALL_DIR/service/confctl.sh" "$SERVICE_CONF" ignore-add "$ip"; rc=$?
+                    case "$rc" in
+                        0) ok "Добавлено. Служба перечитает конфиг при перезапуске."; restart_if_running ;;
+                        3) info "Уже в белом списке." ;;
+                        *) warn "Не удалось добавить (проверьте формат)." ;;
+                    esac
+                fi
+                ;;
+            2)
+                read -rp "Что убрать (0 - отмена): " ip
+                { [ -z "$ip" ] || [ "$ip" = "0" ]; } && continue
+                if [ "$mode" = "service" ]; then
+                    bash "$INSTALL_DIR/service/blockctl.sh" unallow "$ip"
+                else
+                    bash "$INSTALL_DIR/service/confctl.sh" "$SERVICE_CONF" ignore-del "$ip"; rc=$?
+                    case "$rc" in
+                        0) ok "Убрано. Служба перечитает конфиг при перезапуске."; restart_if_running ;;
+                        3) warn "Такого адреса нет в списке." ;;
+                        *) warn "Не удалось убрать." ;;
+                    esac
+                fi
+                ;;
+            0) return ;;
+            *) warn "Неизвестный пункт" ;;
+        esac
+    done
+}
+
+# Статистика детектов (detections.log есть в обоих вариантах, поэтому один и тот же вывод)
+view_stats() {
+    if [ ! -f "$INSTALL_MODE_FILE" ]; then
+        err "Сначала установите Skipa Watchdog."; pause; return
+    fi
+    local days
+    read -rp "За сколько дней (Enter - 7): " days
+    days="${days:-7}"
+    [[ "$days" =~ ^[0-9]+$ ]] || { warn "Нужно целое число дней."; pause; return; }
+    echo
+    bash "$INSTALL_DIR/service/stats.sh" "$SERVICE_CONF" "$days"
+    pause
 }
 
 # ---------------------------------------------------------------------------
@@ -1323,6 +1396,39 @@ update_project() {
     pause
 }
 
+# При КАЖДОМ запуске меню: проверяем, не вышла ли новая версия проекта, и предлагаем
+# установить. Отказ не навсегда: напоминание остаётся в шапке меню и повторится при
+# следующем запуске. После успешного обновления панель перезапускается из новой версии.
+# lib-update.sh лежит в самом репозитории; в очень старой установке его ещё нет -
+# тогда проверка появится сразу после первого обновления.
+_load_update_lib() {
+    [ -f "$INSTALL_DIR/service/lib-update.sh" ] || return 1
+    # shellcheck source=service/lib-update.sh
+    source "$INSTALL_DIR/service/lib-update.sh"
+}
+
+offer_project_update() {
+    _load_update_lib || return 0
+    update_check "$INSTALL_DIR"
+    [ "$UPD_STATE" = "available" ] || return 0
+    echo
+    warn "Доступна новая версия Skipa Watchdog: ${UPD_LOCAL:-?} -> ${UPD_REMOTE:-?} (новых коммитов: $UPD_BEHIND)"
+    [ -n "$UPD_LOG" ] && printf '%s\n' "$UPD_LOG"
+    if confirm "Установить обновление сейчас?"; then
+        if do_install; then
+            ok "Обновление установлено."
+            if [ "${SKIPA_SOURCE_ONLY:-0}" != "1" ]; then
+                SKIPA_NO_UPDATE_CHECK=1 exec bash "$INSTALL_DIR/install.sh"   # меню уже из новой версии
+            fi
+        else
+            warn "Обновление не завершилось, продолжаю с текущей версией."
+            UPD_STATE=available
+        fi
+    else
+        info "Хорошо, напомню при следующем запуске (или пункт 12 меню)."
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Меню
 # ---------------------------------------------------------------------------
@@ -1365,11 +1471,13 @@ main_menu() {
         echo " 4) Telegram (подключить/отключить)"
         echo " 5) Docker/Kubernetes (логирование + блокировка)"
         echo " 6) Заблокированные IP"
-        echo " 7) Принудительно обновить базу IP"
-        echo " 8) Просмотр логов"
-        echo " 9) Редактировать конфиг вручную"
-        echo "10) Обновить Skipa Watchdog"
-        echo "11) Удалить полностью"
+        echo " 7) Белый список (IP, которые не блокируются)"
+        echo " 8) Статистика детектов"
+        echo " 9) Принудительно обновить базу IP"
+        echo "10) Просмотр логов"
+        echo "11) Редактировать конфиг вручную"
+        echo "12) Обновить Skipa Watchdog"
+        echo "13) Удалить полностью"
         echo " 0) Выход"
         read -rp "> " choice || { echo; info "Ввод завершён, выхожу."; exit 0; }
         case "$choice" in
@@ -1379,11 +1487,13 @@ main_menu() {
             4) telegram_menu ;;
             5) firewall_menu ;;
             6) blocklist_menu ;;
-            7) force_update_db ;;
-            8) view_logs ;;
-            9) edit_config ;;
-            10) update_project ;;
-            11) do_uninstall; pause ;;
+            7) allowlist_menu ;;
+            8) view_stats ;;
+            9) force_update_db ;;
+            10) view_logs ;;
+            11) edit_config ;;
+            12) update_project ;;
+            13) do_uninstall; pause ;;
             0) exit 0 ;;
             *) warn "Неизвестный пункт" ;;
         esac
@@ -1421,6 +1531,8 @@ usage() {
   sudo bash install.sh status    краткий статус (без меню)
   sudo bash install.sh fw-rules  поставить правила логирования/блокировки docker/k8s
   sudo bash install.sh check-lists  проверить обновления листов прямо сейчас
+  sudo bash install.sh check-update проверить, вышла ли новая версия проекта (код 10 - да)
+  sudo bash install.sh stats [дней] статистика детектов (как пункт 8 меню)
 EOF
 }
 
@@ -1433,6 +1545,17 @@ main() {
             status) print_header; health_check ;;
             fw-rules) apply_firewall_rules ;;
             check-lists) check_list_updates ;;
+            stats) bash "$INSTALL_DIR/service/stats.sh" "$SERVICE_CONF" "${2:-7}" ;;
+            check-update)
+                # неинтерактивно: код возврата 0 - актуальная версия, 10 - есть обновление, 2 - не удалось проверить
+                _load_update_lib || { echo "Проверка обновлений недоступна: нет $INSTALL_DIR/service/lib-update.sh"; exit 2; }
+                update_check "$INSTALL_DIR"
+                case "$UPD_STATE" in
+                    available) echo "Доступно обновление: ${UPD_LOCAL:-?} -> ${UPD_REMOTE:-?} (коммитов: $UPD_BEHIND)"
+                               [ -n "$UPD_LOG" ] && printf '%s\n' "$UPD_LOG"; exit 10 ;;
+                    none) echo "Установлена актуальная версия ${UPD_LOCAL:-?}"; exit 0 ;;
+                    *) echo "Не удалось проверить обновления (нет git-клона, сети или upstream)"; exit 2 ;;
+                esac ;;
             -h|--help) usage ;;
             *) usage; exit 1 ;;
         esac
@@ -1451,6 +1574,7 @@ main() {
     # Skipa Watchdog, это не повторяется. Донастроить вручную можно из
     # меню (пункт "Docker/Kubernetes") или командой `install.sh fw-rules`.
     _migrate_legacy_service_conf
+    offer_project_update
     check_list_updates
     main_menu
 }

@@ -40,7 +40,7 @@ import time
 from html import escape
 from pathlib import Path
 
-from bot import blocker, http_client, ip_lists
+from bot import blocker, confedit, http_client, ip_lists
 from bot.allowlist import build_allowlist
 from bot.config import Config
 from bot.dbupdate import apply_db_to_firewall, preload_effective, refresh_db
@@ -389,6 +389,48 @@ async def _send_text(config: Config, state: dict, text: str) -> None:
         queue_pending_alert(config.chat_id, text)
 
 
+async def _update_notice(config: Config, state: dict) -> None:
+    """Один раз при каждом запуске: сообщает итог прошлого обновления и проверяет, не
+    вышла ли новая версия. С Telegram - сообщение с кнопкой «Установить», без него -
+    строка в журнале (установить можно из панели). Задача после этого просто живёт:
+    завершение любой задачи из jobs остановило бы весь процесс."""
+    from bot import updater
+
+    try:
+        result = await asyncio.to_thread(updater.take_pending_result)
+        if result:
+            log.info("Итог обновления: %s", result)
+            await _send_text(config, state, result)
+        info = await updater.check_update()
+        if info:
+            log.warning("Доступна новая версия %s -> %s (новых коммитов: %d). Установить: "
+                        "sudo skipa-watchdog", info.local or "?", info.remote or "?", info.behind)
+            if config.telegram_enabled:
+                markup = {"inline_keyboard": [[
+                    {"text": "⬆️ Установить", "callback_data": "upd:install"},
+                    {"text": "Позже", "callback_data": "upd:later"},
+                ]]}
+                for _ in range(30):                      # дать Telegram-слою подняться
+                    if state.get("telegram_app") is not None:
+                        break
+                    await asyncio.sleep(2)
+                app = state.get("telegram_app")
+                text = updater.format_update_text(info)
+                try:
+                    if app is None:
+                        raise RuntimeError("Telegram ещё недоступен")
+                    from bot.telegram_layer import send_notification
+                    from telegram import InlineKeyboardMarkup
+
+                    await send_notification(app, config.chat_id, text, InlineKeyboardMarkup.de_json(markup, app.bot))
+                except Exception as e:  # noqa: BLE001
+                    log.info("Сообщение об обновлении ушло в очередь (%s)", e)
+                    queue_pending_alert(config.chat_id, text, markup)
+    except Exception:  # noqa: BLE001
+        log.exception("Не удалось проверить обновления")
+    await asyncio.Event().wait()
+
+
 async def _healthcheck_loop(config: Config, state: dict) -> None:
     """«Watchdog для watchdog'а»: проверяет, что циклы мониторинга не зависли
     молча (каждый обязан отмечаться через heartbeat()). Если монитор молчит
@@ -537,6 +579,7 @@ async def _init_firewall(config: Config, state: dict) -> None:
 
 async def async_main() -> None:
     config = Config.load(CONFIG_PATH)
+    confedit.CONFIG_FILE = Path(CONFIG_PATH).resolve()
     log_dir = _setup_logging(config)
     detections_log = log_dir / "detections.log"
 
@@ -594,6 +637,8 @@ async def async_main() -> None:
         from bot.webapp import serve_dashboard
 
         jobs.append(("dashboard", lambda: serve_dashboard(lambda: state.get("db"), config)))
+    if config.update_check:
+        jobs.append(("update-check", lambda: _update_notice(config, state)))
     if config.telegram_enabled and config.digest_enabled:
         jobs.append(("weekly-digest", lambda: _weekly_digest_loop(config, state)))
 

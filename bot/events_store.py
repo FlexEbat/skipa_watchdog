@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from pathlib import Path
 
 log = logging.getLogger("skipa_watchdog.events_store")
@@ -67,12 +68,50 @@ def record_event(
         log.error("Не удалось записать событие в %s: %s", EVENTS_FILE, e)
 
 
+# Запас по времени при чтении с конца файла: записи делают разные потоки, поэтому
+# порядок ts в файле может слегка "плавать".
+_TAIL_SLACK_SECONDS = 3600
+_TAIL_BLOCK = 1 << 20
+
+
+def _lines_since(since_ts: float) -> list[str]:
+    """Строки файла начиная с первого блока, где все записи уже старше since_ts.
+    Файл дописывается по времени, поэтому свежие события лежат в конце: для "последних
+    24 часов" не нужно разбирать сотни тысяч старых строк (дашборд делает это каждые 15 с)."""
+    chunks: list[bytes] = []
+    with EVENTS_FILE.open("rb") as f:
+        pos = f.seek(0, 2)
+        while pos > 0:
+            step = min(_TAIL_BLOCK, pos)
+            pos -= step
+            f.seek(pos)
+            chunk = f.read(step)
+            chunks.append(chunk)
+            first_nl = chunk.find(b"\n")
+            if pos > 0 and first_nl != -1:
+                try:
+                    first = json.loads(chunk[first_nl + 1:].split(b"\n", 1)[0])
+                    if first.get("ts", 0) < since_ts - _TAIL_SLACK_SECONDS:
+                        break
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+    text = b"".join(reversed(chunks)).decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if pos > 0 and lines:
+        lines = lines[1:]  # первая строка могла быть обрезана на границе блока
+    return lines
+
+
 def load_events(since_ts: float | None = None, until_ts: float | None = None) -> list[dict]:
     if not EVENTS_FILE.exists():
         return []
     events = []
     try:
-        for line in EVENTS_FILE.read_text(encoding="utf-8").splitlines():
+        if since_ts is not None:
+            raw_lines = _lines_since(since_ts)
+        else:
+            raw_lines = EVENTS_FILE.read_text(encoding="utf-8").splitlines()
+        for line in raw_lines:
             line = line.strip()
             if not line:
                 continue
@@ -94,16 +133,24 @@ def prune_events(keep_last: int = MAX_EVENTS_KEPT) -> None:
     """Обрезает файл событий, оставляя только последние keep_last записей.
     Вызывается изредка (например, вместе с еженедельным обновлением базы),
     чтобы файл не рос бесконечно на нагруженных серверах."""
-    all_events = load_events()
-    if len(all_events) <= keep_last:
+    if not EVENTS_FILE.exists():
         return
-    trimmed = all_events[-keep_last:]
     try:
+        # хвост держим как сырые строки в ограниченной очереди: без разбора JSON и без
+        # загрузки всего файла в память
+        tail: deque[str] = deque(maxlen=keep_last)
+        total = 0
+        with EVENTS_FILE.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.strip():
+                    tail.append(line if line.endswith("\n") else line + "\n")
+                    total += 1
+        if total <= keep_last:
+            return
         # через временный файл + rename, чтобы сбой посреди записи не обрубил журнал
         tmp = EVENTS_FILE.with_name(EVENTS_FILE.name + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
-            for rec in trimmed:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.writelines(tail)
         os.replace(tmp, EVENTS_FILE)
         log.info("events.jsonl обрезан до последних %d записей", keep_last)
     except Exception as e:  # noqa: BLE001

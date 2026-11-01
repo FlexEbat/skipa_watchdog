@@ -12,7 +12,7 @@ Skipa Watchdog 能发现已知扫描器（CyberOK/Skipa、GRChTs、NKTsKI 及其
 - **内核级封锁。** 整个名单加载到 `ipset` 中，扫描器在第一个数据包就会被拦截。
 - **统一配置。** 两种安装方式读取同一个 `config.yaml`。
 - **Telegram 可选。** 不使用 Telegram 时，一切通过本地日志工作。
-- **自我恢复。** 重启、Docker 重启或 `ufw reload` 之后，规则会自动恢复（Telegram 方式）。
+- **自我恢复。** 重启后，规则和 ipset 集合（包括手动封锁）在两种方式下都会自动恢复；Docker 重启或 `ufw reload` 由 Telegram 方式修复。
 - **防止自我封锁。** 内部网络和你自己的 SSH 会话不会被封锁。
 
 ## 目录
@@ -40,7 +40,8 @@ Skipa Watchdog 能发现已知扫描器（CyberOK/Skipa、GRChTs、NKTsKI 及其
 | 封锁 | 在内核中，名单由 systemd 定时器更新 | 在内核中，进程自行更新并修复规则 |
 | 通知 | 写入 `detections.log` | `detections.log` 以及 Telegram 消息 |
 | “封禁”按钮、`/stats` 图表、仪表盘、健康检查 | 无 | 有 |
-| 附加来源（`sources.extra`） | 无 | 有 |
+| 附加来源（`sources.extra`：`cidr_list`、`abuseipdb`） | 有 | 有 |
+| 重启后的保护 | 单元 `skipa-watchdog-ipset` 和 `skipa-watchdog-rules` | 进程 + `skipa-watchdog-fw-rules` |
 
 可以先用第一种方式，之后再从菜单中接入 Telegram。无法切换回纯 bash 方式：需要卸载后重新安装。
 
@@ -63,7 +64,7 @@ Skipa Watchdog 能发现已知扫描器（CyberOK/Skipa、GRChTs、NKTsKI 及其
 | 项目更新检查 | 每次启动菜单时，第 12 项 | 服务启动时：“安装”按钮，`/version` | 写入日志；在面板中安装 |
 
 仅 Python 方式具备（由其性质决定）：测试通知 `/testalert`、队列 `/pending`、告警中的“封禁”按钮、仪表盘、
-附加来源、限时自动封锁。
+限时自动封锁和手动封锁。
 
 ## 快速开始
 
@@ -170,6 +171,8 @@ IP 名单 ──► 数据库（缓存 data/ip_cache.json）──► ipset skip
 | `sources.min_prefix` | `20` | 名单中接受的最大网段（前缀长度）；Spamhaus DROP 请设为 `16` | 是 |
 | `sources.allow_insecure_http` | `false` | 允许通过明文 http 下载名单（默认仅 https） | 是 |
 | `updates.check_on_start` | `true` | 启动面板和服务时检查项目更新 | 是 |
+| `sources.min_entries` | `10` | 来源在首次下载时至少要有的条目数（防止只有三行的“垃圾”名单）；很小的自定义名单请调低 | 是 |
+| `firewall.keep_established_tcp` | `false` | 不切断已建立的 TCP 会话：只封锁新的 TCP 连接（SYN）和所有非 TCP 流量。注意：已建立会话的扫描器会在该会话内继续工作。用一对 DROP 规则实现，而不是 `RETURN`（在内置的 `INPUT`/`DOCKER-USER` 中 `RETURN` 会跳过主机的其余规则）。修改后需重新应用规则 | 是 |
 | `sources.extra` | 空 | 附加来源 | 否 |
 | `monitoring.method` | `both` | `poll`、`kernel_log`、`both` | 否 |
 | `monitoring.ignore_ips` | 空 | 永不封锁的地址 | 是 |
@@ -256,8 +259,8 @@ AS64500 / Example Hosting GmbH
 
 仅在 Telegram 方式下可用，并在 `config.yaml` 中启用。
 
-- **附加来源**（`sources.extra`）：Spamhaus DROP、FireHOL、AbuseIPDB 或你自己的名单。
-  每个来源在告警中以各自的名称显示。
+- **附加来源**（`sources.extra`）：Spamhaus DROP、FireHOL、AbuseIPDB 或你自己的名单（两种方式均可用；类型 `cidr_list` 和 `abuseipdb`，字段 `min_entries`/`min_confidence`）。
+  Telegram 方式下每个来源在告警中以各自的名称显示。支持 `#` 和 `;` 注释（Spamhaus 格式）。仅限 IPv4：来源中的 IPv6 条目会被跳过，但现在会写入日志（`... 条 IPv6 记录被跳过`）。
 - **按钮封禁**（`banning.enabled`）：告警下方会出现“🚫 Забанить”（封禁）按钮
   （时长为 `manual_ban_duration_minutes`）。`auto_ban_new_hits` 会自动封禁每个发现的 IP，
   `fail2ban_jail` 会把封禁同步到 fail2ban。历史记录写入 `data/bans.jsonl`。
@@ -280,9 +283,24 @@ AS64500 / Example Hosting GmbH
 | 名单和定时器（仅服务） | `journalctl -u skipa-watchdog-sync-lists -u skipa-watchdog-notify` |
 
 **重启与规则。** Telegram 方式每隔 `monitoring.guard_interval_seconds`（60 秒）自行检查并修复跳转和 ipset，
-同时还会安装 `skipa-watchdog-fw-rules.service` 单元。在“仅服务”方式中，`skipa-watchdog-sync-lists.timer`
-会在开机 10 分钟后重新填充 ipset，之后按计划执行；而 `iptables` 规则需要通过系统手段保存
-（`iptables-persistent`），或在重启后运行 `sudo bash install.sh fw-rules`。
+同时还会安装 `skipa-watchdog-fw-rules.service` 单元。
+
+在“仅服务”方式中，ipset 集合和规则只存在于内核内存，因此会被保存并在开机时恢复
+（`/var/lib/skipa_watchdog/ipsets.save`，每次同步以及每次手动封锁/解除后更新）：
+
+- `skipa-watchdog-ipset.service` —— 在 `netfilter-persistent` 之前尽早运行：恢复集合（没有文件则创建空集合）。
+  这很重要：若服务器上保存了引用 `skipa-*` 的规则而集合尚不存在，`iptables-restore` 会拒绝整个规则文件，
+  服务器将完全没有防火墙；
+- `skipa-watchdog-rules.service` —— 稍后，在 Docker 和 kubelet 之后（它们提供 `DOCKER-USER` 和 `KUBE-*` 链）：应用规则并验证结果；
+- `skipa-watchdog-sync-lists.timer` 在开机 10 分钟后及之后按计划更新名单。
+
+不能合并为一个单元：`After=docker.service` 与 `Before=netfilter-persistent.service` 同时存在会形成排序环
+（`netfilter-persistent` 在 `network-pre.target` 之前，Docker 在 `network-online.target` 之后），systemd 会随机删除某个任务来打破它。
+
+对集合的所有操作（定时器、菜单第 9 项、`blockctl.sh`、应用规则、开机）都在同一个 `flock`
+（`/var/lib/skipa_watchdog/ipset.lock`）下执行，因此不会重叠。应用规则后脚本会验证集合存在，且 `INPUT`、`DOCKER-USER`
+和 `KUBE-*` 中有规则，并报告结果（`✓`/`✗`）；菜单第 1 项显示同样内容。
+在 Telegram 方式中，如果你自己用 `netfilter-persistent save` 保存规则，请注意集合由进程启动时创建：引用 `skipa-*` 的已保存规则在其启动前无法加载。
 
 **手动封锁。** 通过菜单（第 6 项）、Telegram 中的 `/block` 命令，或
 `sudo bash /opt/skipa_watchdog/service/blockctl.sh {block|unblock|list} [ip]`。
@@ -336,12 +354,11 @@ LOG 规则对所有协议生效（在 `detections.log` 中可以看到 `proto=UD
 ## 开发
 
 ```bash
-python3 -m unittest discover -s tests -t .     # 80+ 个测试，无需 root
+python3 -m unittest discover -s tests -t .     # 200+ 个测试，无需 root
 shellcheck -S warning service/*.sh install-firewall-rules.sh
 ```
 
-测试用模拟对象替代 `iptables` 和 `ipset`（[`tests/fakes.py`](tests/fakes.py)）；CI 在 Python 3.10–3.13
-上运行测试，同时执行 `bash -n` 和 `shellcheck`。
+测试用模拟对象替代 `iptables` 和 `ipset`（[`tests/fakes.py`](tests/fakes.py)、[`tests/netfake.py`](tests/netfake.py)），不会触碰真实防火墙；CI 在 Python 3.10–3.13 上运行，并配合 `bash -n` 和 `shellcheck`。“仅服务”方式在真实 `ipset`/`iptables` 上的端到端场景（重启、`iptables-restore`、flock）需要显式开启，因为它会修改主机的集合和规则：在一次性环境中以 root 运行 `SKIPA_REAL_NETFILTER_TESTS=1 python3 -m unittest tests.test_real_netfilter`。
 
 目录结构：
 

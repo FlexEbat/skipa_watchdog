@@ -13,6 +13,8 @@ SCANNERS_SET="skipa-scanners"
 ALLOW_SET="skipa-allow"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="${SKIPA_CONFIG:-$HERE/../config.yaml}"
+# shellcheck source=lib-ipset.sh
+source "$HERE/lib-ipset.sh"
 ERR_LOG="$(mktemp)"
 
 # Проверка цели: только IPv4/CIDR, не шире /16, не частная/служебная сеть.
@@ -47,12 +49,20 @@ validate_target() {
 }
 trap 'rm -f "$ERR_LOG"' EXIT
 
+# Изменения наборов не должны пересекаться с sync-lists.sh/setup-ipset-rules.sh (общий flock);
+# просмотр (list/allowlist) блокировки не требует
+case "${1:-}" in
+    block|unblock|allow|unallow) acquire_ipset_lock 60 || exit 1 ;;
+esac
+
 case "${1:-}" in
     block)
         [ -n "${2:-}" ] || { echo "Использование: $0 block <ip>" >&2; exit 1; }
         validate_target "$2" || exit 1
-        ipset create "$MANUAL_SET" hash:net maxelem 65536 -exist
+        ipset create "$MANUAL_SET" hash:net maxelem "$MAXELEM_MANUAL" -exist
         if ipset add "$MANUAL_SET" "$2" -exist 2>"$ERR_LOG"; then
+            # без сохранения ручная блокировка пропала бы после перезагрузки
+            save_ipsets || echo "ВНИМАНИЕ: блокировка действует, но не сохранена для перезагрузки" >&2
             echo "OK"
         else
             cat "$ERR_LOG" >&2
@@ -67,6 +77,7 @@ case "${1:-}" in
         # следующем обновлении; чтобы исключить его насовсем, впишите в
         # monitoring.ignore_ips в config.yaml.
         if ipset del "$MANUAL_SET" "$2" -exist 2>"$ERR_LOG"; then
+            save_ipsets || echo "ВНИМАНИЕ: разблокировка действует, но не сохранена для перезагрузки" >&2
             echo "OK"
         else
             cat "$ERR_LOG" >&2
@@ -95,6 +106,7 @@ case "${1:-}" in
         # вручную - снимаем эту блокировку: иначе ручная блокировка и allowlist спорят.
         if ipset add "$ALLOW_SET" "$2" -exist 2>"$ERR_LOG"; then
             ipset del "$MANUAL_SET" "$2" -exist 2>/dev/null
+            save_ipsets || echo "ВНИМАНИЕ: изменение действует, но не сохранено для перезагрузки" >&2
             echo "OK"
         else
             echo "Записано в config.yaml, но в ipset добавить не удалось (набор $ALLOW_SET создаётся при" \
@@ -110,6 +122,7 @@ case "${1:-}" in
         # из ядра убираем только записи, добавленные из конфига; частные сети и SSH-сессии
         # вернутся при ближайшей синхронизации allowlist
         ipset del "$ALLOW_SET" "$2" -exist 2>/dev/null
+        save_ipsets || echo "ВНИМАНИЕ: изменение действует, но не сохранено для перезагрузки" >&2
         echo "OK"
         ;;
     allowlist)

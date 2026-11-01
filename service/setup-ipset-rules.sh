@@ -8,6 +8,13 @@
 #
 # Ядро само отсеивает трафик по обоим сразу, без единого демона в userspace.
 #
+# Опция firewall.keep_established_tcp (по умолчанию false): вместо одного DROP на всё
+# ставится пара правил "-p tcp --syn -> DROP" и "! -p tcp -> DROP": новые TCP-соединения
+# и весь не-TCP трафик блокируются, а уже установленные TCP-сессии не рвутся. Намеренно
+# НЕ используется `-p tcp ! --syn -j RETURN`: RETURN во встроенной цепочке INPUT прекращает
+# её обход и пропускает все остальные правила хоста (в том числе чужие DROP). Смена
+# опции требует повторно применить правила (старый вариант убирается автоматически).
+#
 # Применяется к INPUT (хост) и, если есть, DOCKER-USER и
 # KUBE-EXTERNAL-SERVICES/KUBE-NODEPORTS (Docker/Kubernetes) - как и
 # install-firewall-rules.sh для режима с ботом, только здесь вместо
@@ -23,6 +30,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARG="${1:-$HERE/../config.yaml}"
 # shellcheck source=lib-config.sh
 source "$HERE/lib-config.sh"
+# shellcheck source=lib-ipset.sh
+source "$HERE/lib-ipset.sh"
 if [ -f "$ARG" ]; then
     load_service_config "$ARG"
 else
@@ -30,21 +39,20 @@ else
     ACTION_MODE="$ARG"
 fi
 
-SETS=("skipa-scanners" "skipa-manual")
-MAXELEM_SCANNERS=200000
-MAXELEM_MANUAL=65536
+SETS=("$SET_SCANNERS" "$SET_MANUAL")
 LOG_PREFIX="$KERNEL_LOG_PREFIX"
 LIMIT="$LOG_LIMIT"
 BURST="$LOG_BURST"
 
 ipt() { iptables -w 5 "$@"; }
 
-ipset create skipa-scanners hash:net maxelem "$MAXELEM_SCANNERS" -exist
-ipset create skipa-manual hash:net maxelem "$MAXELEM_MANUAL" -exist
-# allowlist (частные сети + monitoring.ignore_ips): наполняет sync-lists.sh. Каждое правило
+# Никто другой не должен менять наборы, пока ставятся правила (sync-lists.sh, blockctl.sh)
+acquire_ipset_lock 120 || exit 1
+
+# allowlist (частные сети + monitoring.ignore_ips) наполняет sync-lists.sh. Каждое правило
 # ниже содержит условие "src НЕ в skipa-allow", поэтому свои адреса не
 # блокируются, даже если попали внутрь большой сети из списка.
-ipset create skipa-allow hash:net maxelem 4096 -exist
+create_base_sets
 
 # Хвост условия, общий для LOG и DROP
 ALLOW_COND=(-m set ! --match-set skipa-allow src)
@@ -67,19 +75,51 @@ remove_log_rule() {
         --limit-burst "$BURST" -j LOG --log-prefix "$LOG_PREFIX" --log-level 4 2>/dev/null || true
 }
 
+# Варианты DROP-правила: plain - одно правило на всё; syn + nontcp - пара для
+# keep_established_tcp (новые TCP-соединения и весь не-TCP трафик, без установленных сессий).
+drop_spec() {   # $1 - набор, $2 - вариант; результат в массиве DSPEC
+    case "$2" in
+        plain)  DSPEC=(-m set --match-set "$1" src "${ALLOW_COND[@]}" -j DROP) ;;
+        syn)    DSPEC=(-p tcp --syn -m set --match-set "$1" src "${ALLOW_COND[@]}" -j DROP) ;;
+        nontcp) DSPEC=(! -p tcp -m set --match-set "$1" src "${ALLOW_COND[@]}" -j DROP) ;;
+    esac
+}
+
+ensure_drop_variant() {
+    local chain="$1" set="$2" variant="$3"
+    drop_spec "$set" "$variant"
+    if ipt -C "$chain" "${DSPEC[@]}" 2>/dev/null; then
+        echo "[skipa-watchdog] DROP-правило ($set, $variant) в $chain уже стоит"
+    else
+        ipt -I "$chain" 1 "${DSPEC[@]}"
+        echo "[skipa-watchdog] DROP-правило ($set, $variant) добавлено в $chain"
+    fi
+}
+
+remove_drop_variant() {
+    local chain="$1" set="$2" variant="$3"
+    drop_spec "$set" "$variant"
+    ipt -D "$chain" "${DSPEC[@]}" 2>/dev/null || true
+}
+
+# Ставит нужный вид DROP и убирает остальные (после смены keep_established_tcp
+# в цепочке не должно остаться правил прежнего вида)
 ensure_drop_rule() {
     local chain="$1" set="$2"
-    if ipt -C "$chain" -m set --match-set "$set" src "${ALLOW_COND[@]}" -j DROP 2>/dev/null; then
-        echo "[skipa-watchdog] DROP-правило ($set) в $chain уже стоит"
+    if [ "${KEEP_ESTABLISHED:-false}" = "true" ]; then
+        remove_drop_variant "$chain" "$set" plain
+        ensure_drop_variant "$chain" "$set" nontcp
+        ensure_drop_variant "$chain" "$set" syn
     else
-        ipt -I "$chain" 1 -m set --match-set "$set" src "${ALLOW_COND[@]}" -j DROP
-        echo "[skipa-watchdog] DROP-правило ($set) добавлено в $chain"
+        remove_drop_variant "$chain" "$set" syn
+        remove_drop_variant "$chain" "$set" nontcp
+        ensure_drop_variant "$chain" "$set" plain
     fi
 }
 
 remove_drop_rule() {
-    local chain="$1" set="$2"
-    ipt -D "$chain" -m set --match-set "$set" src "${ALLOW_COND[@]}" -j DROP 2>/dev/null || true
+    local chain="$1" set="$2" v
+    for v in plain syn nontcp; do remove_drop_variant "$chain" "$set" "$v"; done
 }
 
 # Правила прошлых версий (без проверки allowlist) - убираем, иначе они продолжат
@@ -144,3 +184,15 @@ else
     [ "$found" = "0" ] && echo "[skipa-watchdog] Цепочки KUBE-EXTERNAL-SERVICES/KUBE-NODEPORTS не найдены - пропускаю."
 fi
 
+
+# Результат нужно проверить, а не считать успешным по факту запуска: если правила не
+# встали (нет ipset-модуля, чужой фаервол пересоздал цепочки), защита молча не работает.
+echo
+echo "[skipa-watchdog] Проверка применённых правил:"
+if verify_service_rules; then
+    echo "[skipa-watchdog] OK: наборы и правила на месте."
+    save_ipsets || echo "[skipa-watchdog] ВНИМАНИЕ: не удалось сохранить наборы для восстановления после перезагрузки" >&2
+else
+    echo "[skipa-watchdog] ОШИБКА: защита применена не полностью (см. ✗ выше)." >&2
+    exit 1
+fi

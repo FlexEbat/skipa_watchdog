@@ -14,5 +14,14 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/env bash /opt/skipa_watchdog/service/boot.sh rules /opt/skipa_watchdog/config.yaml
 
+# Ограничения без собственного пространства имён монтирования: юнит стартует на раннем этапе
+# загрузки (ProtectSystem/PrivateTmp здесь только добавили бы риск), а root-скрипту нужны netlink и /var/lib.
+NoNewPrivileges=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
 [Install]
 WantedBy=multi-user.target

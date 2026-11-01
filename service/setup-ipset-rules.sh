@@ -52,7 +52,11 @@ acquire_ipset_lock 120 || exit 1
 # allowlist (частные сети + monitoring.ignore_ips) наполняет sync-lists.sh. Каждое правило
 # ниже содержит условие "src НЕ в skipa-allow", поэтому свои адреса не
 # блокируются, даже если попали внутрь большой сети из списка.
-create_base_sets
+create_base_sets || {
+    echo "[skipa-watchdog] ОШИБКА: не удалось создать ipset-наборы. Если наборы skipa-* уже существуют с другими" \
+         "параметрами (создавались вручную или другой версией), удалите их: ipset flush/destroy <имя>, затем повторите." >&2
+    exit 1
+}
 
 # Хвост условия, общий для LOG и DROP
 ALLOW_COND=(-m set ! --match-set skipa-allow src)

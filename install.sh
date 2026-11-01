@@ -222,8 +222,6 @@ _apply_service_firewall_rules() {
         err "service/setup-ipset-rules.sh не найден - переустановите (пункт 12)."
         return 1
     fi
-    local mode
-    mode="$(_service_conf_get ACTION_MODE)"
     chmod +x "$script"
     # Скрипт сам проверяет результат (наборы существуют, правила стоят в INPUT/DOCKER-USER/KUBE-*)
     # и завершается с ошибкой, если защита применена не полностью

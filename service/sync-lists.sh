@@ -170,7 +170,9 @@ get_source() {
         cat "$cache"
         return 0
     fi
-    printf '%s\n' "$fresh" > "$cache"
+    # Атомарно: таймер и ручной запуск могут идти одновременно, и второй не должен прочитать
+    # наполовину записанный кэш (он выглядел бы как "источник похудел" и откатил бы свежие данные)
+    printf '%s\n' "$fresh" > "$cache.$$" && mv -f "$cache.$$" "$cache"
     printf '%s\n' "$fresh"
 }
 
@@ -246,7 +248,8 @@ while IFS=$'\037' read -r x_name x_type x_url x_enabled x_key x_conf x_min _; do
             continue
             ;;
     esac
-    EXTRA_NORMALIZED="$(get_source "extra-$x_name" "$x_url" "$x_min" "${x_type:-cidr_list}" "$x_key" "$x_conf")"
+    # </dev/null: ничто внутри не должно читать записи следующих источников из stdin цикла
+    EXTRA_NORMALIZED="$(get_source "extra-$x_name" "$x_url" "$x_min" "${x_type:-cidr_list}" "$x_key" "$x_conf" </dev/null)"
     if [ -n "$EXTRA_NORMALIZED" ]; then
         printf '%s\n' "$EXTRA_NORMALIZED" >> "$RAW_FILE"
         EXTRA_USED=$((EXTRA_USED + 1))

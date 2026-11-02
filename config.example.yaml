@@ -115,6 +115,9 @@ firewall:
   # хоста; (3) после смены значения повторно примените правила (Docker/Kubernetes -> правила,
   # либо перезапуск службы с Python) - старый вид правил убирается автоматически.
   keep_established_tcp: false
+  # Лимит LOG-правила (чтобы шторм сканов не забил журнал)
+  log_limit: "30/second"
+  log_burst: 40
 
 monitoring:
   # "poll" (периодический опрос /proc/net/tcp, без доп. зависимостей) /
@@ -163,11 +166,6 @@ environment:
   # и kernel_log/ipset.
   docker_scan: true
   k8s_scan: true
-
-firewall:
-  # Лимит LOG-правила (чтобы шторм сканов не забил журнал)
-  log_limit: "30/second"
-  log_burst: 40
 
 logging:
   level: "INFO"

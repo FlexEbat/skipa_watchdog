@@ -34,7 +34,7 @@ SERVICE_CONF="$INSTALL_DIR/config.yaml"      # единый конфиг для 
 # независимых путей установлен и как им управлять из меню.
 INSTALL_MODE_FILE="$INSTALL_DIR/.install_mode"
 
-INSTALLER_VERSION="3.0.0"
+INSTALLER_VERSION="3.5.2"
 
 DESCRIPTION="Skipa Watchdog постоянно следит за сетевыми подключениями к серверу и
 сверяет источник с базой IP-адресов сканеров (CyberOK/Skipa, ГРЧЦ, НКЦКИ +
@@ -248,8 +248,11 @@ check_list_updates() {
 
     mkdir -p "$(dirname "$LIST_HASH_STATE")"
     HASH_PRIMARY=""; HASH_BLACKLIST=""
-    # shellcheck disable=SC1090
-    [ -f "$LIST_HASH_STATE" ] && source "$LIST_HASH_STATE"
+    # читаем как данные, а не через source: в файле только две строки с hex-хэшами
+    if [ -f "$LIST_HASH_STATE" ]; then
+        HASH_PRIMARY="$(sed -n 's/^HASH_PRIMARY=\([0-9a-f]\{64\}\)$/\1/p' "$LIST_HASH_STATE" | head -n1)"
+        HASH_BLACKLIST="$(sed -n 's/^HASH_BLACKLIST=\([0-9a-f]\{64\}\)$/\1/p' "$LIST_HASH_STATE" | head -n1)"
+    fi
 
     # Адреса берём из config.yaml (как и бот с сервисом), а не зашиваем в скрипт: иначе
     # при своём списке проверялся бы чужой. Пустой blacklist_url - источник отключён.
@@ -1286,10 +1289,16 @@ configure_telegram() {
     local token chat_id admins
     read -rp "Telegram bot_token (от @BotFather): " token
     { [ -z "$token" ] || [ "$token" = "0" ]; } && { info "Отменено."; return; }
+    [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] \
+        || { err "Токен похож не на токен бота (ожидается вид 123456:ABC-def). Ничего не сохранил."; return; }
     read -rp "chat_id (куда слать уведомления): " chat_id
     [ "$chat_id" = "0" ] && { info "Отменено."; return; }
+    [[ "$chat_id" =~ ^-?[0-9]+$ ]] || { err "chat_id - целое число (у групп оно отрицательное). Ничего не сохранил."; return; }
     read -rp "admin_ids через запятую (Telegram user id; пусто - команды только из чата chat_id): " admins
     [ "$admins" = "0" ] && { info "Отменено."; return; }
+    admins="$(echo "$admins" | tr -d ' ')"
+    [[ -z "$admins" || "$admins" =~ ^[0-9]+(,[0-9]+)*$ ]] \
+        || { err "admin_ids - числа через запятую. Ничего не сохранил."; return; }
 
     confirm "Сохранить настройки Telegram и применить?" || { info "Отменено."; return; }
 

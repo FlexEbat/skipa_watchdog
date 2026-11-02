@@ -485,3 +485,28 @@ class InstallWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SourceHardeningTests(_Env):
+    def test_мусор_после_маски_не_попадает_в_набор(self):
+        """записи вида a.b.c.d/24/мусор отбрасываются целиком, в ipset идут только IP/маска"""
+        self.set_list("primary", [f"45.{i}.0.0/24" for i in range(1, 13)]
+                      + ["9.9.9.0/24/evil", "8.8.0.0/20/24", "7.7.7.0/24timeout0", "6.6.6.0/024"])
+        r = self.sync()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = self.members("skipa-scanners")
+        self.assertTrue(got)
+        for item in got:
+            self.assertRegex(item, r"^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$", item)
+        self.assertNotIn("9.9.9.0/24/evil", got)
+        self.assertNotIn("8.8.0.0/20/24", got)
+        self.assertIn("6.6.6.0/24", got)            # ведущий ноль в маске приводится к обычному виду
+
+    def test_wget_ходит_только_по_https_без_редиректа_на_http(self):
+        """запасной путь через wget не следует за редиректом https -> http"""
+        self.assertIn("--https-only", (SVC / "sync-lists.sh").read_text(encoding="utf-8"))
+
+    def test_журнал_ядра_очищается_от_управляющих_символов(self):
+        """notify-tail пишет в detections.log только печатаемые символы"""
+        text = (SVC / "notify-tail.sh").read_text(encoding="utf-8")
+        self.assertIn("[^[:print:]]", text)

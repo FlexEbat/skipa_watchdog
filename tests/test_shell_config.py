@@ -89,3 +89,69 @@ class LibConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("awk"), "нужны bash и awk")
+class YamlSetHardeningTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = Path(self.tmp.name)
+        self.cfg = self.d / "config.yaml"
+        shutil.copy(ROOT / "config.example.yaml", self.cfg)
+
+    def _set(self, path: str, value: str, raw: bool = False) -> subprocess.CompletedProcess:
+        script = f'source "{LIB}"\nyaml_set "{self.cfg}" "$1" "$2" {"raw" if raw else ""}'
+        return subprocess.run(["bash", "-c", script, "x", path, value], capture_output=True, text=True,
+                              cwd=self.d, timeout=20)
+
+    def test_обратный_слэш_n_не_превращается_в_перевод_строки(self):
+        """`awk -v` раскрывал \\n; значение через окружение остаётся буквальным"""
+        before = self.cfg.read_text(encoding="utf-8").count("\n")
+        r = self._set("telegram.bot_token", "12:abc\\nmonitoring:\\n  ignore_ips: [evil]", raw=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = self.cfg.read_text(encoding="utf-8")
+        self.assertEqual(text.count("\n"), before)                 # ни одной лишней строки
+        self.assertNotIn("\nmonitoring:\n  ignore_ips: [evil]", text)
+        self.assertIn("  bot_token: 12:abc\\nmonitoring:", text)      # осталось буквальным текстом
+
+    def test_перевод_строки_и_кавычки_в_значении_отклоняются(self):
+        """значение с \\n, кавычкой или обратным слэшем не пишется, файл не меняется"""
+        original = self.cfg.read_bytes()
+        for bad in ("a\nb", 'a"b', "a\\b"):
+            r = self._set("telegram.bot_token", bad)
+            self.assertNotEqual(r.returncode, 0, repr(bad))
+        r = self._set("telegram.bot_token", "x\ny", raw=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.cfg.read_bytes(), original)
+
+    def test_недопустимый_ключ_отклоняется(self):
+        """ключ с пробелом или спецсимволами не попадает в awk-программу"""
+        original = self.cfg.read_bytes()
+        for bad in ("a b.c", "sec.k$(id)", "sec.k:x"):
+            self.assertNotEqual(self._set(bad, "v").returncode, 0, bad)
+        self.assertEqual(self.cfg.read_bytes(), original)
+
+    def test_обычное_значение_читается_обратно(self):
+        """токен бота записывается и читается как раньше"""
+        self.assertEqual(self._set("telegram.bot_token", "123456:ABC-def_ghi").returncode, 0)
+        self.assertEqual(sh('yaml_get "%s" telegram.bot_token' % self.cfg, self.d).strip(), "123456:ABC-def_ghi")
+
+
+class ExampleConfigTests(unittest.TestCase):
+    def test_в_примере_конфига_нет_дублирующихся_ключей(self):
+        """PyYAML молча берёт последний из дублей: вторая секция firewall: затирала keep_established_tcp"""
+        class Strict(yaml.SafeLoader):
+            pass
+
+        def construct(loader, node, deep=False):
+            seen = set()
+            for k, _ in node.value:
+                key = loader.construct_object(k)
+                assert key not in seen, f"дубль ключа {key!r}"
+                seen.add(key)
+            return yaml.SafeLoader.construct_mapping(loader, node, deep)
+
+        Strict.add_constructor("tag:yaml.org,2002:map", construct)
+        data = yaml.load((ROOT / "config.example.yaml").read_text(encoding="utf-8"), Loader=Strict)
+        self.assertEqual(set(data["firewall"]), {"keep_established_tcp", "log_limit", "log_burst"})

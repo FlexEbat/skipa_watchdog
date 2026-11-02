@@ -85,7 +85,8 @@ async def ban_ip(
     _log_ban_action("ban", ip, duration_minutes, reason, by)
 
     if fail2ban_jail:
-        code, _, err = await _run("fail2ban-client", "set", fail2ban_jail, "banip", ip)
+        target = blocker.canonical_target(ip) or str(net)
+        code, _, err = await _run("fail2ban-client", "set", fail2ban_jail, "banip", target)
         if code != 0:
             log.warning("Не удалось зеркалировать бан %s в fail2ban jail %r: %s", ip, fail2ban_jail, err.strip())
     return True, ""
@@ -98,7 +99,8 @@ async def unban_ip(ip: str, fail2ban_jail: str = "", by: str = "auto") -> bool:
     log.info("IP разбанен: %s (кем: %s)", ip, by)
     _log_ban_action("unban", ip, 0, "", by)
     if fail2ban_jail:
-        await _run("fail2ban-client", "set", fail2ban_jail, "unbanip", ip)
+        # blocker.unblock_ip уже отверг всё, что не IPv4/сеть; в fail2ban уходит каноническая форма
+        await _run("fail2ban-client", "set", fail2ban_jail, "unbanip", blocker.canonical_target(ip) or ip)
     return True
 
 

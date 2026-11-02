@@ -245,3 +245,22 @@ class ModeSwitchTests(unittest.TestCase):
         """справка blockctl.sh не обещает block/unblock"""
         text = (ROOT / "service" / "blockctl.sh").read_text(encoding="utf-8")
         self.assertIn("{list|allow|unallow|allowlist|import-blocks}", text)
+
+    def test_версия_установщика_совпадает_с_VERSION(self):
+        """INSTALLER_VERSION не отстаёт от файла VERSION (раньше застряла на 3.0.0)"""
+        import re
+        text = (ROOT / "install.sh").read_text(encoding="utf-8")
+        m = re.search(r'^INSTALLER_VERSION="([^"]+)"', text, re.M)
+        self.assertEqual(m.group(1), (ROOT / "VERSION").read_text(encoding="utf-8").strip())
+
+    def test_telegram_ввод_проверяется_до_записи(self):
+        """мусор вместо токена, chat_id или admin_ids не попадает в config.yaml"""
+        script = 'cp "$INSTALL_DIR/config.example.yaml" "$SERVICE_CONF"; configure_telegram; grep -E "^  (bot_token|chat_id|admin_ids):" "$SERVICE_CONF"'
+        r, _, _ = self._run(script, stdin='1"\nmonitoring: x\n')
+        self.assertIn("на токен бота", r.stdout + r.stderr)
+        r, _, _ = self._run(script, stdin="123456:ABC-def\nabc\n")
+        self.assertIn("chat_id", r.stdout + r.stderr)
+        r, _, _ = self._run(script, stdin="123456:ABC-def\n-100123\n1,x\n")
+        self.assertIn("admin_ids", r.stdout + r.stderr)
+        self.assertIn('bot_token: ""', r.stdout)                              # конфиг не изменён
+        self.assertNotIn("123456:ABC-def", r.stdout)

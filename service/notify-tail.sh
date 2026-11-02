@@ -52,6 +52,9 @@ journalctl -k -f -n 0 --output=cat 2>/dev/null | grep --line-buffered -F "$PREFI
         fi
 
         ts="$(date '+%Y-%m-%d %H:%M:%S')"
+        # в журнал ядра может попасть что угодно между нашими полями: оставляем печатаемый ASCII,
+        # иначе управляющие символы/переводы строк позволили бы подделать соседние записи
+        line="${line//[^[:print:]]/ }"
         {
             echo "===== $ts | IP=$src | proto=$proto port=$dpt ====="
             echo "$line"

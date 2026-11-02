@@ -62,6 +62,12 @@ esac''')
     def sync(self) -> subprocess.CompletedProcess:
         return self.run_script("sync-lists.sh", str(self.conf))
 
+    def import_blocks(self, *nets: str) -> subprocess.CompletedProcess:
+        """перенос бессрочных блокировок из варианта с ботом (единственный путь в skipa-manual)"""
+        f = self.d / f"carry-{abs(hash(nets))}.txt"
+        f.write_text("\n".join(nets) + "\n", encoding="utf-8")
+        return self.run_script("blockctl.sh", "import-blocks", str(f))
+
     def members(self, name: str) -> list[str]:
         p = self.d / "ipsets" / name
         return [x for x in p.read_text(encoding="utf-8").split() if x] if p.exists() else []
@@ -81,23 +87,42 @@ class SaveAndRestoreTests(_Env):
         self.assertIn("add skipa-scanners 45.5.0.0/24", text)
         self.assertIn("create skipa-allow", text)
 
-    def test_ручная_блокировка_и_разблокировка_сохраняются(self):
-        """blockctl block/unblock/allow/unallow обновляют файл сохранения"""
+    def test_перенесённые_блокировки_и_белый_список_сохраняются(self):
+        """import-blocks/allow/unallow обновляют файл сохранения; allow снимает перенесённую блокировку"""
         self.sync()
-        self.assertEqual(self.run_script("blockctl.sh", "block", "8.8.8.0/24").returncode, 0)
+        r = self.import_blocks("8.8.8.0/24")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip().splitlines()[-1], "1")
         self.assertIn("add skipa-manual 8.8.8.0/24", self.save_file.read_text(encoding="utf-8"))
-        self.assertEqual(self.run_script("blockctl.sh", "unblock", "8.8.8.0/24").returncode, 0)
-        self.assertNotIn("add skipa-manual 8.8.8.0/24", self.save_file.read_text(encoding="utf-8"))
         env = {"SKIPA_CONFIG": str(self.conf)}
+        self.assertEqual(self.run_script("blockctl.sh", "allow", "8.8.8.0/24", env=env).returncode, 0)
+        self.assertNotIn("add skipa-manual 8.8.8.0/24", self.save_file.read_text(encoding="utf-8"))
         self.assertEqual(self.run_script("blockctl.sh", "allow", "203.0.113.5", env=env).returncode, 0)
         self.assertIn("add skipa-allow 203.0.113.5", self.save_file.read_text(encoding="utf-8"))
         self.assertEqual(self.run_script("blockctl.sh", "unallow", "203.0.113.5", env=env).returncode, 0)
         self.assertNotIn("add skipa-allow 203.0.113.5", self.save_file.read_text(encoding="utf-8"))
 
+    def test_ручной_блокировки_и_разблокировки_в_сервис_режиме_нет(self):
+        """block/unblock отказывают с пояснением и ничего не меняют: всё работает автоматически"""
+        self.sync()
+        for cmd in ("block", "unblock"):
+            r = self.run_script("blockctl.sh", cmd, "8.8.8.0/24")
+            self.assertNotEqual(r.returncode, 0, cmd)
+            self.assertIn("автоматически", r.stderr)
+        self.assertEqual(self.members("skipa-manual"), [])
+
+    def test_перенос_отбрасывает_частные_и_слишком_широкие_сети(self):
+        """import-blocks проходит ту же проверку целей, что и раньше блокировка: мусор не попадает в набор"""
+        self.sync()
+        r = self.import_blocks("10.0.0.0/8", "0.0.0.0/0", "192.168.1.5", "не-адрес", "8.8.4.0/24")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip().splitlines()[-1], "1")
+        self.assertEqual(self.members("skipa-manual"), ["8.8.4.0/24"])
+
     def test_после_перезагрузки_наборы_возвращаются(self):
         """boot.sh sets восстанавливает базу и ручные блокировки из файла"""
         self.sync()
-        self.run_script("blockctl.sh", "block", "8.8.8.0/24")
+        self.import_blocks("8.8.8.0/24")
         shutil.rmtree(self.d / "ipsets")                      # «перезагрузка»: память ядра пуста
         self.assertEqual(self.members("skipa-scanners"), [])
         r = self.run_script("boot.sh", "sets", str(self.conf))
@@ -161,11 +186,16 @@ class LockTests(_Env):
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_параллельные_blockctl_не_теряют_записи(self):
-        """две одновременные ручные блокировки обе попадают в файл сохранения"""
+        """два одновременных переноса обе попадают в файл сохранения"""
         self.sync()
-        procs = [subprocess.Popen(["bash", str(SVC / "blockctl.sh"), "block", net], env=self.env,
+        files = []
+        for net in ("9.9.9.0/24", "9.9.8.0/24"):
+            f = self.d / f"par-{net.split('/')[0]}.txt"
+            f.write_text(net + "\n", encoding="utf-8")
+            files.append(f)
+        procs = [subprocess.Popen(["bash", str(SVC / "blockctl.sh"), "import-blocks", str(f)], env=self.env,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                 for net in ("9.9.9.0/24", "9.9.8.0/24")]
+                 for f in files]
         for p in procs:
             self.assertEqual(p.wait(timeout=60), 0)
         text = self.save_file.read_text(encoding="utf-8")

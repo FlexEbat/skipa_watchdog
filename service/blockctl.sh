@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Ручное управление блокировками для режима "только сервис" (bash).
-# Работает с отдельным ipset "skipa-manual" - НЕ с автообновляемым
-# "skipa-scanners" (тот целиком пересобирается при каждом обновлении списка,
-# поэтому ручные блокировки хранятся отдельно и не теряются при sync).
-# Использование: blockctl.sh {block|unblock|list|allow|unallow|allowlist} [ip]
+# Управление наборами в режиме "только сервис" (bash). Блокировка в этом режиме полностью
+# автоматическая: сканеры из списка (skipa-scanners) режет ядро, список обновляет таймер.
+# Ручной блокировки и разблокировки здесь НЕТ - единственный ручной рычаг - белый список.
+# Набор "skipa-manual" остаётся только для бессрочных блокировок, перенесённых из варианта
+# с Telegram при переключении режима (import-blocks); отдельно от skipa-scanners, потому что
+# тот целиком пересобирается при каждом обновлении списка.
+# Использование: blockctl.sh {list|allow|unallow|allowlist|import-blocks} [аргумент]
 #   allow / unallow / allowlist - белый список (monitoring.ignore_ips): запись в
 #   config.yaml (общий для панели и бота код confctl.sh) и сразу в ipset skipa-allow.
+#   import-blocks <файл> - внутренняя команда переключения режима: по адресу в строке.
 set -uo pipefail
 
 MANUAL_SET="skipa-manual"
@@ -18,7 +21,7 @@ source "$HERE/lib-ipset.sh"
 ERR_LOG="$(mktemp)"
 
 # Проверка цели: только IPv4/CIDR, не шире /16, не частная/служебная сеть.
-# Защита от `blockctl.sh block 0.0.0.0/0`, который отрезал бы и администратора.
+# Защита от переноса 0.0.0.0/0 и подобного, что отрезало бы и администратора.
 validate_target() {
     local t="$1" ip mask
     ip="${t%%/*}"
@@ -52,43 +55,27 @@ trap 'rm -f "$ERR_LOG"' EXIT
 # Изменения наборов не должны пересекаться с sync-lists.sh/setup-ipset-rules.sh (общий flock);
 # просмотр (list/allowlist) блокировки не требует
 case "${1:-}" in
-    block|unblock|allow|unallow) acquire_ipset_lock 60 || exit 1 ;;
+    allow|unallow|import-blocks) acquire_ipset_lock 60 || exit 1 ;;
 esac
 
 case "${1:-}" in
-    block)
-        [ -n "${2:-}" ] || { echo "Использование: $0 block <ip>" >&2; exit 1; }
-        validate_target "$2" || exit 1
-        ipset create "$MANUAL_SET" hash:net maxelem "$MAXELEM_MANUAL" -exist
-        if ipset add "$MANUAL_SET" "$2" -exist 2>"$ERR_LOG"; then
-            # без сохранения ручная блокировка пропала бы после перезагрузки
-            save_ipsets || echo "ВНИМАНИЕ: блокировка действует, но не сохранена для перезагрузки" >&2
-            echo "OK"
-        else
-            cat "$ERR_LOG" >&2
-            echo "FAIL"
-            exit 1
-        fi
+    block|unblock)
+        echo "В режиме 'только сервис' ручной блокировки и разблокировки нет: всё работает автоматически." >&2
+        echo "Чтобы адрес не блокировался - blockctl.sh allow <ip> (белый список)." >&2
+        echo "Ручная блокировка есть в варианте с Telegram (/block, /unblock)." >&2
+        exit 1
         ;;
-    unblock)
-        [ -n "${2:-}" ] || { echo "Использование: $0 unblock <ip>" >&2; exit 1; }
-        # Разблокировать можно только то, что заблокировали вручную. Если IP
-        # пришёл из базового списка (skipa-scanners) - он вернётся при
-        # следующем обновлении; чтобы исключить его насовсем, впишите в
-        # monitoring.ignore_ips в config.yaml.
-        if ipset del "$MANUAL_SET" "$2" -exist 2>"$ERR_LOG"; then
-            save_ipsets || echo "ВНИМАНИЕ: разблокировка действует, но не сохранена для перезагрузки" >&2
-            echo "OK"
-        else
-            cat "$ERR_LOG" >&2
-            echo "FAIL"
-            exit 1
-        fi
-        if ipset test "$SCANNERS_SET" "$2" >/dev/null 2>&1; then
-            echo "ПРИМЕЧАНИЕ: $2 также входит в автообновляемый список skipa-scanners -" \
-                 "останется заблокирован через него. Чтобы исключить насовсем, выполните:" \
-                 "blockctl.sh allow $2 (запишет IP в monitoring.ignore_ips)." >&2
-        fi
+    import-blocks)
+        [ -f "${2:-}" ] || { echo "Использование: $0 import-blocks <файл>" >&2; exit 1; }
+        create_base_sets || exit 1
+        added=0
+        while IFS= read -r target; do
+            [ -n "$target" ] || continue
+            validate_target "$target" 2>/dev/null || continue
+            ipset add "$MANUAL_SET" "$target" -exist 2>/dev/null && added=$((added + 1))
+        done < "$2"
+        save_ipsets || echo "ВНИМАНИЕ: блокировки действуют, но не сохранены для перезагрузки" >&2
+        echo "$added"
         ;;
     list)
         echo "# Ручные блокировки (skipa-manual):"
@@ -130,7 +117,7 @@ case "${1:-}" in
         bash "$HERE/confctl.sh" "$CONF" ignore-list
         ;;
     *)
-        echo "Использование: $0 {block|unblock|list|allow|unallow|allowlist} [ip]" >&2
+        echo "Использование: $0 {list|allow|unallow|allowlist|import-blocks} [аргумент]" >&2
         exit 1
         ;;
 esac

@@ -59,12 +59,6 @@ case "${1:-}" in
 esac
 
 case "${1:-}" in
-    block|unblock)
-        echo "В режиме 'только сервис' ручной блокировки и разблокировки нет: всё работает автоматически." >&2
-        echo "Чтобы адрес не блокировался - blockctl.sh allow <ip> (белый список)." >&2
-        echo "Ручная блокировка есть в варианте с Telegram (/block, /unblock)." >&2
-        exit 1
-        ;;
     import-blocks)
         [ -f "${2:-}" ] || { echo "Использование: $0 import-blocks <файл>" >&2; exit 1; }
         create_base_sets || exit 1

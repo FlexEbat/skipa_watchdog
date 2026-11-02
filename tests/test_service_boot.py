@@ -102,13 +102,15 @@ class SaveAndRestoreTests(_Env):
         self.assertEqual(self.run_script("blockctl.sh", "unallow", "203.0.113.5", env=env).returncode, 0)
         self.assertNotIn("add skipa-allow 203.0.113.5", self.save_file.read_text(encoding="utf-8"))
 
-    def test_ручной_блокировки_и_разблокировки_в_сервис_режиме_нет(self):
-        """block/unblock отказывают с пояснением и ничего не меняют: всё работает автоматически"""
+    def test_команд_block_и_unblock_в_сервис_режиме_нет(self):
+        """block/unblock удалены совсем: это неизвестные команды, набор не меняется"""
         self.sync()
+        text = (SVC / "blockctl.sh").read_text(encoding="utf-8")
+        self.assertNotIn("block)", text.replace("import-blocks)", ""))
         for cmd in ("block", "unblock"):
             r = self.run_script("blockctl.sh", cmd, "8.8.8.0/24")
             self.assertNotEqual(r.returncode, 0, cmd)
-            self.assertIn("автоматически", r.stderr)
+            self.assertIn("Использование", r.stderr)
         self.assertEqual(self.members("skipa-manual"), [])
 
     def test_перенос_отбрасывает_частные_и_слишком_широкие_сети(self):

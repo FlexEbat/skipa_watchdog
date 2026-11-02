@@ -320,12 +320,18 @@ class Config:
                     "переписке пользователя telegram.chat_id (в группе они закрыты). "
                     "Укажите свой Telegram user id в admin_ids."
                 )
+        has_secret = (
+            self.telegram_enabled or bool(self.dashboard_password)
+            or any(e.get("api_key") for e in self.extra_sources)
+        )
+        if has_secret:
             try:
                 mode = path.stat().st_mode
                 if mode & (stat.S_IRWXG | stat.S_IRWXO):
                     print(
-                        f"[config] {path} содержит токен бота, но доступен другим пользователям "
-                        f"(права {stat.filemode(mode)}) - выполните: chmod 600 {path}"
+                        f"[config] {path} содержит секреты (токен бота, пароль дашборда или ключ API), "
+                        f"но доступен другим пользователям (права {stat.filemode(mode)}) - "
+                        f"выполните: chmod 600 {path}"
                     )
             except OSError:
                 pass

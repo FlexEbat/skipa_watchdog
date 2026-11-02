@@ -72,14 +72,24 @@ yaml_set() {
     local file="$1" path="$2" value="$3" raw="${4:-}" sec key tmp
     sec="${path%%.*}"; key="${path#*.}"
     [ -f "$file" ] || { echo "yaml_set: нет файла $file" >&2; return 1; }
+    # перевод строки в значении дописал бы в конфиг чужие ключи; ключ - только из безопасного набора
+    case "$value" in *$'\n'*|*$'\r'*) echo "yaml_set: значение не должно содержать переводов строк" >&2; return 1 ;; esac
+    # парсер значений в кавычках (yaml_get) не понимает экранирования, поэтому кавычку и \
+    # в значении, которое мы сами берём в кавычки, не принимаем, а не портим молча
+    if [ -z "$raw" ]; then
+        case "$value" in *\"*|*\\*) echo "yaml_set: в значении нельзя использовать двойную кавычку и обратный слэш" >&2; return 1 ;; esac
+    fi
+    [[ "$sec" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+        || { echo "yaml_set: недопустимый ключ $path" >&2; return 1; }
     tmp="$(mktemp "${file}.XXXXXX")" || return 1
-    awk -v want_sec="$sec" -v want_key="$key" -v val="$value" -v raw="$raw" '
+    # значение передаётся через окружение: `awk -v` обрабатывает обратные слэши (\n стал бы переводом строки)
+    YS_VAL="$value" YS_RAW="$raw" awk -v want_sec="$sec" -v want_key="$key" '
     function emit_key() {
         if (raw != "") printf "  %s: %s\n", want_key, val
         else printf "  %s: \"%s\"\n", want_key, val
         done = 1
     }
-    BEGIN { done = 0; in_sec = 0; skipping_list = 0 }
+    BEGIN { done = 0; in_sec = 0; skipping_list = 0; val = ENVIRON["YS_VAL"]; raw = ENVIRON["YS_RAW"] }
     {
         if (skipping_list) {
             if ($0 ~ /^    -/ || $0 ~ /^[ \t]*$/) next

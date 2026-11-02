@@ -501,11 +501,28 @@ def block_ip(ip: str, timeout_s: int | None = None, blocklist_file: Path | None 
         return True
 
 
+def canonical_target(text: str) -> str | None:
+    """IPv4-адрес или сеть в каноническом виде ('1.2.3.4' или '1.2.3.0/24') либо None.
+    Любой другой текст (опции, пробелы, мусор после '/') отбрасывается: результат уходит
+    в аргументы ipset и fail2ban-client."""
+    text = (text or "").strip()
+    base, slash, mask = text.partition("/")
+    if slash and not mask:
+        return None
+    ip_obj = normalize_ip(base) if base else None
+    if ip_obj is None or ip_obj.version != 4:
+        return None
+    try:
+        net = ipaddress.ip_network(f"{ip_obj}/{mask or 32}", strict=False)
+    except ValueError:
+        return None
+    return str(net.network_address) if net.prefixlen == 32 else str(net)
+
+
 def unblock_ip(ip: str, blocklist_file: Path | None = None) -> bool:
-    ip_obj = normalize_ip(ip.split("/")[0]) if ip else None
-    if ip_obj is None:
+    target = canonical_target(ip)
+    if target is None:
         return False
-    target = ip if "/" in ip else str(ip_obj)
     with _lock:
         _persist_remove(target, blocklist_file or BLOCKLIST_FILE_DEFAULT)
         ok_any = False

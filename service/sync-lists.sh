@@ -63,7 +63,10 @@ fetch() {
         if [ "$protos" = "https" ] && [[ "$1" != https://* ]]; then
             return 0
         fi
-        wget -qO- --timeout=30 "$1" 2>/dev/null | head -c 20971520
+        # --https-only: без него wget идёт за редиректом https -> http, что обходит проверку выше
+        local wopts=(-qO- --timeout=30)
+        [ "$protos" = "https" ] && wopts+=(--https-only)
+        wget "${wopts[@]}" "$1" 2>/dev/null | head -c 20971520
     fi
 }
 
@@ -86,7 +89,8 @@ normalize_list() {
         if (index($0, "/")) {
             split($0, p, "/")
             if (ip2int(p[1]) < 0 || p[2] !~ /^[0-9]+$/ || p[2] + 0 > 32 || p[2] + 0 < minp) next
-            print $0
+            if (split($0, extra, "/") != 2) next          # "a/b/c" и подобное - мусор, не пропускаем в ipset
+            print p[1] "/" (p[2] + 0)
         } else if (index($0, "-")) {
             split($0, p, "-")
             s = ip2int(p[1]); e = ip2int(p[2])

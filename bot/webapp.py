@@ -27,6 +27,8 @@ log = logging.getLogger("skipa_watchdog.webapp")
 
 MAX_HEADER_BYTES = 16 * 1024
 READ_TIMEOUT = 10
+MAX_CONNECTIONS = 32          # одновременных соединений: дальше закрываем сразу, не копим
+AUTH_FAIL_DELAY = 1.0         # пауза перед ответом 401: подбор пароля идёт не быстрее раза в секунду на соединение
 
 
 def _check_auth(config, header_value: str | None) -> bool:
@@ -82,7 +84,21 @@ def _json(status: str, payload) -> bytes:
     return _response(status, json.dumps(payload, ensure_ascii=False).encode(), "application/json; charset=utf-8")
 
 
-async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, get_db, config) -> None:
+async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, get_db, config,
+                  slots: asyncio.Semaphore | None = None) -> None:
+    if slots is not None:
+        if slots.locked():
+            writer.close()
+            return
+        await slots.acquire()
+    try:
+        await _handle_one(reader, writer, get_db, config)
+    finally:
+        if slots is not None:
+            slots.release()
+
+
+async def _handle_one(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, get_db, config) -> None:
     try:
         raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), READ_TIMEOUT)
         if len(raw) > MAX_HEADER_BYTES:
@@ -98,6 +114,7 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ge
         if method != "GET":
             out = _json("405 Method Not Allowed", {"error": "only GET"})
         elif not _check_auth(config, headers.get("authorization")):
+            await asyncio.sleep(AUTH_FAIL_DELAY)
             out = _response(
                 "401 Unauthorized", "Неверный логин/пароль".encode(), "text/plain; charset=utf-8",
                 ['WWW-Authenticate: Basic realm="Skipa Watchdog"'],
@@ -147,8 +164,9 @@ async def serve_dashboard(get_db, config) -> None:
             "нельзя, слушаю только 127.0.0.1 (задайте логин и пароль или используйте SSH-туннель)", host,
         )
         host = "127.0.0.1"
+    slots = asyncio.Semaphore(MAX_CONNECTIONS)
     server = await asyncio.start_server(
-        lambda r, w: _handle(r, w, get_db, config),
+        lambda r, w: _handle(r, w, get_db, config, slots),
         host=host, port=config.dashboard_port, limit=MAX_HEADER_BYTES,
     )
     log.info("Веб-дашборд запущен на http://%s:%s/", host, config.dashboard_port)

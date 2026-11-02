@@ -53,8 +53,9 @@ chk "журнал: доп. источников 1"                       grep -q
 chk "файл сохранения создан, права 600"               test "$(stat -c %a "$SKIPA_STATE_DIR/ipsets.save")" = 600
 chk "в сохранении есть scanners и allow"              bash -c "grep -q '^create skipa-scanners' $SKIPA_STATE_DIR/ipsets.save && grep -q '^create skipa-allow' $SKIPA_STATE_DIR/ipsets.save"
 
-echo "== 2. ручная блокировка сохраняется"
-bash service/blockctl.sh block 8.8.8.0/24 >/dev/null 2>&1
+echo "== 2. перенесённая блокировка сохраняется"
+printf '8.8.8.0/24\n' > "$W/carry1.txt"
+bash service/blockctl.sh import-blocks "$W/carry1.txt" >/dev/null 2>&1
 chk "8.8.8.8 в skipa-manual"                   ipset test skipa-manual 8.8.8.8
 chk "блокировка записана в файл сохранения"    grep -q "add skipa-manual 8.8.8.0/24" "$SKIPA_STATE_DIR/ipsets.save"
 
@@ -112,7 +113,8 @@ wait
 chk "оба прошли успешно"                  test "$(cat "$W/pa.rc")$(cat "$W/pb.rc")" = "00"
 chk "набор цел после гонки (45.5.0.77, 47.2.1.9)" bash -c "ipset test skipa-scanners 45.5.0.77 && ipset test skipa-scanners 47.2.1.9"
 chk "временных *-tmp наборов не осталось"  test -z "$(ipset list -n | grep -- '-tmp')"
-( bash service/blockctl.sh block 9.9.9.0/24 > /dev/null 2>&1 ) & ( bash service/blockctl.sh block 9.9.8.0/24 >/dev/null 2>&1 ) & wait
+printf '9.9.9.0/24\n' > "$W/c2.txt"; printf '9.9.8.0/24\n' > "$W/c3.txt"
+( bash service/blockctl.sh import-blocks "$W/c2.txt" > /dev/null 2>&1 ) & ( bash service/blockctl.sh import-blocks "$W/c3.txt" >/dev/null 2>&1 ) & wait
 chk "параллельные blockctl: обе блокировки в файле сохранения" bash -c "grep -q 'add skipa-manual 9.9.9.0/24' $SKIPA_STATE_DIR/ipsets.save && grep -q 'add skipa-manual 9.9.8.0/24' $SKIPA_STATE_DIR/ipsets.save"
 
 echo "== 8. минимум записей при ПЕРВОЙ загрузке"

@@ -14,7 +14,7 @@ works on the host and for services published through Docker and Kubernetes.
   at its first packet.
 - **One config.** Both installation variants read the same `config.yaml`.
 - **Telegram is optional.** Without it everything works through local logs.
-- **Self-healing.** After a reboot the rules and ipset sets (including manual blocks) come back
+- **Self-healing.** After a reboot the rules and ipset sets (including saved blocks) come back
   on their own in both variants; a Docker restart or `ufw reload` is repaired by the Telegram variant.
 - **Self-lockout protection.** Service networks and your own SSH sessions cannot be blocked.
 
@@ -46,8 +46,10 @@ works on the host and for services published through Docker and Kubernetes.
 | Extra sources (`sources.extra`: `cidr_list`, `abuseipdb`) | yes | yes |
 | Protection after a reboot | units `skipa-watchdog-ipset` and `skipa-watchdog-rules` | process + `skipa-watchdog-fw-rules` |
 
-You can start with the first variant and add Telegram later from the menu. Switching back
-to plain bash is not possible: uninstall and install again.
+You can start with the first variant and add Telegram later from the menu (item 4). Switching works
+both ways on the fly, with no reinstall and no gap in protection: to go from the bot back to plain
+bash use item 4 → "Switch to service only". Permanent manual blocks are carried over, `config.yaml`
+(Telegram settings included) and `data/` stay, and the venv can be removed.
 
 ### What is available where
 
@@ -59,7 +61,7 @@ way to invoke them differs. Edits to `config.yaml` from any of them go through t
 | --- | --- | --- | --- |
 | Status, health check | item 1, `install.sh status` | `/status` | item 1, `install.sh status` |
 | Update the IP database | item 9 | `/update` | item 9, `sync-lists` timer |
-| Block / unblock | item 6 (for N hours or permanent) | `/block <ip> [hours]`, `/unblock` | item 6, `blockctl.sh block\|unblock` (permanent) |
+| Block / unblock | item 6 (for N hours or permanent) | `/block <ip> [hours]`, `/unblock` | none: blocking is fully automatic, exceptions via the allowlist |
 | List of blocks | item 6 | `/blocklist` | item 6, `blockctl.sh list` |
 | Allowlist | item 7 | `/allowlist`, `/allow`, `/unallow` | item 7, `blockctl.sh allow\|unallow\|allowlist` |
 | Action mode, list source, method | item 3 | `/settings` | item 3 |
@@ -69,7 +71,8 @@ way to invoke them differs. Edits to `config.yaml` from any of them go through t
 | Project update check | on every menu launch, item 12 | on service start: an "Install" button, `/version` | a log line; install from the panel |
 
 Python-only by nature: the `/testalert` test notification, the `/pending` queue, the "Ban"
-button in alerts, the dashboard, time-limited auto- and manual blocking.
+button in alerts, the dashboard, time-limited auto-blocking and manual block/unblock (in the service-only
+variant everything is automatic, there is no manual blocking).
 
 ## Quick start
 
@@ -88,11 +91,7 @@ After that, manage everything with:
 sudo skipa-watchdog
 ```
 
-Every menu item has an exit (`0`), and every action that changes something asks for
-confirmation. Menu items: health check, service management, detection settings, Telegram,
-Docker/Kubernetes, blocked IPs, allowlist, detection statistics, database update, logs, config
-editing, project update, uninstall. On every launch the menu also checks whether a new project
-version is out and offers to install it.
+On every launch the menu checks whether a new project version is out and offers to install it.
 
 Without the menu:
 
@@ -318,7 +317,7 @@ is installed as well.
 
 In the "service only" variant ipset sets and rules live only in kernel memory, so they are saved
 and brought back at boot (`/var/lib/skipa_watchdog/ipsets.save`, refreshed after every sync and
-every manual block/unblock):
+every allowlist change and every block carry-over on a mode switch):
 
 - `skipa-watchdog-ipset.service` - early, before `netfilter-persistent`: restores the sets (or
   creates empty ones if there is no file). This matters: if the server has saved rules that
@@ -340,9 +339,16 @@ the rules, and prints the outcome (`✓`/`✗`); menu item 1 shows the same.
 In the Telegram variant, if you persist rules yourself with `netfilter-persistent save`, note that
 the process creates the sets on start: saved rules that reference `skipa-*` cannot load before it.
 
-**Manual blocking.** From the menu (item 6), with `/block` in Telegram, or with
-`sudo bash /opt/skipa_watchdog/service/blockctl.sh {block|unblock|list} [ip]`.
-Blocks in the Telegram variant are saved in `data/blocked_ips.json` and restored on start.
+**Manual blocking** exists only in the Telegram variant: from the menu (item 6) or with `/block`.
+Those blocks are saved in `data/blocked_ips.json` and restored on start. In the service-only variant
+there is no manual block/unblock: everything is automatic (the kernel drops listed scanners, a timer
+refreshes the list), and an address is exempted via the allowlist (item 7 or
+`blockctl.sh allow <ip>`, which also lifts a block carried over on a mode switch).
+
+**Switching mode.** Menu item 4. Service → service + bot: connect Telegram. Service + bot → service:
+the Python process stops, the bash units and `ipset` rules come up, and only then the `SKIPA-BLOCK`
+chain and the `skipa-dyn`/`skipa-db` sets are removed, so protection never lapses. Permanent blocks
+are carried over; time-limited ones (auto-blocks included) are not.
 
 **Service.** `skipa-watchdog.service` runs as root: it needs `iptables`, `ipset`, access to
 conntrack and write access to the install directory and logs. Only safe restrictions are enabled
@@ -363,8 +369,9 @@ repository history changed), the installer offers to switch to the current versi
 - The bot token and API keys are masked in logs (`skipa-watchdog.log`, `journalctl`).
 - Bot commands are accepted only from administrators (`admin_ids`, or the private chat with `chat_id`).
 - Self-lockout protection is described above. If you still got cut off, log in through the
-  host console and run `sudo skipa-watchdog`: item 6 unblocks a specific IP, item 13 removes
-  the project along with its rules.
+  host console and run `sudo skipa-watchdog`: in the Telegram variant item 6 unblocks a specific
+  IP, in the service-only variant add the IP to the allowlist (item 7); item 13 removes the project
+  along with its rules.
 - Data from external APIs (organization, ASN) is escaped in Telegram and on the dashboard page, and
   newlines and control characters are stripped from it before it reaches text logs (otherwise a network
   owner could feed fail2ban a forged line with someone else's IP).

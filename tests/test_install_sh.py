@@ -146,3 +146,102 @@ class MonitoringMethodMenuTests(unittest.TestCase):
         self.assertEqual(self._run("0\\n"), ["both", "5"])             # выход без изменений
         self.assertEqual(self._run("9\\n"), ["both", "5"])             # неизвестный пункт
         self.assertEqual(self._run("1\\ny\\n\\n", mode="service"), ["poll", "5"])
+
+
+FAKE_IPTABLES_STATEFUL = """#!/usr/bin/env bash
+# запоминает вызовы; переход `-j SKIPA-BLOCK` считается стоящим один раз в каждой цепочке
+args=("$@"); [ "${args[0]}" = "-w" ] && args=("${args[@]:2}")
+echo "${args[*]}" >> "$FAKE_LOG"
+case "${args[0]}" in
+  -L) exit 0;;
+  -C) if [ "${args[2]}" = "-j" ] && [ "${args[3]}" = "SKIPA-BLOCK" ] && [ ! -e "$FAKE_LOG.del.${args[1]}" ]; then exit 0; fi; exit 1;;
+  -D) touch "$FAKE_LOG.del.${args[1]}"; exit 0;;
+  *) exit 0;;
+esac
+"""
+
+
+@unittest.skipUnless(shutil.which("bash"), "нужен bash")
+class ModeSwitchTests(unittest.TestCase):
+    """переключение режимов на лету и отсутствие ручной блокировки в режиме «только сервис»"""
+
+    def _run(self, script: str, stdin: str = "", mode: str = "service", fake_ipt: bool = False):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "bin").mkdir()
+            log = d / "ipt.log"
+            ipt = d / "bin" / "iptables"
+            ipt.write_text(FAKE_IPTABLES_STATEFUL if fake_ipt else FAKE_IPTABLES)
+            ipt.chmod(ipt.stat().st_mode | stat.S_IXUSR)
+            inst = d / "inst"
+            shutil.copytree(ROOT / "service", inst / "service")
+            shutil.copy(ROOT / "config.example.yaml", inst / "config.example.yaml")
+            (inst / "data").mkdir()
+            if mode:
+                (inst / ".install_mode").write_text(mode + "\n")
+            env = {**os.environ, "PATH": f"{d / 'bin'}:{os.environ['PATH']}", "SKIPA_SOURCE_ONLY": "1",
+                   "SKIPA_INSTALL_DIR": str(inst), "SKIPA_LOG_DIR": str(d / "log"), "FAKE_LOG": str(log)}
+            r = subprocess.run(["bash", "-c", f'source "{ROOT / "install.sh"}"\n{script}'], input=stdin,
+                               capture_output=True, text=True, env=env, timeout=30, cwd=d)
+            mode_after = (inst / ".install_mode").read_text().strip() if (inst / ".install_mode").exists() else ""
+            return r, mode_after, (log.read_text() if log.exists() else "")
+
+    def test_в_сервис_режиме_меню_блокировок_только_просмотр(self):
+        """пункт 6 в режиме «только сервис» ничего не спрашивает про блокировку/разблокировку"""
+        r, _, _ = self._run("blocklist_menu", stdin="\n")
+        out = r.stdout
+        self.assertIn("только просмотр", out)
+        self.assertIn("белый список", out)
+        self.assertNotIn("Заблокировать IP вручную", out)
+        self.assertNotIn("Разблокировать IP", out)
+
+    def test_в_варианте_с_ботом_ручная_блокировка_остаётся(self):
+        """в варианте с Telegram пункты блокировки/разблокировки на месте"""
+        r, _, _ = self._run("blocklist_menu", stdin="0\n", mode="bot")
+        self.assertIn("Заблокировать IP вручную", r.stdout)
+        self.assertIn("Разблокировать IP", r.stdout)
+
+    def test_меню_telegram_предлагает_переключение_только_из_бота(self):
+        """из бота есть возврат на «только сервис», из сервис-режима - только подключение Telegram"""
+        r, _, _ = self._run("telegram_menu", stdin="0\n", mode="bot")
+        self.assertIn("Переключить на 'только сервис'", r.stdout)
+        r, _, _ = self._run("telegram_menu", stdin="0\n", mode="service")
+        self.assertNotIn("Переключить на 'только сервис'", r.stdout)
+        self.assertIn("Подключить Telegram", r.stdout)
+
+    def test_переключение_в_сервис_режиме_ничего_не_делает(self):
+        """switch_to_service в режиме «только сервис» только предупреждает"""
+        r, mode_after, _ = self._run("switch_to_service", mode="service")
+        self.assertIn("Уже режим", r.stdout)
+        self.assertEqual(mode_after, "service")
+
+    def test_отказ_от_переключения_ничего_не_меняет(self):
+        """без подтверждения режим остаётся «bot»"""
+        r, mode_after, _ = self._run("switch_to_service", stdin="n\n", mode="bot")
+        self.assertIn("Отменено", r.stdout)
+        self.assertEqual(mode_after, "bot")
+
+    def test_переносятся_только_бессрочные_блокировки_бота(self):
+        """из data/blocked_ips.json берутся записи с нулевым сроком, блокировки на срок - нет"""
+        script = (
+            'cat > "$INSTALL_DIR/data/blocked_ips.json" <<EOF\n'
+            '{\n "ips": {\n  "1.2.3.4": 0.0,\n  "5.6.7.0/24": 0.0,\n  "9.9.9.9": 1893456000.5\n }\n}\nEOF\n'
+            '_collect_bot_blocks | sort'
+        )
+        r, _, _ = self._run(script, mode="bot")
+        self.assertEqual(r.stdout.split(), ["1.2.3.4", "5.6.7.0/24"], r.stderr)
+
+    def test_удаление_python_правил_не_трогает_правила_сервис_режима(self):
+        """убираются только переходы в SKIPA-BLOCK и сама цепочка; ничего про skipa-scanners не удаляется"""
+        _, _, log = self._run("_remove_bot_firewall_rules", mode="bot", fake_ipt=True)
+        lines = log.splitlines()
+        self.assertIn("-D INPUT -j SKIPA-BLOCK", lines)
+        self.assertIn("-F SKIPA-BLOCK", lines)
+        self.assertIn("-X SKIPA-BLOCK", lines)
+        self.assertFalse([x for x in lines if "skipa-scanners" in x or "skipa-manual" in x], lines)
+        self.assertFalse([x for x in lines if x.startswith("-D") and "SKIPA-BLOCK" not in x], lines)
+
+    def test_в_документах_нет_ручной_блокировки_для_сервис_режима(self):
+        """справка blockctl.sh не обещает block/unblock"""
+        text = (ROOT / "service" / "blockctl.sh").read_text(encoding="utf-8")
+        self.assertIn("{list|allow|unallow|allowlist|import-blocks}", text)

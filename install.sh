@@ -1172,6 +1172,111 @@ _migrate_service_to_bot() {
     ok "Режим переключён на 'сервис + бот'."
 }
 
+# Постоянные блокировки варианта с ботом (skipa-dyn без таймаута и бессрочные записи из
+# data/blocked_ips.json) - по одному адресу в строке. Нужны, чтобы при переключении на
+# 'только сервис' не потерять то, что админ заблокировал бессрочно. Блокировки с таймаутом
+# (в том числе автоблокировки) не переносятся: они и так истекли бы сами.
+_collect_bot_blocks() {
+    if command -v ipset >/dev/null 2>&1; then
+        ipset save skipa-dyn 2>/dev/null | awk '$1=="add" && $2=="skipa-dyn" {
+            t=0; for (i=4;i<=NF;i++) if ($i=="timeout") t=$(i+1)
+            if (t+0==0) print $3 }'
+    fi
+    local f="$INSTALL_DIR/data/blocked_ips.json"
+    [ -f "$f" ] && grep -E '^[[:space:]]*"[0-9a-fA-F.:/]+"[[:space:]]*:[[:space:]]*0(\.0+)?,?[[:space:]]*$' "$f" \
+        | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/'
+}
+
+# Убирает только то, что ставил python-вариант: переходы в SKIPA-BLOCK, саму цепочку и
+# наборы skipa-dyn/skipa-db. Правила и наборы 'только сервис' (skipa-scanners/-manual/-allow)
+# не трогает - именно поэтому нельзя использовать _remove_firewall_rules.
+_remove_bot_firewall_rules() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    local chain n
+    for chain in INPUT DOCKER-USER KUBE-EXTERNAL-SERVICES KUBE-NODEPORTS; do
+        iptables -w 5 -L "$chain" -n >/dev/null 2>&1 || continue
+        n=0
+        while iptables -w 5 -C "$chain" -j SKIPA-BLOCK 2>/dev/null && [ "$n" -lt 20 ]; do
+            iptables -w 5 -D "$chain" -j SKIPA-BLOCK 2>/dev/null || break
+            n=$((n + 1))
+        done
+    done
+    if iptables -w 5 -L SKIPA-BLOCK -n >/dev/null 2>&1; then
+        iptables -w 5 -F SKIPA-BLOCK 2>/dev/null
+        iptables -w 5 -X SKIPA-BLOCK 2>/dev/null
+    fi
+    if command -v ipset >/dev/null 2>&1; then
+        local set
+        for set in skipa-dyn skipa-db skipa-db-tmp; do ipset destroy "$set" 2>/dev/null; done
+    fi
+}
+
+# 'сервис + бот' -> 'только сервис' без перерыва в защите: сначала останавливается процесс
+# (он чинил бы правила сам), затем поднимается и применяется bash-вариант, и только потом
+# убирается всё, что было от python-варианта. Telegram-настройки в config.yaml остаются.
+_migrate_bot_to_service() {
+    info "Переключаю на 'только сервис': Python-процесс остановлю, защита продолжит работать в ядре."
+
+    ensure_command iptables iptables >/dev/null 2>&1
+    ensure_command ipset ipset \
+        || { err "Нужен ipset - без него режим 'только сервис' не работает. Ничего не менял."; return 1; }
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        ensure_command curl curl \
+            || { err "Нужен curl или wget для скачивания списков. Ничего не менял."; return 1; }
+    fi
+    [ -f "$INSTALL_DIR/service/sync-lists.sh" ] \
+        || { err "service/sync-lists.sh не найден - обновите проект (пункт 12). Ничего не менял."; return 1; }
+
+    local carry
+    carry="$(mktemp)" || return 1
+    _collect_bot_blocks | sort -u > "$carry"
+
+    systemctl stop "$UNIT" 2>/dev/null
+    if _do_install_service && apply_firewall_rules; then
+        :
+    else
+        err "Не удалось поднять 'только сервис'. Python-часть не удалена; вернуть как было: sudo bash install.sh install"
+        echo "bot" > "$INSTALL_MODE_FILE"
+        systemctl start "$UNIT" 2>/dev/null
+        rm -f "$carry"
+        return 1
+    fi
+
+    # теперь, когда правила 'только сервис' уже стоят, можно убрать python-вариант
+    systemctl disable "$UNIT" "$FW_UNIT" 2>/dev/null
+    systemctl stop "$FW_UNIT" 2>/dev/null
+    rm -f "$SYSTEMD_DIR/${UNIT}.service" "$SYSTEMD_DIR/${FW_UNIT}.service"
+    systemctl daemon-reload 2>/dev/null
+    _remove_bot_firewall_rules
+
+    if [ -s "$carry" ]; then
+        local n
+        n="$(bash "$INSTALL_DIR/service/blockctl.sh" import-blocks "$carry" 2>&1 | tail -n 1)"
+        info "Бессрочные блокировки из варианта с ботом перенесены: ${n:-0}"
+    fi
+    rm -f "$carry"
+    ok "Режим переключён на 'только сервис'."
+}
+
+switch_to_service() {
+    if [ "$(_current_mode 2>/dev/null)" != "bot" ]; then
+        warn "Уже режим 'только сервис'."; return
+    fi
+    echo
+    echo "Что произойдёт:"
+    echo "  - остановится и удалится Python-процесс (юниты $UNIT и $FW_UNIT);"
+    echo "  - включатся bash-юниты: таймер обновления списка, восстановление после перезагрузки,"
+    echo "    запись detections.log; правила iptables пересоберутся на ipset 'только сервис';"
+    echo "  - бессрочные ручные блокировки перенесутся, блокировки на срок - нет;"
+    echo "  - кнопка 'Забанить', команды бота и дашборд перестанут работать;"
+    echo "  - config.yaml (в том числе Telegram-настройки) и data/ останутся."
+    confirm "Переключить на 'только сервис'?" || { info "Отменено."; return; }
+    _migrate_bot_to_service || return
+    if [ -d "$INSTALL_DIR/venv" ] && confirm "Удалить venv ($INSTALL_DIR/venv) - Python больше не нужен? Позже его пересоздаст подключение Telegram"; then
+        rm -rf "$INSTALL_DIR/venv" && ok "venv удалён."
+    fi
+}
+
 configure_telegram() {
     if [ ! -f "$INSTALL_MODE_FILE" ]; then
         warn "Сначала установите Skipa Watchdog."; return
@@ -1220,22 +1325,36 @@ telegram_menu() {
     while true; do
         echo
         if [ "$(_current_mode 2>/dev/null)" != "bot" ]; then
-            echo "Сейчас установлен режим 'только сервис' (без Python). Подключение"
-            echo "Telegram создаст venv и поставит python-telegram-bot - единственное"
-            echo "место во всём проекте, где используется Python."
+            echo "Сейчас режим: 'только сервис' (без Python). Подключение Telegram создаст"
+            echo "venv, поставит python-telegram-bot и переведёт защиту на 'сервис + бот'."
+            echo "Вернуться обратно можно в любой момент из этого же меню."
             echo
+            echo "Telegram:"
+            echo "  1) Подключить Telegram (переключить на 'сервис + бот')"
+            echo "  0) Назад"
+            read -rp "> " c || return
+            case "$c" in
+                1) configure_telegram; pause ;;
+                0) return ;;
+                *) warn "Неизвестный пункт" ;;
+            esac
+        else
+            echo "Сейчас режим: 'сервис + бот' (Python)."
+            echo
+            echo "Telegram и режим работы:"
+            echo "  1) Перенастроить Telegram"
+            echo "  2) Отключить Telegram (очистить bot_token, остаться на боте)"
+            echo "  3) Переключить на 'только сервис' (без Python, блокировка не прерывается)"
+            echo "  0) Назад"
+            read -rp "> " c || return
+            case "$c" in
+                1) configure_telegram; pause ;;
+                2) disable_telegram; restart_if_running; pause ;;
+                3) switch_to_service; pause ;;
+                0) return ;;
+                *) warn "Неизвестный пункт" ;;
+            esac
         fi
-        echo "Telegram:"
-        echo "  1) Подключить/перенастроить"
-        echo "  2) Отключить"
-        echo "  0) Назад"
-        read -rp "> " c || return
-        case "$c" in
-            1) configure_telegram; pause ;;
-            2) disable_telegram; restart_if_running; pause ;;
-            0) return ;;
-            *) warn "Неизвестный пункт" ;;
-        esac
     done
 }
 
@@ -1248,6 +1367,19 @@ blocklist_menu() {
     fi
     local mode py c ip hours
     mode="$(_current_mode)"
+    if [ "$mode" != "bot" ]; then
+        # «Только сервис»: всё работает само - сканеры из списка блокируются ядром, ручных
+        # блокировок и разблокировок нет. Единственный ручной рычаг - белый список (пункт 7).
+        echo
+        echo "Заблокированные IP (только просмотр):"
+        bash "$INSTALL_DIR/service/blockctl.sh" list | sed 's/^/  /'
+        echo
+        echo "В режиме 'только сервис' блокировка полностью автоматическая: список обновляется"
+        echo "по таймеру, ядро режет всё, что в нём есть. Чтобы адрес не блокировался, добавьте"
+        echo "его в белый список (пункт 7). Ручная блокировка/разблокировка есть в варианте с Telegram."
+        pause
+        return
+    fi
     py="$(_python_bin)"
     while true; do
         echo
@@ -1532,7 +1664,7 @@ main_menu() {
         echo " 1) Проверка работоспособности"
         echo " 2) Управление сервисом (start/stop/restart/статус)"
         echo " 3) Настройки обнаружения (список IP / режим действия)"
-        echo " 4) Telegram (подключить/отключить)"
+        echo " 4) Telegram и режим работы (подключить/отключить/переключить)"
         echo " 5) Docker/Kubernetes (логирование + блокировка)"
         echo " 6) Заблокированные IP"
         echo " 7) Белый список (IP, которые не блокируются)"

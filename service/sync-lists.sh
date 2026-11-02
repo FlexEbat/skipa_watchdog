@@ -13,7 +13,16 @@
 #   - текущие SSH-сессии администратора попадают в allowlist (monitoring.auto_allowlist);
 #   - если источник не скачался - используется его последняя удачная копия;
 #   - если источник внезапно "похудел" больше чем вдвое - тоже;
-#   - ipset подменяется (swap) только если restore прошёл без ошибок.
+#   - при ПЕРВОЙ загрузке (копии ещё нет) источник, давший меньше sources.min_entries
+#     записей (по умолчанию 10), не принимается: "похудение вдвое" сравнивает с прошлой
+#     копией, а при первом запуске сравнивать не с чем;
+#   - ipset подменяется (swap) только если restore прошёл без ошибок;
+#   - после каждой успешной синхронизации наборы сохраняются на диск (lib-ipset.sh), а
+#     skipa-watchdog-ipset.service восстанавливает их при загрузке.
+#
+# Дополнительные источники (sources.extra: Spamhaus DROP, FireHOL, AbuseIPDB) работают и
+# здесь, без Python: типы cidr_list и abuseipdb, те же поля config.yaml, что у бота.
+# Только IPv4: записи IPv6 из источников пропускаются, но теперь с записью в журнал.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,15 +33,16 @@ if [ ! -f "$CONF" ]; then
 fi
 # shellcheck source=lib-config.sh
 source "$HERE/lib-config.sh"
+# shellcheck source=lib-ipset.sh
+source "$HERE/lib-ipset.sh"
 load_service_config "$CONF"   # единый config.yaml, тот же, что читает watchdog.py
 STATE_DIR="${SKIPA_STATE_DIR:-/var/lib/skipa_watchdog}"
 mkdir -p "$LOG_DIR" "$STATE_DIR"
 
-SETNAME="skipa-scanners"
+SETNAME="$SET_SCANNERS"
 TMPSET="skipa-scanners-tmp"
-ALLOWSET="skipa-allow"
-MAXELEM=200000
-MAXELEM_ALLOW=4096
+ALLOWSET="$SET_ALLOW"
+MAXELEM="$MAXELEM_SCANNERS"
 # MIN_PREFIX приходит из config.yaml (sources.min_prefix) через load_service_config
 MAX_RANGE=1048576
 MAX_COVERAGE=4194304   # столько адресов (~0,1% IPv4) максимум может покрывать один источник
@@ -71,7 +81,7 @@ normalize_list() {
         return a[1]*16777216 + a[2]*65536 + a[3]*256 + a[4]
     }
     {
-        sub(/#.*/, ""); gsub(/[ \t\r]/, "")
+        sub(/#.*/, ""); sub(/;.*/, ""); gsub(/[ \t\r]/, "")
         if ($0 == "") next
         if (index($0, "/")) {
             split($0, p, "/")
@@ -89,6 +99,23 @@ normalize_list() {
     }'
 }
 
+# Сколько строк источника - IPv6 (их нормализация отбрасывает: наборы и правила только IPv4).
+# Раньше они пропадали молча. Комментарии (# и ;) не считаются.
+count_ipv6() {
+    awk '{ sub(/#.*/, ""); sub(/;.*/, ""); if (index($0, ":")) n++ } END { print n + 0 }'
+}
+
+# AbuseIPDB: JSON blacklist API. Ключ передаётся в конфиге curl через stdin (-K -), а не
+# аргументом, чтобы он не попал в список процессов. На выходе - IP по одному в строке.
+fetch_abuseipdb() {
+    local key="$1" conf="$2"
+    command -v curl >/dev/null 2>&1 || return 0     # wget не умеет читать заголовки из stdin
+    printf 'header = "Key: %s"\nheader = "Accept: application/json"\n' "$key" |
+        curl -fsSL --proto '=https' --proto-redir '=https' --max-time 60 --max-filesize 20971520 \
+            -K - "https://api.abuseipdb.com/api/v2/blacklist?confidenceMinimum=$conf" 2>/dev/null |
+        grep -o '"ipAddress"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*:[[:space:]]*"\(.*\)"$/\1/'
+}
+
 # Сколько IPv4-адресов покрывает нормализованный список (грубая верхняя оценка).
 coverage() {
     awk '
@@ -99,11 +126,21 @@ coverage() {
 }
 
 # Скачивает один источник с откатом на последнюю удачную копию.
-# $1 - имя (для файла кэша и лога), $2 - URL. Результат - в stdout.
+# $1 - имя (для файла кэша и лога), $2 - URL (для abuseipdb не нужен), $3 - минимум записей
+# при первой загрузке, $4 - тип (cidr_list | abuseipdb), $5 - api_key, $6 - min_confidence.
+# Результат - в stdout.
 get_source() {
-    local name="$1" url="$2" cache="$STATE_DIR/$1.last" fresh="" n_new n_old=0
-    [ -z "$url" ] && return 0
-    fresh="$(fetch "$url" | normalize_list)"
+    local name="$1" url="$2" min="${3:-$MIN_ENTRIES}" type="${4:-cidr_list}" key="${5:-}" conf="${6:-90}"
+    local cache="$STATE_DIR/$1.last" raw="" fresh="" n_new n_old=0 n6
+    if [ "$type" = "abuseipdb" ]; then
+        raw="$(fetch_abuseipdb "$key" "$conf")"
+    else
+        [ -z "$url" ] && return 0
+        raw="$(fetch "$url")"
+    fi
+    n6="$(printf '%s\n' "$raw" | count_ipv6)"
+    [ "$n6" -gt 0 ] && log "Источник $name: $n6 записей IPv6 пропущено (блокировка работает только для IPv4)"
+    fresh="$(printf '%s\n' "$raw" | normalize_list)"
     n_new=$(printf '%s' "$fresh" | grep -c . || true)
     [ -f "$cache" ] && n_old=$(grep -c . "$cache" || true)
 
@@ -116,6 +153,13 @@ get_source() {
         fi
         return 0
     fi
+    # Первая загрузка: прошлой копии нет, "похудение вдвое" проверить не с чем, и список
+    # из трёх строк (страница ошибки, пустой ответ прокси) был бы принят как настоящий.
+    if [ "$n_old" -eq 0 ] && [ "$n_new" -lt "$min" ]; then
+        log "Источник $name вернул всего $n_new записей (минимум для первой загрузки - $min): похоже на" \
+            "мусор или сбой источника, не принимаю. Для действительно маленького списка задайте sources.min_entries"
+        return 0
+    fi
     if [ "$(printf '%s\n' "$fresh" | coverage)" -gt "$MAX_COVERAGE" ]; then
         log "Источник $name покрывает больше $MAX_COVERAGE адресов - похоже на подмену, использую прошлую копию"
         [ "$n_old" -gt 0 ] && cat "$cache"
@@ -126,7 +170,9 @@ get_source() {
         cat "$cache"
         return 0
     fi
-    printf '%s\n' "$fresh" > "$cache"
+    # Атомарно: таймер и ручной запуск могут идти одновременно, и второй не должен прочитать
+    # наполовину записанный кэш (он выглядел бы как "источник похудел" и откатил бы свежие данные)
+    printf '%s\n' "$fresh" > "$cache.$$" && mv -f "$cache.$$" "$cache"
     printf '%s\n' "$fresh"
 }
 
@@ -174,6 +220,42 @@ BLACKLIST_NORMALIZED="$(get_source blacklist "${BLACKLIST_URL:-}")"
 [ "$use_list1" = "1" ] && [ -n "$PRIMARY_NORMALIZED" ] && printf '%s\n' "$PRIMARY_NORMALIZED" >> "$RAW_FILE"
 [ "$use_list2" = "1" ] && [ -n "$BLACKLIST_NORMALIZED" ] && printf '%s\n' "$BLACKLIST_NORMALIZED" >> "$RAW_FILE"
 
+# Дополнительные источники (sources.extra) участвуют всегда, независимо от active_list - так
+# же, как у бота. Отключённые (enabled: false) пропускаются.
+EXTRA_USED=0
+while IFS=$'\037' read -r x_name x_type x_url x_enabled x_key x_conf x_min _; do
+    [ -n "$x_name" ] || continue
+    [ "$x_enabled" = "true" ] || continue
+    if ! [[ "$x_name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        log "Дополнительный источник с name='$x_name' пропущен: допустимы только буквы, цифры, '_', '.', '-'"
+        continue
+    fi
+    [[ "$x_min" =~ ^[0-9]+$ ]] || x_min="$MIN_ENTRIES"
+    case "${x_type:-cidr_list}" in
+        cidr_list)
+            [ -n "$x_url" ] || { log "Источник $x_name (cidr_list) пропущен: не задан url"; continue; }
+            ;;
+        abuseipdb)
+            if ! [[ "$x_key" =~ ^[A-Za-z0-9]+$ ]]; then
+                log "Источник $x_name (AbuseIPDB) пропущен: не задан или некорректен api_key в config.yaml"
+                continue
+            fi
+            [[ "$x_conf" =~ ^[0-9]+$ ]] && [ "$x_conf" -ge 1 ] && [ "$x_conf" -le 100 ] || x_conf=90
+            command -v curl >/dev/null 2>&1 || { log "Источник $x_name (AbuseIPDB) пропущен: нужен curl"; continue; }
+            ;;
+        *)
+            log "Источник $x_name: неизвестный тип '$x_type' (поддерживаются cidr_list и abuseipdb), пропускаю"
+            continue
+            ;;
+    esac
+    # </dev/null: ничто внутри не должно читать записи следующих источников из stdin цикла
+    EXTRA_NORMALIZED="$(get_source "extra-$x_name" "$x_url" "$x_min" "${x_type:-cidr_list}" "$x_key" "$x_conf" </dev/null)"
+    if [ -n "$EXTRA_NORMALIZED" ]; then
+        printf '%s\n' "$EXTRA_NORMALIZED" >> "$RAW_FILE"
+        EXTRA_USED=$((EXTRA_USED + 1))
+    fi
+done < <(yaml_extra_sources "$CONF")
+
 sort -u "$RAW_FILE" -o "$RAW_FILE"
 COUNT=$(grep -c . "$RAW_FILE" || true)
 
@@ -182,6 +264,11 @@ if [ "$COUNT" -eq 0 ]; then
         "оставляю текущий ipset без изменений."
     exit 0
 fi
+
+# Дальше идёт изменение наборов (restore в *-tmp + swap). Блокировку берём только здесь, после
+# скачивания: загрузка источников может занять минуты, и всё это время blockctl.sh и
+# остальные вынуждены были бы ждать.
+acquire_ipset_lock 300 || exit 1
 
 # allowlist: частные/служебные сети + monitoring.ignore_ips (IP или CIDR). Это именно набор,
 # а не вычёркивание строк из списка: так исключение работает и для адреса,
@@ -213,6 +300,10 @@ fi
 
 date +%s > "$STATE_DIR/last-sync"
 
+# Наборы живут только в памяти ядра: сохраняем, чтобы skipa-watchdog-ipset.service вернул их
+# после перезагрузки (в том числе ручные блокировки из skipa-manual)
+save_ipsets || log "ВНИМАНИЕ: не удалось сохранить наборы на диск - после перезагрузки они будут пустыми до следующей синхронизации"
+
 # Сервис-режим работает без постоянного процесса и без чата, поэтому о новой версии
 # сообщаем в журнал; установить её предложит панель при ближайшем запуске.
 # shellcheck source=lib-update.sh
@@ -223,4 +314,4 @@ if [ -f "$HERE/lib-update.sh" ]; then
         log "Доступна новая версия: ${UPD_LOCAL:-?} -> ${UPD_REMOTE:-?}. Установить: sudo skipa-watchdog (предложит обновиться при запуске)"
     fi
 fi
-log "Обновлено: $COUNT записей в ipset $SETNAME (active_list=${ACTIVE_LIST:-merged})"
+log "Обновлено: $COUNT записей в ipset $SETNAME (active_list=${ACTIVE_LIST:-merged}, доп. источников: $EXTRA_USED)"

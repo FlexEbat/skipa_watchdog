@@ -327,16 +327,27 @@ async def _fetch_extra_source(extra: dict) -> tuple[str, list[NetEntry]]:
             headers={"Key": api_key, "Accept": "application/json"},
         )
         entries: list[NetEntry] = []
+        skipped_v6 = 0
         for item in (data or {}).get("data", []):
             ip = item.get("ipAddress") if isinstance(item, dict) else None
             try:
                 entries.append(NetEntry(ipaddress.ip_network(f"{ip}/32"), label))
             except ValueError:
-                continue
+                if ip and ":" in str(ip):
+                    skipped_v6 += 1   # раньше такие записи пропадали молча
+        if skipped_v6:
+            log.info("Источник %s: %d записей IPv6 пропущено (блокировка работает только для IPv4)", label, skipped_v6)
         return label, entries
 
     log.warning("Неизвестный тип источника %r у %r, пропускаю", src_type, name)
     return label, []
+
+
+def _int_or_none(value) -> "int | None":
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _coverage(nets: list, ranges: list) -> int:
@@ -362,6 +373,7 @@ async def fetch_threat_db(
     active_list: str = "merged",
     previous: "ThreatDB | None" = None,
     extra_sources: "list[dict] | None" = None,
+    min_entries: int = 0,
 ) -> ThreatDB:
     """Тянет настроенные списки и собирает единую базу.
 
@@ -380,6 +392,11 @@ async def fetch_threat_db(
     FireHOL, AbuseIPDB и любые свои списки CIDR); включённые (enabled: true)
     участвуют всегда, независимо от active_list. Каждый показывается в алерте
     под своим display_name.
+
+    min_entries - минимум записей в источнике при ПЕРВОЙ загрузке (когда прошлой копии, с которой
+    можно сравнить, нет): без него список из трёх строк (страница ошибки, пустой ответ прокси)
+    принимался бы как настоящий, потому что проверка «похудел вдвое» сравнивает с прошлой
+    версией. У дополнительного источника можно задать свой min_entries. 0 - не проверять.
 
     previous - прошлая версия базы. Если АКТИВНЫЙ источник не скачался (или
     вернул подозрительно мало записей), берутся его записи из previous, а база
@@ -412,8 +429,16 @@ async def fetch_threat_db(
     per_source: dict[str, int] = {}
     degraded = False
 
-    def _guard(label: str, new_count: int, covered: int = 0) -> bool:
+    def _guard(label: str, new_count: int, covered: int = 0, minimum: "int | None" = None) -> bool:
         """True, если новое число записей и охват адресов выглядят нормально."""
+        floor = min_entries if minimum is None else minimum
+        if not (previous.per_source_counts.get(label, 0) if previous else 0) and new_count < floor:
+            log.warning(
+                "Источник %s вернул всего %d записей (минимум для первой загрузки - %d): похоже на мусор "
+                "или сбой источника, не принимаю (для маленького списка задайте sources.min_entries)",
+                label, new_count, floor,
+            )
+            return False
         if covered > MAX_SOURCE_ADDRESSES:
             log.warning(
                 "Источник %s покрывает %d адресов (предел %d) - похоже на подмену или ошибку списка, "
@@ -469,7 +494,7 @@ async def fetch_threat_db(
 
     # ---- дополнительные источники (sources.extra) ----
     for (label, entries), extra in zip(extra_results, enabled_extras):
-        if entries and _guard(label, len(entries), _coverage(entries, [])):
+        if entries and _guard(label, len(entries), _coverage(entries, []), _int_or_none(extra.get("min_entries"))):
             networks.extend(entries)
             per_source[label] = len(entries)
         else:

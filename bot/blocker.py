@@ -81,6 +81,7 @@ class Settings:
     auto_timeout_s: int = 0      # таймаут автоблокировок (0 = бессрочно)
     skip_docker: bool = False
     skip_k8s: bool = False
+    keep_established: bool = False  # DROP только для новых TCP-соединений и не-TCP; сессии не рвём
 
 
 _settings = Settings()
@@ -296,16 +297,25 @@ def _desired_rules() -> list[tuple[str, list[str], bool]]:
             ["-p", "tcp", "--syn", "-m", "set", "--match-set", SET_DB, "src"] + _log_args(),
             _settings.preload_db,
         ),
-        (
-            "db-drop",
-            ["-m", "set", "--match-set", SET_DB, "src", "-j", "DROP"],
-            _settings.preload_db and _settings.drop_enabled,
-        ),
-        (
-            "dyn-drop",
-            ["-m", "set", "--match-set", SET_DYN, "src", "-j", "DROP"],
-            _settings.drop_enabled,
-        ),
+    ] + _drop_rules("db-drop", SET_DB, _settings.preload_db and _settings.drop_enabled) \
+      + _drop_rules("dyn-drop", SET_DYN, _settings.drop_enabled)
+
+
+def _drop_rules(key: str, set_name: str, wanted: bool) -> list[tuple[str, list[str], bool]]:
+    """DROP по набору в двух видах; нужен ровно один из них, второй (wanted=False) будет убран,
+    поэтому после смены firewall.keep_established_tcp в цепочке не остаётся правил прежнего вида.
+
+    plain - одно правило на всё. С keep_established_tcp: новые TCP-соединения (SYN) и весь
+    не-TCP трафик, а установленные TCP-сессии не трогаем. RETURN для этого не используется
+    намеренно: в наших цепочках он безопасен (возврат в вызывающую), но так одинаково работает
+    и сервис-режим, где правила стоят прямо во встроенных INPUT/DOCKER-USER, а там RETURN
+    пропустил бы остальные правила хоста."""
+    match = ["-m", "set", "--match-set", set_name, "src", "-j", "DROP"]
+    keep = _settings.keep_established
+    return [
+        (key, match, wanted and not keep),
+        (f"{key}-nontcp", ["!", "-p", "tcp"] + match, wanted and keep),
+        (f"{key}-syn", ["-p", "tcp", "--syn"] + match, wanted and keep),
     ]
 
 

@@ -25,6 +25,8 @@ FW_UNIT="skipa-watchdog-fw-rules"           # применяет правила 
 SYNC_UNIT="skipa-watchdog-sync-lists"       # bash-режим: таймер обновления ipset
 NOTIFY_UNIT="skipa-watchdog-notify"         # bash-режим: демон записи detections.log
 ALLOW_UNIT="skipa-watchdog-allow-ssh"       # bash-режим: таймер, добавляющий SSH-сессии в allowlist
+SETS_UNIT="skipa-watchdog-ipset"            # bash-режим: при загрузке возвращает ipset-наборы (до netfilter-persistent)
+RULES_UNIT="skipa-watchdog-rules"           # bash-режим: при загрузке ставит iptables-правила (после Docker/kubelet)
 SERVICE_CONF="$INSTALL_DIR/config.yaml"      # единый конфиг для обоих вариантов (bash читает его через service/lib-config.sh)
 
 # Содержит "service" (чистый bash + ipset/iptables, без Python вообще) или
@@ -185,8 +187,33 @@ _apply_bot_firewall_rules() {
         return 1
     fi
     chmod +x "$script"
-    bash "$script"
-    ok "Готово. Правила применены (см. вывод выше)."
+    bash "$script" || { err "install-firewall-rules.sh завершился с ошибкой."; return 1; }
+    _verify_bot_firewall_rules
+}
+
+# Проверка результата применения правил (вариант с ботом): цепочка SKIPA-BLOCK существует и
+# в INPUT (а также в DOCKER-USER/KUBE-*, если они есть) стоит переход в неё.
+_verify_bot_firewall_rules() {
+    local chain rc=0
+    echo
+    echo "Проверка применённых правил:"
+    if iptables -w 5 -L SKIPA-BLOCK -n >/dev/null 2>&1; then
+        echo "  ✓ цепочка SKIPA-BLOCK существует"
+    else
+        echo "  ✗ цепочка SKIPA-BLOCK НЕ существует"; rc=1
+    fi
+    for chain in INPUT DOCKER-USER KUBE-EXTERNAL-SERVICES KUBE-NODEPORTS; do
+        iptables -w 5 -L "$chain" -n >/dev/null 2>&1 || continue
+        if iptables -w 5 -C "$chain" -j SKIPA-BLOCK 2>/dev/null; then
+            echo "  ✓ $chain -> SKIPA-BLOCK"
+        else
+            # DOCKER-USER/KUBE-* могут быть отключены в конфиге: это не ошибка защиты хоста
+            if [ "$chain" = "INPUT" ]; then echo "  ✗ в INPUT НЕТ перехода в SKIPA-BLOCK: хост не защищён"; rc=1
+            else echo "  – $chain: перехода нет (отключено в конфиге или цепочку ведёт другой фаервол)"; fi
+        fi
+    done
+    if [ "$rc" -eq 0 ]; then ok "Готово. Правила применены и проверены."; else err "Правила применены не полностью - защита может не работать."; fi
+    return "$rc"
 }
 
 _apply_service_firewall_rules() {
@@ -195,11 +222,15 @@ _apply_service_firewall_rules() {
         err "service/setup-ipset-rules.sh не найден - переустановите (пункт 12)."
         return 1
     fi
-    local mode
-    mode="$(_service_conf_get ACTION_MODE)"
     chmod +x "$script"
-    bash "$script" "${mode:-block_notify}"
-    ok "Готово. Правила применены (см. вывод выше)."
+    # Скрипт сам проверяет результат (наборы существуют, правила стоят в INPUT/DOCKER-USER/KUBE-*)
+    # и завершается с ошибкой, если защита применена не полностью
+    if bash "$script" "$SERVICE_CONF"; then
+        ok "Готово. Правила применены и проверены (см. вывод выше)."
+    else
+        err "Правила применены не полностью - защита может не работать. Смотрите строки ✗ выше."
+        return 1
+    fi
 }
 
 # При каждом запуске: проверяем, не вышла ли новая версия одного из листов
@@ -612,7 +643,17 @@ _do_install_service() {
     sed -i "s#/opt/skipa_watchdog#$INSTALL_DIR#g" "$SYSTEMD_DIR/${ALLOW_UNIT}.service"
     cp "$INSTALL_DIR/service/skipa-watchdog-allow-ssh.timer" "$SYSTEMD_DIR/${ALLOW_UNIT}.timer"
 
+    # Без этих двух юнитов защита пропадала после перезагрузки: ipset-наборы и iptables-правила
+    # живут только в памяти ядра, а sync-lists.sh лишь наполняет наборы, но не ставит правила
+    local u
+    for u in "$SETS_UNIT" "$RULES_UNIT"; do
+        cp "$INSTALL_DIR/service/${u}.service" "$SYSTEMD_DIR/${u}.service"
+        sed -i "s#/opt/skipa_watchdog#$INSTALL_DIR#g" "$SYSTEMD_DIR/${u}.service"
+    done
+
     systemctl daemon-reload || { err "systemctl daemon-reload не удался."; return 1; }
+    systemctl enable "$SETS_UNIT" "$RULES_UNIT" >/dev/null 2>&1 \
+        || warn "Не удалось включить юниты восстановления после перезагрузки ($SETS_UNIT, $RULES_UNIT)."
     systemctl enable --now "${SYNC_UNIT}.timer" >/dev/null 2>&1
     systemctl enable --now "${ALLOW_UNIT}.timer" >/dev/null 2>&1
     _sync_notify_service_state
@@ -635,12 +676,16 @@ do_uninstall() {
     mode="$(_current_mode 2>/dev/null || echo service)"
 
     systemctl stop "$UNIT" "$FW_UNIT" "${SYNC_UNIT}.timer" "$SYNC_UNIT" "$NOTIFY_UNIT" \
-        "${ALLOW_UNIT}.timer" "$ALLOW_UNIT" 2>/dev/null
-    systemctl disable "$UNIT" "$FW_UNIT" "${SYNC_UNIT}.timer" "$NOTIFY_UNIT" "${ALLOW_UNIT}.timer" 2>/dev/null
+        "${ALLOW_UNIT}.timer" "$ALLOW_UNIT" "$SETS_UNIT" "$RULES_UNIT" 2>/dev/null
+    systemctl disable "$UNIT" "$FW_UNIT" "${SYNC_UNIT}.timer" "$NOTIFY_UNIT" "${ALLOW_UNIT}.timer" \
+        "$SETS_UNIT" "$RULES_UNIT" 2>/dev/null
     rm -f "$SYSTEMD_DIR/${UNIT}.service" "$SYSTEMD_DIR/${FW_UNIT}.service" \
           "$SYSTEMD_DIR/${SYNC_UNIT}.service" "$SYSTEMD_DIR/${SYNC_UNIT}.timer" \
           "$SYSTEMD_DIR/${NOTIFY_UNIT}.service" \
-          "$SYSTEMD_DIR/${ALLOW_UNIT}.service" "$SYSTEMD_DIR/${ALLOW_UNIT}.timer"
+          "$SYSTEMD_DIR/${ALLOW_UNIT}.service" "$SYSTEMD_DIR/${ALLOW_UNIT}.timer" \
+          "$SYSTEMD_DIR/${SETS_UNIT}.service" "$SYSTEMD_DIR/${RULES_UNIT}.service"
+    # сохранённые наборы больше не нужны: восстанавливать их некому
+    rm -f /var/lib/skipa_watchdog/ipsets.save /var/lib/skipa_watchdog/ipset.lock
     systemctl daemon-reload
     rm -f "$CLI_LINK"
     rm -rf "$INSTALL_DIR"
@@ -787,6 +832,21 @@ print(int(json.load(open('$INSTALL_DIR/data/ip_cache.json')).get('last_update_ts
             ok "ipset skipa-scanners существует, записей: ${entries:-?}"
         else
             warn "ipset skipa-scanners не найден - выполните пункт 5 (Docker/Kubernetes) ещё раз."
+        fi
+
+        # Восстановление после перезагрузки: оба юнита включены и есть что восстанавливать
+        local u
+        for u in "$SETS_UNIT" "$RULES_UNIT"; do
+            if systemctl is-enabled --quiet "$u" 2>/dev/null; then
+                echo "   Автозапуск после перезагрузки ($u): включён"
+            else
+                warn "Юнит $u не включён - после перезагрузки защита пропадёт. Исправить: пункт 12 (обновить проект)."
+            fi
+        done
+        if [ -s /var/lib/skipa_watchdog/ipsets.save ]; then
+            echo "   Сохранённые наборы для восстановления: есть"
+        else
+            warn "Файла сохранённых наборов ещё нет - появится после ближайшей синхронизации (пункт 9)."
         fi
 
         if command -v iptables >/dev/null 2>&1; then
@@ -1093,6 +1153,10 @@ _migrate_service_to_bot() {
 
     systemctl stop "$NOTIFY_UNIT" "${ALLOW_UNIT}.timer" 2>/dev/null
     systemctl disable "$NOTIFY_UNIT" "${ALLOW_UNIT}.timer" 2>/dev/null
+    # правила и наборы в варианте с ботом ведёт сам watchdog.py + skipa-watchdog-fw-rules:
+    # юниты сервис-режима при загрузке только мешали бы (повторно ставили бы свои правила)
+    systemctl disable "$SETS_UNIT" "$RULES_UNIT" 2>/dev/null
+    rm -f "$SYSTEMD_DIR/${SETS_UNIT}.service" "$SYSTEMD_DIR/${RULES_UNIT}.service"
 
     [ -f "$INSTALL_DIR/skipa-watchdog.service" ] || { err "skipa-watchdog.service не найден."; return 1; }
     cp "$INSTALL_DIR/skipa-watchdog.service" "$SYSTEMD_DIR/${UNIT}.service"

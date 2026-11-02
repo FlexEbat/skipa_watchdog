@@ -108,6 +108,10 @@ class Config:
     min_list_prefix: int = 20
     # разрешить скачивание списков по обычному http (по умолчанию только https)
     allow_insecure_http: bool = False
+    # минимум записей в источнике при ПЕРВОЙ загрузке (прошлой копии, с которой сравнить, нет)
+    min_list_entries: int = 10
+    # не рвать установленные TCP-сессии: DROP только для новых TCP-соединений и не-TCP трафика
+    keep_established_tcp: bool = False
 
     # ---- бан: кнопка под алертом, автобан, зеркалирование в fail2ban ----
     ban_enabled: bool = False
@@ -197,6 +201,7 @@ class Config:
         banning = sect("banning")
         healthcheck = sect("healthcheck")
         updates = sect("updates")
+        firewall = sect("firewall")
         dashboard = sect("dashboard")
         digest = sect("digest")
 
@@ -272,6 +277,8 @@ class Config:
             extra_sources=[e for e in (src.get("extra") or []) if isinstance(e, dict)],
             min_list_prefix=min(32, max(8, int(src.get("min_prefix", 20)))),
             allow_insecure_http=bool(src.get("allow_insecure_http", False)),
+            min_list_entries=max(0, int(src.get("min_entries", 10))),
+            keep_established_tcp=bool(firewall.get("keep_established_tcp", False)),
             ban_enabled=bool(banning.get("enabled", False)),
             auto_ban_new_hits=bool(banning.get("auto_ban_new_hits", False)),
             auto_ban_duration_minutes=max(0, int(banning.get("auto_ban_duration_minutes", 60))),

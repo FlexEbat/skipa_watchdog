@@ -12,11 +12,17 @@ CONF="${1:-$HERE/../config.yaml}"
 [ -f "$CONF" ] || exit 0
 # shellcheck source=lib-config.sh
 source "$HERE/lib-config.sh"
+# shellcheck source=lib-ipset.sh
+source "$HERE/lib-ipset.sh"
 load_service_config "$CONF"
 
 [ "$AUTO_ALLOWLIST" = "false" ] && exit 0
 command -v ipset >/dev/null 2>&1 || exit 0
 ipset list skipa-allow -terse >/dev/null 2>&1 || exit 0   # набора ещё нет - sync-lists.sh не запускался
+
+# Раз в минуту этот скрипт не должен мешать идущей синхронизации (sync-lists.sh пересобирает
+# skipa-allow через swap): занято - просто пропускаем такт, следующий через минуту.
+acquire_ipset_lock 5 || exit 0
 
 # Запас до maxelem (4096): не даём вечным SSH-сканерам раздуть набор
 size="$(ipset list skipa-allow -terse 2>/dev/null | awk -F': ' '/^Number of entries/{print $2}')"

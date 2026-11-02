@@ -17,7 +17,9 @@
 #       ACTION_MODE PRIMARY_LIST_URL BLACKLIST_URL ACTIVE_LIST UPDATE_INTERVAL_DAYS
 #       LOG_DIR KERNEL_LOG_PREFIX ALERT_COOLDOWN_MINUTES IGNORE_IPS (через пробел)
 #       LOG_LIMIT LOG_BURST SKIP_DOCKER SKIP_K8S MIN_PREFIX ALLOW_INSECURE_HTTP
-#       AUTO_ALLOWLIST SSH_PORTS (через пробел)
+#       AUTO_ALLOWLIST SSH_PORTS (через пробел) MIN_ENTRIES KEEP_ESTABLISHED
+#   yaml_extra_sources <config.yaml>          sources.extra: по записи на строку, поля через \037:
+#                                             name type url enabled api_key min_confidence min_entries display_name
 #   ssh_peers <порт>...                       IPv4-адреса, с которых сейчас открыты
 #                                             SSH-сессии на этих портах (по одному в строке)
 
@@ -124,6 +126,11 @@ load_service_config() {
     [ "$MIN_PREFIX" -lt 8 ] && MIN_PREFIX=8
     [ "$MIN_PREFIX" -gt 32 ] && MIN_PREFIX=32
     ALLOW_INSECURE_HTTP="$(yaml_get "$file" sources.allow_insecure_http)"; ALLOW_INSECURE_HTTP="${ALLOW_INSECURE_HTTP:-false}"
+    # минимум записей в источнике при ПЕРВОЙ загрузке (когда сравнить с прошлой копией нечем)
+    MIN_ENTRIES="$(yaml_get "$file" sources.min_entries)";               MIN_ENTRIES="${MIN_ENTRIES:-10}"
+    [[ "$MIN_ENTRIES" =~ ^[0-9]+$ ]] || MIN_ENTRIES=10
+    # не трогать установленные TCP-сессии (блокировать только новые соединения и не-TCP)
+    KEEP_ESTABLISHED="$(yaml_get "$file" firewall.keep_established_tcp)"; KEEP_ESTABLISHED="${KEEP_ESTABLISHED:-false}"
     AUTO_ALLOWLIST="$(yaml_get "$file" monitoring.auto_allowlist)";      AUTO_ALLOWLIST="${AUTO_ALLOWLIST:-true}"
     SSH_PORTS="$(yaml_list "$file" monitoring.ssh_ports | grep -E '^[0-9]+$' | tr '\n' ' ' | sed 's/ *$//')"
     SSH_PORTS="${SSH_PORTS:-22}"
@@ -132,7 +139,7 @@ load_service_config() {
     v="$(yaml_get "$file" environment.k8s_scan)";    [ "$v" = "false" ] && SKIP_K8S=1
     export ACTION_MODE PRIMARY_LIST_URL BLACKLIST_URL ACTIVE_LIST UPDATE_INTERVAL_DAYS LOG_DIR \
         KERNEL_LOG_PREFIX ALERT_COOLDOWN_MINUTES IGNORE_IPS LOG_LIMIT LOG_BURST SKIP_DOCKER SKIP_K8S \
-        MIN_PREFIX ALLOW_INSECURE_HTTP AUTO_ALLOWLIST SSH_PORTS
+        MIN_PREFIX ALLOW_INSECURE_HTTP AUTO_ALLOWLIST SSH_PORTS MIN_ENTRIES KEEP_ESTABLISHED
 }
 
 # IPv4-адреса администраторов с живыми SSH-сессиями: их нельзя блокировать, даже если
@@ -146,4 +153,71 @@ ssh_peers() {
     done | awk '
         { peer = $4; sub(/:[0-9]+$/, "", peer); gsub(/[\[\]]/, "", peer); sub(/^::ffff:/, "", peer)
           if (peer ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print peer }' | sort -u
+}
+
+# sources.extra: список источников (Spamhaus DROP, FireHOL, AbuseIPDB...). Читается тем же
+# config.yaml, что и у бота, без Python и без YAML-библиотек: поддерживаются блочные
+# элементы ("- name: x" + ключи ниже) и однострочные ("- {name: x, url: y}").
+# Вывод - по записи на источник, поля через \037 (в порядке):
+#   name type url enabled api_key min_confidence min_entries display_name
+# enabled: true, если ключа нет (как у бота); false/no/off/0 - выключен.
+yaml_extra_sources() {
+    awk '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    function unq(v,    q, rest, e) {
+        v = trim(v); q = substr(v, 1, 1)
+        if (q == "\"" || q == "\047") {
+            rest = substr(v, 2); e = index(rest, q)
+            return e ? substr(rest, 1, e - 1) : rest
+        }
+        sub(/[ \t]+#.*$/, "", v)
+        return trim(v)
+    }
+    function setkv(kv,    p, k) {
+        p = index(kv, ":"); if (!p) return
+        k = trim(substr(kv, 1, p - 1))
+        cur[k] = unq(substr(kv, p + 1)); seen[k] = 1
+    }
+    function flow(s,    i, c, q, part, n) {      # {a: 1, b: "x,y"} - запятые внутри кавычек не делят
+        s = trim(s); sub(/^\{/, "", s); sub(/\}[ \t]*(#.*)?$/, "", s)
+        part = ""; q = ""
+        n = length(s)
+        for (i = 1; i <= n; i++) {
+            c = substr(s, i, 1)
+            if (q != "") { part = part c; if (c == q) q = ""; continue }
+            if (c == "\"" || c == "\047") { q = c; part = part c; continue }
+            if (c == ",") { setkv(part); part = ""; continue }
+            part = part c
+        }
+        if (trim(part) != "") setkv(part)
+    }
+    function flush(    en) {
+        if (!active) return
+        en = ("enabled" in seen) ? tolower(cur["enabled"]) : "true"
+        en = (en == "false" || en == "no" || en == "off" || en == "0") ? "false" : "true"
+        printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n", cur["name"], cur["type"], cur["url"], en, \
+            cur["api_key"], cur["min_confidence"], cur["min_entries"], cur["display_name"]
+        split("", cur); split("", seen); active = 0
+    }
+    { line = $0; sub(/\r$/, "", line) }
+    line ~ /^[ \t]*(#.*)?$/ { next }
+    {
+        match(line, /^ */); ind = RLENGTH; body = substr(line, ind + 1)
+    }
+    ind == 0 { flush(); insrc = (body ~ /^sources:/); inextra = 0; next }
+    !insrc { next }
+    !inextra {
+        if (body ~ /^extra:[ \t]*(#.*)?$/) { inextra = 1; extra_ind = ind }
+        next
+    }
+    body ~ /^-([ \t]|$)/ {
+        flush(); active = 1
+        rest = trim(substr(body, 2))
+        if (substr(rest, 1, 1) == "{") flow(rest); else if (rest != "") setkv(rest)
+        next
+    }
+    ind <= extra_ind { flush(); inextra = 0; next }
+    active { setkv(body) }
+    END { flush() }
+    ' "$1"
 }

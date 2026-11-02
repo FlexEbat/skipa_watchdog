@@ -518,6 +518,7 @@ def _configure_blocker(config: Config) -> None:
         auto_timeout_s=config.auto_block_timeout_s,
         skip_docker=not config.docker_scan_enabled,
         skip_k8s=not config.k8s_scan_enabled,
+        keep_established=config.keep_established_tcp,
     )
 
 
@@ -600,6 +601,7 @@ async def async_main() -> None:
         new_db = await fetch_threat_db(
             config.primary_list_url, config.blacklist_url, config.blacklist_name,
             config.active_list, previous=db, extra_sources=config.extra_sources,
+            min_entries=config.min_list_entries,
         )
         if has_data(new_db):
             db = new_db

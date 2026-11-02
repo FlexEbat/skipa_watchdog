@@ -234,6 +234,9 @@ class _BashStubs(unittest.TestCase):
         shutil.copy(ROOT / "config.example.yaml", self.cfg)
         text = self.cfg.read_text(encoding="utf-8")
         text = text.replace("/var/log/skipa_watchdog", str(self.d / "log"))
+        # эти тесты проверяют разбор и фильтры на коротких списках; порог первой загрузки
+        # (min_entries) проверяется отдельно в test_service_boot.py
+        text = text.replace("min_entries: 10", "min_entries: 1")
         self.cfg.write_text(text, encoding="utf-8")
         self._fake("curl", 'echo "$@" >> "$OUT/curl-args"\ncat "$OUT/list.txt"')
         self._fake("ss", 'cat "$OUT/ss.txt" 2>/dev/null; true')

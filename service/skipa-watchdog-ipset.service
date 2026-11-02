@@ -1,0 +1,29 @@
+[Unit]
+Description=Skipa Watchdog (service mode) - restore ipset sets after boot, before the firewall is loaded
+# Ранний юнит без стандартных зависимостей: наборы должны появиться ДО того, как
+# netfilter-persistent загрузит сохранённые правила со ссылками на skipa-*. Если пакета
+# netfilter-persistent нет, Before= на него просто ни на что не влияет.
+DefaultDependencies=no
+After=local-fs.target systemd-modules-load.service
+Before=netfilter-persistent.service network-pre.target shutdown.target
+Conflicts=shutdown.target
+# Docker/kubelet здесь НЕЛЬЗЯ упоминать: netfilter-persistent идёт до network-pre.target, а Docker -
+# после network-online.target, так что After=docker.service вместе с Before=netfilter-persistent
+# даёт цикл упорядочивания. Правила, которым нужен Docker, ставит skipa-watchdog-rules.service.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/env bash /opt/skipa_watchdog/service/boot.sh sets /opt/skipa_watchdog/config.yaml
+
+# Ограничения без собственного пространства имён монтирования: юнит стартует на раннем этапе
+# загрузки (ProtectSystem/PrivateTmp здесь только добавили бы риск), а root-скрипту нужны netlink и /var/lib.
+NoNewPrivileges=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

@@ -14,8 +14,8 @@ works on the host and for services published through Docker and Kubernetes.
   at its first packet.
 - **One config.** Both installation variants read the same `config.yaml`.
 - **Telegram is optional.** Without it everything works through local logs.
-- **Self-healing.** After a reboot, a Docker restart or `ufw reload`, the rules come back
-  on their own (in the Telegram variant).
+- **Self-healing.** After a reboot the rules and ipset sets (including manual blocks) come back
+  on their own in both variants; a Docker restart or `ufw reload` is repaired by the Telegram variant.
 - **Self-lockout protection.** Service networks and your own SSH sessions cannot be blocked.
 
 ## Table of contents
@@ -43,7 +43,8 @@ works on the host and for services published through Docker and Kubernetes.
 | Blocking | in the kernel, list refreshed by a systemd timer | in the kernel, the process refreshes and repairs rules itself |
 | Notifications | entries in `detections.log` | `detections.log` and Telegram messages |
 | "Ban" button, charts in `/stats`, dashboard, health-check | no | yes |
-| Extra sources (`sources.extra`) | no | yes |
+| Extra sources (`sources.extra`: `cidr_list`, `abuseipdb`) | yes | yes |
+| Protection after a reboot | units `skipa-watchdog-ipset` and `skipa-watchdog-rules` | process + `skipa-watchdog-fw-rules` |
 
 You can start with the first variant and add Telegram later from the menu. Switching back
 to plain bash is not possible: uninstall and install again.
@@ -68,7 +69,7 @@ way to invoke them differs. Edits to `config.yaml` from any of them go through t
 | Project update check | on every menu launch, item 12 | on service start: an "Install" button, `/version` | a log line; install from the panel |
 
 Python-only by nature: the `/testalert` test notification, the `/pending` queue, the "Ban"
-button in alerts, the dashboard, extra sources, time-limited auto-blocking.
+button in alerts, the dashboard, time-limited auto- and manual blocking.
 
 ## Quick start
 
@@ -181,6 +182,8 @@ marked in the last column.
 | `sources.min_prefix` | `20` | widest network accepted from lists (prefix length); use `16` for Spamhaus DROP | yes |
 | `sources.allow_insecure_http` | `false` | allow downloading lists over plain http (https only by default) | yes |
 | `updates.check_on_start` | `true` | check for project updates when the panel and the service start | yes |
+| `sources.min_entries` | `10` | minimum entries a source must return on its FIRST download (protects against a three-line "garbage" list); lower it for a genuinely tiny custom list | yes |
+| `firewall.keep_established_tcp` | `false` | do not cut established TCP sessions: block only new TCP connections (SYN) and all non-TCP traffic. Caution: a scanner that already opened a session keeps working within it. Implemented as a pair of DROP rules, not `RETURN` (in the built-in `INPUT`/`DOCKER-USER` it would skip the host's remaining rules). Re-apply the rules after changing it | yes |
 | `sources.extra` | empty | additional sources | no |
 | `monitoring.method` | `both` | `poll`, `kernel_log`, `both` | no |
 | `monitoring.ignore_ips` | empty | addresses that are never blocked | yes |
@@ -277,10 +280,13 @@ AS64500 / Example Hosting GmbH
 
 ## Additional features
 
-Available in the Telegram variant and enabled in `config.yaml`.
+Enabled in `config.yaml`. Extra sources work in both variants, the rest in the Telegram variant.
 
-- **Extra sources** (`sources.extra`): Spamhaus DROP, FireHOL, AbuseIPDB or your own list.
-  Each is shown in the alert under its own name.
+- **Extra sources** (`sources.extra`): Spamhaus DROP, FireHOL, AbuseIPDB or your own list
+  (in both variants; types `cidr_list` and `abuseipdb`, fields `min_entries`/`min_confidence`).
+  In the Telegram variant each is shown in the alert under its own name. `#` and `;` comments
+  (Spamhaus format) are supported. IPv4 only: IPv6 entries from sources are skipped, but are
+  now written to the log (`... IPv6 entries skipped`).
 - **Ban by button** (`banning.enabled`): a "🚫 Забанить" (Ban) button appears under the alert
   (duration `manual_ban_duration_minutes`). `auto_ban_new_hits` bans every detected IP
   automatically, `fail2ban_jail` duplicates the ban in fail2ban. History is written to
@@ -308,10 +314,31 @@ Available in the Telegram variant and enabled in `config.yaml`.
 
 **Reboot and rules.** The Telegram variant checks and repairs the jumps and ipset itself
 every `monitoring.guard_interval_seconds` (60 s); the `skipa-watchdog-fw-rules.service` unit
-is installed as well. In the "service only" variant, `skipa-watchdog-sync-lists.timer`
-refills the ipset 10 minutes after boot and then on a schedule, while `iptables` rules must
-be persisted by the system (`iptables-persistent`) or restored by running
-`sudo bash install.sh fw-rules` after a reboot.
+is installed as well.
+
+In the "service only" variant ipset sets and rules live only in kernel memory, so they are saved
+and brought back at boot (`/var/lib/skipa_watchdog/ipsets.save`, refreshed after every sync and
+every manual block/unblock):
+
+- `skipa-watchdog-ipset.service` - early, before `netfilter-persistent`: restores the sets (or
+  creates empty ones if there is no file). This matters: if the server has saved rules that
+  reference `skipa-*` and the sets do not exist yet, `iptables-restore` rejects the whole rules
+  file, leaving the server with no firewall at all;
+- `skipa-watchdog-rules.service` - later, after Docker and kubelet (they provide the
+  `DOCKER-USER` and `KUBE-*` chains): applies the rules and verifies the result;
+- `skipa-watchdog-sync-lists.timer` refreshes the lists 10 minutes after boot and then on a schedule.
+
+It cannot be a single unit: `After=docker.service` together with
+`Before=netfilter-persistent.service` forms an ordering cycle (`netfilter-persistent` runs before
+`network-pre.target`, Docker after `network-online.target`), and systemd would break it by
+deleting an arbitrary job.
+
+All operations on the sets (timer, menu item 9, `blockctl.sh`, applying rules, boot) run under a
+single `flock` (`/var/lib/skipa_watchdog/ipset.lock)`, so they never overlap. After applying the
+rules the script verifies that the sets exist and that `INPUT`, `DOCKER-USER` and `KUBE-*` carry
+the rules, and prints the outcome (`✓`/`✗`); menu item 1 shows the same.
+In the Telegram variant, if you persist rules yourself with `netfilter-persistent save`, note that
+the process creates the sets on start: saved rules that reference `skipa-*` cannot load before it.
 
 **Manual blocking.** From the menu (item 6), with `/block` in Telegram, or with
 `sudo bash /opt/skipa_watchdog/service/blockctl.sh {block|unblock|list} [ip]`.
@@ -380,12 +407,16 @@ is picked up within a minute.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t .     # 80+ tests, no root needed
+python3 -m unittest discover -s tests -t .     # 200+ tests, no root needed
 shellcheck -S warning service/*.sh install-firewall-rules.sh
 ```
 
-The tests replace `iptables` and `ipset` with fakes ([`tests/fakes.py`](tests/fakes.py)); CI
-runs them on Python 3.10–3.13 together with `bash -n` and `shellcheck`.
+The tests replace `iptables` and `ipset` with fakes ([`tests/fakes.py`](tests/fakes.py),
+[`tests/netfake.py`](tests/netfake.py)) and never touch the real firewall; CI runs them on
+Python 3.10–3.13 together with `bash -n` and `shellcheck`. An end-to-end scenario of the "service
+only" variant on real `ipset`/`iptables` (reboot, `iptables-restore`, flock) is opt-in because it
+changes the host's sets and rules: `SKIPA_REAL_NETFILTER_TESTS=1 python3 -m unittest
+tests.test_real_netfilter` as root in a disposable environment.
 
 Structure:
 

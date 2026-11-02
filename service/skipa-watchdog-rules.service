@@ -1,0 +1,27 @@
+[Unit]
+Description=Skipa Watchdog (service mode) - apply iptables rules after boot (INPUT + DOCKER-USER + KUBE-*)
+# Наборы к этому моменту уже восстановлены. Wants (а не Requires): без наборов правила
+# всё равно можно поставить - boot.sh создаст пустые.
+Wants=skipa-watchdog-ipset.service
+After=skipa-watchdog-ipset.service
+# DOCKER-USER и KUBE-* пересоздаются при старте Docker/kubelet - правила ставим после них.
+# Только упорядочивание, без Wants: хост, где Docker установлен, но выключен, не запустит его
+# из-за нашего юнита (на серверах без Docker/k8s эти After= ни на что не влияют).
+After=docker.service kubelet.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/env bash /opt/skipa_watchdog/service/boot.sh rules /opt/skipa_watchdog/config.yaml
+
+# Ограничения без собственного пространства имён монтирования: юнит стартует на раннем этапе
+# загрузки (ProtectSystem/PrivateTmp здесь только добавили бы риск), а root-скрипту нужны netlink и /var/lib.
+NoNewPrivileges=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

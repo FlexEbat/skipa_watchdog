@@ -59,9 +59,6 @@ class RealTrafficScenarios(unittest.TestCase):
         """только сервис: по умолчанию рвётся всё, с опцией живёт установленная TCP-сессия"""
         self._run("e2e_traffic_bash_real.sh", 12)
 
-    def test_python_keep_established_tcp(self):
-        """вариант с Python: то же поведение через bot.blocker"""
-        self._run("e2e_traffic_python_real.sh", 6)
 
 
 if __name__ == "__main__":

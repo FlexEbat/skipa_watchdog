@@ -462,27 +462,6 @@ class InstallWiringTests(unittest.TestCase):
             self.assertIn(needle, self.text, needle)
         self.assertGreaterEqual(self.text.count("$SETS_UNIT"), 5)
 
-    @unittest.skipUnless(HAVE, "нужен bash")
-    def test_проверка_правил_варианта_с_ботом(self):
-        """_verify_bot_firewall_rules: ✓ при наличии перехода в SKIPA-BLOCK, ✗ и код 1 без него"""
-        d = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, d, True)
-        bindir = d / "bin"
-        netfake.install(bindir)
-        env = netfake.env_for(dict(os.environ), d, bindir)
-        env.update(SKIPA_SOURCE_ONLY="1", SKIPA_INSTALL_DIR=str(d / "inst"))
-        (d / "ipt").mkdir()
-        (d / "ipt" / "state.json").write_text(json.dumps({"INPUT": [], "SKIPA-BLOCK": []}), encoding="utf-8")
-        script = f'source "{ROOT / "install.sh"}"; _verify_bot_firewall_rules; echo "rc=$?"'
-        bad = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
-        self.assertIn("✗ в INPUT НЕТ перехода", bad.stdout)
-        self.assertIn("rc=1", bad.stdout)
-        (d / "ipt" / "state.json").write_text(json.dumps({"INPUT": ["-j SKIPA-BLOCK"], "SKIPA-BLOCK": []}), encoding="utf-8")
-        good = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
-        self.assertIn("✓ INPUT -> SKIPA-BLOCK", good.stdout)
-        self.assertIn("rc=0", good.stdout)
-
-
 if __name__ == "__main__":
     unittest.main()
 

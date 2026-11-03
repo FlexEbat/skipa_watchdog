@@ -26,7 +26,7 @@ class LibConfigTests(unittest.TestCase):
         self.cfg = self.d / "config.yaml"
         shutil.copy(ROOT / "config.example.yaml", self.cfg)
 
-    def test_values_match_python_view_of_the_same_file(self):
+    def test_values_match_yaml_view_of_the_same_file(self):
         """bash и Python читают из config.yaml одинаковые значения"""
         data = yaml.safe_load(self.cfg.read_text())
         out = sh(
@@ -46,7 +46,7 @@ class LibConfigTests(unittest.TestCase):
         self.assertEqual(int(out[8]), data["firewall"]["log_burst"])
         self.assertEqual(out[9], data["logging"]["log_dir"])
 
-    def test_set_changes_only_target_and_python_sees_it(self):
+    def test_set_changes_only_target_and_yaml_sees_it(self):
         """запись меняет только целевой ключ"""
         before = yaml.safe_load(self.cfg.read_text())
         sh('yaml_set config.yaml sources.active_list list1\nyaml_set config.yaml action.mode notify', self.d)

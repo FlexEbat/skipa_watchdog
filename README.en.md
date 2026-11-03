@@ -6,92 +6,55 @@
 [![license: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 [![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/FlexEbat/badge.svg)](https://hub.xerj.org/contributors/FlexEbat)
 
-Skipa Watchdog detects connections to your server from known scanners (CyberOK/Skipa,
-GRChTs, NKTsKI and additional lists), blocks them and/or sends a notification. Protection
-works on the host and for services published through Docker and Kubernetes.
+Skipa Watchdog blocks connections from known scanners (CyberOK/Skipa, GRCHTs, NKTsKI and extra lists) on
+your server and, optionally, notifies you in Telegram or Matrix. Protection covers the host and services
+published through Docker and Kubernetes.
 
-- **Kernel-level blocking.** The whole list is loaded into `ipset`, so a scanner is cut off
-  at its first packet.
-- **One config.** Both installation variants read the same `config.yaml`.
-- **Telegram is optional.** Without it everything works through local logs.
-- **Self-healing.** After a reboot the rules and ipset sets (including saved blocks) come back
-  on their own in both variants; a Docker restart or `ufw reload` is repaired by the Telegram variant.
+- **Blocking in the kernel.** The lists are loaded into `ipset`, and a scanner is dropped on its first
+  packet. There is no long-running process for blocking.
+- **Bash only.** `iptables`, `ipset`, `curl`, `systemd`. Python is needed neither to install nor to run.
+- **Fully automatic.** The list refreshes on a timer and blocking happens by itself; there is no manual
+  block or unblock. The only manual lever is the allowlist.
+- **Optional notifications.** Telegram and/or Matrix, one message per wave of scans. Without them the local
+  logs still work.
+- **Self-healing.** After a reboot the ipset sets and rules come back on their own.
 - **Self-lockout protection.** Service networks and your own SSH sessions cannot be blocked.
 
-## Table of contents
+## Contents
 
-- [Installation options](#installation-options)
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
 - [Self-lockout protection](#self-lockout-protection)
 - [Docker and Kubernetes](#docker-and-kubernetes)
-- [Telegram](#telegram)
-- [Additional features](#additional-features)
+- [Notifications: Telegram and Matrix](#notifications-telegram-and-matrix)
+- [Extra sources](#extra-sources)
 - [Operations](#operations)
+- [Upgrading from the Python bot](#upgrading-from-the-python-bot)
 - [Security](#security)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
-- [License](#license)
-
-## Installation options
-
-| | Service only | Service + Telegram |
-| --- | --- | --- |
-| Implementation | bash, `iptables`, `ipset` | `watchdog.py` (Python 3.10+), venv |
-| Python | not needed | required |
-| Blocking | in the kernel, list refreshed by a systemd timer | in the kernel, the process refreshes and repairs rules itself |
-| Notifications | entries in `detections.log` | `detections.log` and Telegram messages |
-| "Ban" button, charts in `/stats`, dashboard, health-check | no | yes |
-| Extra sources (`sources.extra`: `cidr_list`, `abuseipdb`) | yes | yes |
-| Protection after a reboot | units `skipa-watchdog-ipset` and `skipa-watchdog-rules` | process + `skipa-watchdog-fw-rules` |
-
-You can start with the first variant and add Telegram later from the menu (item 4). Switching works
-both ways on the fly, with no reinstall and no gap in protection: to go from the bot back to plain
-bash use item 4 → "Switch to service only". Permanent manual blocks are carried over, `config.yaml`
-(Telegram settings included) and `data/` stay, and the venv can be removed.
-
-### What is available where
-
-The panel (`sudo skipa-watchdog`), the bot and the service scripts do the same things; only the
-way to invoke them differs. Edits to `config.yaml` from any of them go through the same code
-(`service/confctl.sh`).
-
-| Feature | Panel | Bot | Service without Python |
-| --- | --- | --- | --- |
-| Status, health check | item 1, `install.sh status` | `/status` | item 1, `install.sh status` |
-| Update the IP database | item 9 | `/update` | item 9, `sync-lists` timer |
-| Block / unblock | item 6 (for N hours or permanent) | `/block <ip> [hours]`, `/unblock` | none: blocking is fully automatic, exceptions via the allowlist |
-| List of blocks | item 6 | `/blocklist` | item 6, `blockctl.sh list` |
-| Allowlist | item 7 | `/allowlist`, `/allow`, `/unallow` | item 7, `blockctl.sh allow\|unallow\|allowlist` |
-| Action mode, list source, method | item 3 | `/settings` | item 3 |
-| Detection statistics | item 8, `install.sh stats` | `/stats` (with a chart), `/export` | item 8, `service/stats.sh` |
-| Logs | item 10 | `/logs [lines]` | item 10 |
-| Docker/Kubernetes | item 5 | `/env` | item 5 |
-| Project update check | on every menu launch, item 12 | on service start: an "Install" button, `/version` | a log line; install from the panel |
-
-Python-only by nature: the `/testalert` test notification, the `/pending` queue, the "Ban"
-button in alerts, the dashboard, time-limited auto-blocking and manual block/unblock (in the service-only
-variant everything is automatic, there is no manual blocking).
 
 ## Quick start
 
-Requires root and `git` (`install.sh` installs it if missing).
+You need root and `git` (`install.sh` installs it, plus `iptables`, `ipset` and `curl`, if missing).
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/FlexEbat/skipa_watchdog/main/install.sh -o install.sh
 sudo bash install.sh
 ```
 
-The installer shows a description, asks which variant you want and applies the `iptables`
-rules. The code is installed to `/opt/skipa_watchdog`, logs go to `/var/log/skipa_watchdog`.
-After that, manage everything with:
+The installer shows a description, downloads the lists, builds the `ipset` and applies the `iptables`
+rules. The code goes to `/opt/skipa_watchdog`, logs go to `/var/log/skipa_watchdog`. Then manage it with:
 
 ```bash
 sudo skipa-watchdog
 ```
 
-On every launch the menu checks whether a new project version is out and offers to install it.
+Menu items: 1 health check, 2 service management, 3 detection settings, 4 notifications, 5 Docker/Kubernetes,
+6 blocked IPs (view only), 7 allowlist, 8 statistics, 9 update the database, 10 logs, 11 edit the config,
+12 update the project, 13 uninstall. On every launch the menu checks whether a new version is out and offers
+to install it.
 
 Without the menu:
 
@@ -100,35 +63,22 @@ sudo bash install.sh install       # install or update
 sudo bash install.sh status        # short status
 sudo bash install.sh fw-rules      # apply Docker/Kubernetes rules
 sudo bash install.sh check-lists   # check for new list versions
-sudo bash install.sh uninstall     # uninstall (offers to remove rules and ipsets)
+sudo bash install.sh test-notify   # send a test message to Telegram/Matrix
+sudo bash install.sh stats [days]  # detection statistics
+sudo bash install.sh uninstall     # remove (offers to drop rules and ipsets)
 ```
 
-**Right after installation, add your own SSH IP** to `monitoring.ignore_ips` in
-`/opt/skipa_watchdog/config.yaml` if it is static.
-
-> The installer menu and the bot's messages are currently in Russian.
+**Right after installing, add your SSH IP** to the allowlist (menu item 7) if it is static.
 
 <details>
-<summary>Manual installation, without install.sh</summary>
-
-Service only:
+<summary>Manual install without install.sh</summary>
 
 ```bash
 sudo apt install ipset curl
 cp config.example.yaml config.yaml && chmod 600 config.yaml
 sudo bash service/sync-lists.sh config.yaml          # fill the ipset
 sudo bash service/setup-ipset-rules.sh config.yaml   # iptables rules
-sudo bash service/notify-tail.sh config.yaml         # (optional) write detections.log
-```
-
-With Telegram:
-
-```bash
-python3 -m venv venv && . venv/bin/activate
-pip install -r requirements.txt -r requirements-telegram.txt
-cp config.example.yaml config.yaml && chmod 600 config.yaml   # fill in telegram.*
-sudo bash install-firewall-rules.sh
-python watchdog.py config.yaml
+sudo bash service/notify-tail.sh config.yaml         # (optional) detections.log and notifications
 ```
 
 </details>
@@ -136,170 +86,136 @@ python watchdog.py config.yaml
 ## How it works
 
 ```
-IP lists ──► database (cache data/ip_cache.json) ──► ipset skipa-db ──► kernel-level drop
-                      │
- poll (/proc/net/tcp, conntrack) ─┐
-                                  ├─► match ─► block + detections.log + Telegram
- kernel_log (LOG rule) ───────────┘            (what exactly happens is set by action.mode)
+IP lists ──► sync-lists.sh (timer) ──► ipset skipa-scanners ──► DROP in the kernel (INPUT, DOCKER-USER, KUBE-*)
+                                                  │
+                                 LOG rule ──► kernel log ──► notify-tail.sh ──► detections.log
+                                                                           └──► Telegram / Matrix
 ```
 
-**Detection** (`monitoring.method`):
+**Blocking.** `iptables` rules match the source address against `ipset` sets: `skipa-scanners` (the lists),
+`skipa-manual` (permanent blocks carried over from an older version) and `skipa-allow` (the allowlist). The
+kernel decides everything; no userspace process is involved in blocking.
 
-| method | how | what it sees |
-| --- | --- | --- |
-| `poll` | reads `/proc/net/tcp` and kernel conntrack every `poll_interval_seconds` | incoming connections, traffic to Docker container ports, short scans |
-| `kernel_log` | reads the kernel log that the iptables LOG rule writes to | every first packet from a scanner, instantly |
-| `both` (default) | both | everything above |
+**Detection and notifications.** A LOG rule writes a scanner's first packet to the kernel log, and
+`skipa-watchdog-notify.service` reads it (`journalctl -k`), writes `detections.log` and sends the
+notification. The same IP is not logged or sent more often than once per `alert_cooldown_minutes`.
 
-**Blocking.** Rules live in a dedicated `SKIPA-BLOCK` chain, which `INPUT`, `DOCKER-USER`
-and `KUBE-*` jump to. If `ipset` is installed, the whole database is loaded into the
-`skipa-db` set, dynamic blocks (with a timeout) go to `skipa-dyn`, and your own addresses to
-`skipa-allow`. Without `ipset`, a separate `DROP` rule is created for every IP.
+**Action modes** (`action.mode`, menu item 3):
 
-**Action modes** (`action.mode`):
-
-| mode | blocking | notification |
+| mode | blocking | logging and notifications |
 | --- | --- | --- |
 | `block_notify` (default) | yes | yes |
-| `block` | yes | log entry only |
+| `block` | yes | no (the `notify` daemon is not started) |
 | `notify` | no | yes |
 
 ## Configuration
 
-A single `config.yaml` file (template: [`config.example.yaml`](config.example.yaml), every
-parameter is described there in comments). The "service only" variant reads a subset of it,
-marked in the last column.
+A single `config.yaml` (template: [`config.example.yaml`](config.example.yaml), every option is documented
+in comments). The easiest way to change it is the menu; after editing by hand, apply the changes (menu item
+11 offers to do it).
 
-| key | default | purpose | bash |
-| --- | --- | --- | --- |
-| `action.mode` | `block_notify` | action mode | yes |
-| `action.block_timeout_hours` | `72` | auto-block duration, `0` — permanent | no |
-| `action.preload_db` | `true` | preload the whole database into ipset | no |
-| `sources.active_list` | `merged` | which lists to use: `list1`, `list2`, `merged` | yes |
-| `sources.primary_list_url` / `blacklist_url` | see template | list URLs | yes |
-| `sources.update_interval_days` | `7` | how often to refresh the database | yes |
-| `sources.min_prefix` | `20` | widest network accepted from lists (prefix length); use `16` for Spamhaus DROP | yes |
-| `sources.allow_insecure_http` | `false` | allow downloading lists over plain http (https only by default) | yes |
-| `updates.check_on_start` | `true` | check for project updates when the panel and the service start | yes |
-| `sources.min_entries` | `10` | minimum entries a source must return on its FIRST download (protects against a three-line "garbage" list); lower it for a genuinely tiny custom list | yes |
-| `firewall.keep_established_tcp` | `false` | do not cut established TCP sessions: block only new TCP connections (SYN) and all non-TCP traffic. Caution: a scanner that already opened a session keeps working within it. Implemented as a pair of DROP rules, not `RETURN` (in the built-in `INPUT`/`DOCKER-USER` it would skip the host's remaining rules). Re-apply the rules after changing it | yes |
-| `sources.extra` | empty | additional sources | no |
-| `monitoring.method` | `both` | `poll`, `kernel_log`, `both` | no |
-| `monitoring.ignore_ips` | empty | addresses that are never blocked | yes |
-| `monitoring.alert_cooldown_minutes` | `60` | don't log the same IP more often than this | yes |
-| `monitoring.use_conntrack` | `true` | `poll` also reads conntrack | no |
-| `monitoring.auto_allowlist` | `true` | don't block IPs of current SSH sessions | no |
-| `telegram.bot_token`, `chat_id`, `admin_ids` | empty | Telegram connection | no |
-| `firewall.log_limit`, `log_burst` | `30/second`, `40` | LOG rule rate limit | yes |
-| `logging.log_dir` | `/var/log/skipa_watchdog` | log directory | yes |
+| key | default | purpose |
+| --- | --- | --- |
+| `action.mode` | `block_notify` | action mode |
+| `sources.active_list` | `merged` | which lists to use: `list1`, `list2`, `merged` |
+| `sources.primary_list_url`, `blacklist_url` | see template | list URLs |
+| `sources.update_interval_days` | `7` | how often to refresh the database |
+| `sources.min_prefix` | `20` | widest network accepted from lists (prefix length); use `16` for Spamhaus DROP |
+| `sources.allow_insecure_http` | `false` | allow plain http list downloads (https only by default) |
+| `sources.min_entries` | `10` | minimum entries in a source on the FIRST download (guards against a three-line junk list) |
+| `sources.extra` | empty | extra sources |
+| `firewall.keep_established_tcp` | `false` | do not cut established TCP sessions: block only new TCP connections (SYN) and all non-TCP traffic. Careful: a scanner that already opened a session keeps working inside it. Re-apply rules after changing (item 5) |
+| `firewall.log_limit`, `log_burst` | `30/second`, `40` | LOG rule rate limit |
+| `monitoring.ignore_ips` | empty | addresses that are never blocked |
+| `monitoring.auto_allowlist`, `ssh_ports` | `true`, `[22]` | do not block IPs of current SSH sessions |
+| `monitoring.alert_cooldown_minutes` | `60` | do not repeat an entry for the same IP more often |
+| `monitoring.kernel_log_prefix` | `CONN: ` | LOG rule prefix in the kernel log |
+| `telegram.*`, `matrix.*` | empty | notification channels |
+| `notifications.batch_seconds`, `batch_max` | `30`, `20` | how long to collect messages and how many addresses to list |
+| `notifications.language` | `ru` | message text language: `ru` or `en` |
+| `environment.docker_scan`, `k8s_scan` | `true` | whether to attach rules to `DOCKER-USER` and `KUBE-*` |
+| `logging.log_dir` | `/var/log/skipa_watchdog` | log directory |
 
 Default sources:
 
 - **List 1** — [tread-lightly/CyberOK_Skipa_ips](https://github.com/tread-lightly/CyberOK_Skipa_ips)
-  (CyberOK/Skipa, GRChTs, NKTsKI).
-- **List 2** — blacklist by [sngvy](https://gist.github.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8)
+  (CyberOK/Skipa, GRCHTs, NKTsKI).
+- **List 2** — a blacklist by [sngvy](https://gist.github.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8)
   (CIDRs, ranges and single IPs; includes scanner networks such as Censys).
 
-Both are always downloaded; `active_list` selects which entries go into the database. If a
-source is unavailable or returns half as many entries as before, its previous version is
-used, and an incomplete database is rechecked after an hour. Networks wider than
-`sources.min_prefix` (`/20` by default) are discarded, and a source that covers more than ~4 million
-addresses in total is rejected, so an inflated third-party list cannot block half the internet.
-Lists are downloaded over https only; a redirect to http is refused.
-
-You can change settings from the menu (item 3: list source, action mode, detection method;
-item 11: edit the file) or by hand; after editing, apply the changes through the menu or with
-`sudo systemctl restart skipa-watchdog`.
+Both are always downloaded; `active_list` picks which entries go into the set. If a source is unreachable or
+returns half as many entries as before, its previous version is used. Networks wider than
+`sources.min_prefix` are dropped, and a source that covers more than ~4 million addresses in total is
+rejected, so a bloated third-party list cannot block half the internet. Lists are downloaded over https only
+and a redirect to http is refused. Entries like `1.2.3.0/24/junk` are discarded entirely.
 
 ## Self-lockout protection
 
-The lists are external and blocking is automatic, so the following can never be blocked:
+The lists are external and blocking is automatic, so these can never be blocked:
 
 - loopback, private networks (`10/8`, `172.16/12`, `192.168/16`) and link-local;
 - addresses from `monitoring.ignore_ips`;
-- IPs with open SSH sessions on `monitoring.ssh_ports` (`monitoring.auto_allowlist`); in the
-  "service only" variant `skipa-watchdog-allow-ssh.timer` adds them every minute;
-- networks shorter than `/16` (including `0.0.0.0/0`), IPv6, and anything that overlaps the
-  allowlist.
-
-The `poll` method only considers incoming connections: the server's own outgoing
-connections are never counted as scanners.
+- IPs with open SSH sessions on `monitoring.ssh_ports` (`monitoring.auto_allowlist`), added once a minute by
+  `skipa-watchdog-allow-ssh.timer`;
+- networks shorter than `/16` (including `0.0.0.0/0`), IPv6 and anything that overlaps the allowlist.
 
 ## Docker and Kubernetes
 
-Traffic to published container ports goes through the `FORWARD` chain, not `INPUT`.
-Therefore the jump to `SKIPA-BLOCK` is installed in `DOCKER-USER` and (if present) in
-`KUBE-EXTERNAL-SERVICES` and `KUBE-NODEPORTS`. The installer finds them itself; you can
-reapply the rules from the menu (item 5) or with `sudo bash install.sh fw-rules`. To
-disable these chains: `environment.docker_scan: false`, `environment.k8s_scan: false`.
+Traffic to published container ports goes through the `FORWARD` chain, not `INPUT`. So the rules are attached
+to `DOCKER-USER` and, if present, `KUBE-EXTERNAL-SERVICES` and `KUBE-NODEPORTS`. The installer finds them on
+its own; re-apply the rules from the menu (item 5) or with `sudo bash install.sh fw-rules`. To turn the
+chains off: `environment.docker_scan: false`, `environment.k8s_scan: false`.
 
-Such traffic is not visible in the host's `/proc/net/tcp`, so `poll` reads kernel conntrack
-(root required), and `kernel_log` works through a LOG rule on `DOCKER-USER`.
+## Notifications: Telegram and Matrix
 
-## Telegram
+Notifications are send-only: there are no chat commands, no bot to manage, and no Python. Everything is done
+by `curl` from bash. Set up with menu item 4 (tokens are typed without echo and format-checked before they
+are written to `config.yaml`) and verify with `sudo bash install.sh test-notify`.
 
-Enable it from the menu (item 4) or in `config.yaml`: `telegram.bot_token` (from
-[@BotFather](https://t.me/BotFather)), `chat_id` and `admin_ids`. An empty `admin_ids` means
-commands are accepted only in the private chat of the `chat_id` user; in a group they are closed until
-administrators are listed in `admin_ids`. If Telegram is not reachable directly,
-set `telegram.proxy` (`socks5://` requires `pip install "python-telegram-bot[socks]"`).
+**Telegram.** Create a bot with [@BotFather](https://t.me/BotFather), add it to a chat or channel and give
+the token and `chat_id` (negative for groups). If Telegram is not reachable directly, set `telegram.proxy`
+(`http://`, `https://`, `socks5://`, `socks5h://`).
 
-An unreachable Telegram does not stop protection: the layer starts in the background with
-retries, and unsent alerts wait in a queue (up to 500 items, up to a week).
+**Matrix.** You need the homeserver address (`https://matrix.example.org`; `http` is allowed only for
+localhost), an `access_token` of a user or bot, and a `room_id` like `!abc:example.org` (not a `#room`
+alias). The user must already be a member of the room.
 
-| command | action |
-| --- | --- |
-| `/menu`, `/status` | menu, database, rules and monitors state |
-| `/update` | update the database now |
-| `/blocklist` (`/banlist`) | list of blocks |
-| `/block <ip or network> [hours]` | block (permanent by default) |
-| `/unblock <ip>` (`/unban`) | unblock |
-| `/stats [days]`, `/export [days]` | statistics with a chart, and event export |
-| `/testalert [ip]` | test notification |
-| `/pending`, `/env` | queue of unsent alerts, Docker/Kubernetes environment |
-| `/allowlist`, `/allow <ip or network>`, `/unallow <ip or network>` | allowlist (`monitoring.ignore_ips`): applied immediately, written to `config.yaml` |
-| `/settings` | action mode, list source, detection method (with confirmation and a service restart) |
-| `/logs [lines]` | last lines of the log (the bot token is masked) |
-| `/version` | version and update check with an "Install" button |
+Both channels can be enabled at once. What is guaranteed:
 
-Example notification (values from documentation ranges, RFC 5737 and RFC 5398; the bot's
-message text is in Russian):
+- **One message per wave.** Detections are collected for `notifications.batch_seconds` (30 by default) and
+  sent as a list of up to `batch_max` addresses; the rest is a trailing "and N more" line.
+- **Queue with retries.** A message is first put in a queue (`/var/lib/skipa_watchdog/notify-spool`), one
+  file per channel. Network errors and 5xx responses are retried in order; on 429 the `retry_after` pause is
+  honoured (at most 60 s). If the server answers 400/401/403/404 (wrong token, chat or room) the message is
+  dropped with a line in `skipa-watchdog.log` instead of piling up forever. Messages older than a day and
+  anything beyond 200 files are dropped. Matrix gets the same `txnId` on a retry, so there are no duplicates.
+- **Secrets stay out of `ps`.** The URL with the token and the `Authorization` header are passed to `curl`
+  through stdin (`-K -`), not as arguments.
+- **Plain text.** No HTML or Markdown, so there is nothing to escape.
+
+Example message:
 
 ```
-🚨 УГРОЗА. СКАНЕР ОБНАРУЖЕН - IP
-
-IP: 203.0.113.42
-▢ MaxMind & IPinfo & Cloudflare:
-🇩🇪 DE Germany, Bavaria, Example City
-AS64500 / Example Hosting GmbH
-База: Skipa | Совпадение: 203.0.113.0/24
-
-🚫 IP заблокирован.
+Skipa Watchdog @ my-server
+Scanners detected: 3 (blocked by the kernel)
+• 203.0.113.42  TCP/22
+• 203.0.113.43  TCP/443
+• 198.51.100.7  UDP/3478
 ```
 
-## Additional features
+The message text is Russian by default; set `notifications.language: "en"` for English. Notifications are sent by the `skipa-watchdog-notify` daemon,
+which runs only when `action.mode` includes notifying (`notify`, `block_notify`). If you enable a channel while
+the mode is `block`, the menu offers to switch to `block_notify`.
 
-Enabled in `config.yaml`. Extra sources work in both variants, the rest in the Telegram variant.
+## Extra sources
 
-- **Extra sources** (`sources.extra`): Spamhaus DROP, FireHOL, AbuseIPDB or your own list
-  (in both variants; types `cidr_list` and `abuseipdb`, fields `min_entries`/`min_confidence`).
-  In the Telegram variant each is shown in the alert under its own name. `#` and `;` comments
-  (Spamhaus format) are supported. IPv4 only: IPv6 entries from sources are skipped, but are
-  now written to the log (`... IPv6 entries skipped`).
-- **Ban by button** (`banning.enabled`): a "🚫 Забанить" (Ban) button appears under the alert
-  (duration `manual_ban_duration_minutes`). `auto_ban_new_hits` bans every detected IP
-  automatically, `fail2ban_jail` duplicates the ban in fail2ban. History is written to
-  `data/bans.jsonl`. Alternative: the filter and jail in [`fail2ban/`](fail2ban), which ban
-  based on `detections.log`.
-- **Statistics** (`/stats`, `/export`, weekly digest `digest.*`): events are written to
-  `data/events.jsonl`. The chart is drawn by `matplotlib`
-  (`pip install -r requirements-extras.txt`); without it you get a text histogram.
-- **Dashboard** (`dashboard.enabled`): a page with database status, events, blocks and
-  monitor state. It listens on `127.0.0.1`; open it through an SSH tunnel:
-  `ssh -L 8080:localhost:8080 user@server`. Outside localhost, set `username`/`password`
-  (HTTP Basic Auth) and keep it behind a TLS proxy.
-- **Health-check** (`healthcheck.*`): if a monitor stays silent longer than
-  `stale_after_minutes`, you get a warning, and a message again when it recovers.
+`sources.extra` in `config.yaml`: Spamhaus DROP, FireHOL, AbuseIPDB or your own list. Types are `cidr_list`
+(a plain text list, comments with `#` and `;`) and `abuseipdb` (needs your own `api_key`, field
+`min_confidence`); each can set `min_entries`. They take part regardless of `active_list` as long as
+`enabled: true`. IPv4 only: IPv6 entries are skipped with a log line.
+
+Fail2ban can be used instead of kernel blocking: the filter and jail in [`fail2ban/`](fail2ban) ban based on
+`detections.log`.
 
 ## Operations
 
@@ -308,133 +224,126 @@ Enabled in `config.yaml`. Extra sources work in both variants, the rest in the T
 | what | where |
 | --- | --- |
 | detections | `/var/log/skipa_watchdog/detections.log` |
-| process | `/var/log/skipa_watchdog/skipa-watchdog.log`, `journalctl -u skipa-watchdog` |
-| lists and timer (service only) | `journalctl -u skipa-watchdog-sync-lists -u skipa-watchdog-notify` |
+| process, notification errors | `/var/log/skipa_watchdog/skipa-watchdog.log` |
+| list and daemon | `journalctl -u skipa-watchdog-sync-lists -u skipa-watchdog-notify` |
 
-**Reboot and rules.** The Telegram variant checks and repairs the jumps and ipset itself
-every `monitoring.guard_interval_seconds` (60 s); the `skipa-watchdog-fw-rules.service` unit
-is installed as well.
+Log rotation (`/etc/logrotate.d/skipa-watchdog`) is installed by the installer.
 
-In the "service only" variant ipset sets and rules live only in kernel memory, so they are saved
-and brought back at boot (`/var/lib/skipa_watchdog/ipsets.save`, refreshed after every sync and
-every allowlist change and every block carry-over on a mode switch):
+**Reboot and rules.** ipset sets and rules live only in kernel memory, so they are saved and restored at boot
+(`/var/lib/skipa_watchdog/ipsets.save`, updated after every sync and every allowlist change):
 
-- `skipa-watchdog-ipset.service` - early, before `netfilter-persistent`: restores the sets (or
-  creates empty ones if there is no file). This matters: if the server has saved rules that
-  reference `skipa-*` and the sets do not exist yet, `iptables-restore` rejects the whole rules
-  file, leaving the server with no firewall at all;
-- `skipa-watchdog-rules.service` - later, after Docker and kubelet (they provide the
-  `DOCKER-USER` and `KUBE-*` chains): applies the rules and verifies the result;
-- `skipa-watchdog-sync-lists.timer` refreshes the lists 10 minutes after boot and then on a schedule.
+- `skipa-watchdog-ipset.service` — early, before `netfilter-persistent`: restores the sets (or creates empty
+  ones if there is no file). This matters: if saved rules reference `skipa-*` while the sets do not exist
+  yet, `iptables-restore` rejects the whole rules file and the server is left without a firewall at all;
+- `skipa-watchdog-rules.service` — later, after Docker and kubelet (they need the `DOCKER-USER` and `KUBE-*`
+  chains): applies the rules and verifies the result;
+- `skipa-watchdog-sync-lists.timer` refreshes the lists 10 minutes after boot and then on schedule.
 
-It cannot be a single unit: `After=docker.service` together with
-`Before=netfilter-persistent.service` forms an ordering cycle (`netfilter-persistent` runs before
-`network-pre.target`, Docker after `network-online.target`), and systemd would break it by
-deleting an arbitrary job.
+A single unit will not do: `After=docker.service` together with `Before=netfilter-persistent.service` forms
+an ordering cycle, and systemd would break it by deleting a random job.
 
-All operations on the sets (timer, menu item 9, `blockctl.sh`, applying rules, boot) run under a
-single `flock` (`/var/lib/skipa_watchdog/ipset.lock)`, so they never overlap. After applying the
-rules the script verifies that the sets exist and that `INPUT`, `DOCKER-USER` and `KUBE-*` carry
-the rules, and prints the outcome (`✓`/`✗`); menu item 1 shows the same.
-In the Telegram variant, if you persist rules yourself with `netfilter-persistent save`, note that
-the process creates the sets on start: saved rules that reference `skipa-*` cannot load before it.
+All set operations (timer, menu item 9, `blockctl.sh`, rule application, boot) run under one `flock`
+(`/var/lib/skipa_watchdog/ipset.lock`), so they never overlap. After applying the rules the script verifies
+the sets exist and that rules are present in `INPUT`, `DOCKER-USER` and `KUBE-*`, and reports the result
+(`✓`/`✗`); menu item 1 shows the same.
 
-**Manual blocking** exists only in the Telegram variant: from the menu (item 6) or with `/block`.
-Those blocks are saved in `data/blocked_ips.json` and restored on start. In the service-only variant
-there is no manual block/unblock: everything is automatic (the kernel drops listed scanners, a timer
-refreshes the list), and an address is exempted via the allowlist (item 7 or
-`blockctl.sh allow <ip>`, which also lifts a block carried over on a mode switch).
+**Allowlist.** Menu item 7 or `sudo bash service/blockctl.sh allow|unallow|allowlist [ip]`: written to
+`config.yaml` and to the `ipset` immediately. There is no manual block or unblock: everything is automatic.
 
-**Switching mode.** Menu item 4. Service → service + bot: connect Telegram. Service + bot → service:
-the Python process stops, the bash units and `ipset` rules come up, and only then the `SKIPA-BLOCK`
-chain and the `skipa-dyn`/`skipa-db` sets are removed, so protection never lapses. Permanent blocks
-are carried over; time-limited ones (auto-blocks included) are not.
+**Units.** They run as root (they need `iptables`, `ipset` and the kernel log). systemd restrictions that do
+not get in the way are enabled: `NoNewPrivileges`, `PrivateTmp`, `PrivateDevices`, `ProtectSystem=full`,
+`RestrictNamespaces`, `RestrictAddressFamilies` and so on; the notification daemon additionally has
+`ProtectKernelModules`/`ProtectKernelTunables`. A strict sandbox is not used for the units that call
+`iptables`: it loads kernel modules, and the sandbox broke startup on some systems.
 
-**Service.** `skipa-watchdog.service` runs as root: it needs `iptables`, `ipset`, access to
-conntrack and write access to the install directory and logs. Only safe restrictions are enabled
-(`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`, `RestrictAddressFamilies`, etc.); a strict
-sandbox (`ProtectSystem=strict`, `ProtectKernelModules`) is not used: iptables loads kernel modules
-and it broke startup on some systems.
-
-**Updating.** On every launch the panel (`sudo skipa-watchdog`) checks whether a new version is out and offers to install it; declining is not permanent: a reminder stays in the menu header. When the service starts, the bot sends a message with an "Install" button to the chat (and `/version` on demand); without Telegram and in service-only mode a new version is noted in the log. `updates.check_on_start: false` turns the check off (`SKIPA_NO_UPDATE_CHECK=1` for a single run); `sudo bash install.sh check-update` checks without prompting (exit code 10 means an update is available). Manually: menu item 12 or `sudo bash install.sh install`. If `git pull` fails (the
-repository history changed), the installer offers to switch to the current version;
+**Updating.** On every launch of the panel (`sudo skipa-watchdog`) it checks whether a new version is out and
+offers to install it; declining is not permanent: a reminder stays in the menu header.
+`SKIPA_NO_UPDATE_CHECK=1` turns the check off once, `sudo bash install.sh check-update` checks without
+prompts (exit code 10 means an update is available). Manually: menu item 12 or `sudo bash install.sh install`.
+If `git pull` fails (the repository history changed), the installer offers to move to the current version:
 `config.yaml` and `data/` are not touched.
 
-**Uninstalling.** Menu item 13. The installer separately asks whether to remove the
-`iptables` rules and `ipset` sets.
+**Uninstalling.** Menu item 13. The installer separately asks whether to remove the `iptables` rules and
+`ipset` sets.
+
+## Upgrading from the Python bot
+
+Starting with 4.0 Python is gone from the project. If you had the "service + Telegram bot" variant, updating
+(`sudo skipa-watchdog` → item 12, or `sudo bash install.sh install`) moves it to bash by itself with no gap in
+protection: the bash units and `ipset` rules come up first, and only then are the bot's unit, the
+`SKIPA-BLOCK` chain and the `skipa-dyn`/`skipa-db` sets removed, and the venv is deleted.
+
+- **Kept:** `config.yaml` (the Telegram token and `chat_id` keep working as notifications), `data/`, the
+  allowlist and permanent manual blocks (they move into `skipa-manual`).
+- **Gone:** time-limited blocks (including auto-blocks; they would expire anyway), chat commands (`/block`,
+  `/allow`, `/stats` and others), the "Ban" button, the dashboard, alert enrichment (country, ASN), the weekly
+  digest and the bot's health check. The allowlist replaces manual blocking; the rest is no longer needed.
 
 ## Security
 
-- `config.yaml` contains the bot token: the installer sets permissions to `600`.
-- The bot token and API keys are masked in logs (`skipa-watchdog.log`, `journalctl`).
-- Bot commands are accepted only from administrators (`admin_ids`, or the private chat with `chat_id`).
-- Self-lockout protection is described above. If you still got cut off, log in through the
-  host console and run `sudo skipa-watchdog`: in the Telegram variant item 6 unblocks a specific
-  IP, in the service-only variant add the IP to the allowlist (item 7); item 13 removes the project
-  along with its rules.
-- Data from external APIs (organization, ASN) is escaped in Telegram and on the dashboard page, and
-  newlines and control characters are stripped from it before it reaches text logs (otherwise a network
-  owner could feed fail2ban a forged line with someone else's IP).
-- A dashboard without `username` is open to anyone who can reach the port: do not expose it
-  to the internet. If `dashboard.host` is not a loopback address and there is no login, the dashboard
-  listens on `127.0.0.1` only and logs that.
+- `config.yaml` holds tokens: the installer sets mode `600`, and warns if it holds secrets with other
+  permissions.
+- Tokens are passed to `curl` via stdin, not as arguments, and are not visible in `ps`.
+- Values entered in the menu are format-checked before they are written (Telegram token, `chat_id`,
+  `homeserver`, `room_id`), and writing to `config.yaml` does not expand `\n` and rejects quotes, backslashes
+  and newlines that could be used to smuggle in extra keys.
+- The kernel log is stripped of control characters before it goes to `detections.log` (otherwise adjacent
+  entries could be forged for fail2ban).
+- Self-lockout protection is described above. If you still get locked out, log in through the host console and
+  run `sudo skipa-watchdog`: add your IP to the allowlist (item 7); item 13 removes the project with its rules.
+- Updating the project is a `git pull` from the repository as root: whoever controls the repository controls
+  your servers. Enable 2FA on the GitHub account, and point `SKIPA_REPO_URL` at your own fork if you want to
+  read changes before updating.
 - Report vulnerabilities to the repository owner privately, not in public issues.
 
 ## Troubleshooting
 
-**An alert came for an IP that is "not in the rules".** Check whether the address belongs to
-any of the lists, including ranges in the second list:
+**A notification came for an IP that is "not in the rules".** Check whether the address belongs to one of the
+lists, including ranges in the second list:
 
 ```bash
-sudo ipset test skipa-scanners 66.132.186.215        # service only
-sudo ipset test skipa-db 66.132.186.215              # service + Telegram (ipset)
+sudo ipset test skipa-scanners 66.132.186.215
 ```
 
-Scanner networks in the lists are wider than a single address: for example,
-`66.132.186.215` belongs to `66.132.186.0/24` from the second list. The matching network is
-shown in the alert and in `detections.log`. Any packet from a scanner creates an entry: in
-the "service only" variant the LOG rule fires on all protocols (you will see
-`proto=UDP port=3478` in `detections.log`), and the packet is dropped after being logged.
+Scanner networks in the lists are wider than one address: for example `66.132.186.215` falls inside
+`66.132.186.0/24` from the second list. Any packet from a scanner creates an entry: the LOG rule fires on all
+protocols (`detections.log` shows `proto=UDP port=3478`), and the packet is dropped after logging.
 
-**The menu says INPUT is not connected although the rules are in place.** Update the project
-(item 12). The check used to look only for rules in the old form; now it looks for any
-project rules in the chain.
+**Notifications do not arrive.** Menu item 4 → "Send a test message" reports each channel: "delivered",
+"server rejected the request" (wrong token, `chat_id` or room) or "no connection". Also check that
+`action.mode` is not `block` and that the daemon is alive: `systemctl status skipa-watchdog-notify`. Sending
+errors go to `skipa-watchdog.log`. Menu item 1 shows the size of the queue of unsent messages.
 
-**The service does not start.** `journalctl -u skipa-watchdog -n 50`. Common causes: no
-`ipset` (the service runs in simplified iptables mode), an invalid `config.yaml`, the
-dashboard port is taken.
+**False positive on a legitimate scanner** (for example your security monitoring): add its IP to the
+allowlist (item 7).
 
-**False positive on a legitimate scanner** (for example, your own security monitoring): add
-its IP to `monitoring.ignore_ips`.
-
-**Blocking does not work for containers.** Open menu item 5 → "Show current rules": the jump
-to `SKIPA-BLOCK` must be present in `DOCKER-USER` as well. Docker started after the service
-is picked up within a minute.
+**Blocking does not work for containers.** Open menu item 5 → "Show current rules": the rules must also be in
+`DOCKER-USER`. If Docker started later, re-apply the rules (item 5; at boot `skipa-watchdog-rules.service`
+does it).
 
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t .     # 200+ tests, no root needed
-shellcheck -S warning service/*.sh install-firewall-rules.sh
+python3 -m unittest discover -s tests -t .     # 100+ tests, no root needed
+shellcheck -S warning install.sh service/*.sh
 ```
 
-The tests replace `iptables` and `ipset` with fakes ([`tests/fakes.py`](tests/fakes.py),
-[`tests/netfake.py`](tests/netfake.py)) and never touch the real firewall; CI runs them on
-Python 3.10–3.13 together with `bash -n` and `shellcheck`. An end-to-end scenario of the "service
-only" variant on real `ipset`/`iptables` (reboot, `iptables-restore`, flock) is opt-in because it
-changes the host's sets and rules: `SKIPA_REAL_NETFILTER_TESTS=1 python3 -m unittest
-tests.test_real_netfilter` as root in a disposable environment.
+The project itself is pure bash; Python is needed only by the tests (they run the bash scripts) and PyYAML to
+check `config.yaml`. The tests replace `iptables`, `ipset`, `curl` and `journalctl` with fakes
+([`tests/netfake.py`](tests/netfake.py) and stub scripts inside the tests) and never touch the real firewall
+or network. The end-to-end scenario on real `ipset`/`iptables` (reboot, `iptables-restore`, flock) is opt-in
+because it changes the host's sets and rules:
+`SKIPA_REAL_NETFILTER_TESTS=1 python3 -m unittest tests.test_real_netfilter` as root in a disposable
+environment.
 
-Structure:
+Layout:
 
 ```
-watchdog.py            entry point of the Telegram variant
 install.sh             installer and menu
-bot/                   Python modules (monitoring, blocking, lists, Telegram, dashboard)
-service/               bash variant and the shared config.yaml reader library
+service/               scripts: lists, rules, notifications, config.yaml reader, allowlist
 fail2ban/              filter and jail (alternative way to ban)
 tests/                 tests
-config.example.yaml    template of the unified config
+config.example.yaml    config template
 ```
 
 ## License

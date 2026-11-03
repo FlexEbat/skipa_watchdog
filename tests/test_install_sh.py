@@ -64,7 +64,7 @@ class InstallShTests(unittest.TestCase):
         r, inst = run(
             'cp "$INSTALL_DIR/config.example.yaml" "$SERVICE_CONF"\n'
             '_service_conf_get ACTIVE_LIST\n_service_conf_set ACTIVE_LIST list2\n_service_conf_get ACTIVE_LIST\n'
-            '_service_conf_get ACTION_MODE\n_set_yaml_scalar "$SERVICE_CONF" chat_id 123\n'
+            '_service_conf_get ACTION_MODE\n_set_yaml_scalar "$SERVICE_CONF" telegram.chat_id 123\n'
             'yaml_get "$SERVICE_CONF" telegram.chat_id'
         )
         self.assertEqual(r.stdout.split(), ["merged", "list2", "block_notify", "123"], r.stderr)
@@ -128,26 +128,6 @@ class UpdateRepoTests(unittest.TestCase):
         self.assertEqual(self._scenario(""), ["1", "секрет"])       # без терминала: ничего не сбрасываем
 
 
-@unittest.skipUnless(shutil.which("bash"), "нужен bash")
-class MonitoringMethodMenuTests(unittest.TestCase):
-    def _run(self, answers, mode="bot"):
-        r, _ = run(
-            'cp "$INSTALL_DIR/config.example.yaml" "$SERVICE_CONF"\n'
-            f'echo {mode} > "$INSTALL_MODE_FILE"\n'
-            f'printf "%b" "{answers}" | select_monitoring_method >/dev/null 2>&1\n'
-            '_conf_lib; yaml_get "$SERVICE_CONF" monitoring.method; yaml_get "$SERVICE_CONF" monitoring.poll_interval_seconds'
-        )
-        return r.stdout.split()
-
-    def test_method_changes_only_after_confirmation(self):
-        """метод обнаружения меняется только после подтверждения и не трогает соседние ключи"""
-        self.assertEqual(self._run("2\\ny\\n\\n"), ["kernel_log", "5"])
-        self.assertEqual(self._run("1\\nn\\n\\n"), ["both", "5"])      # отказ: значение по умолчанию
-        self.assertEqual(self._run("0\\n"), ["both", "5"])             # выход без изменений
-        self.assertEqual(self._run("9\\n"), ["both", "5"])             # неизвестный пункт
-        self.assertEqual(self._run("1\\ny\\n\\n", mode="service"), ["poll", "5"])
-
-
 FAKE_IPTABLES_STATEFUL = """#!/usr/bin/env bash
 # запоминает вызовы; переход `-j SKIPA-BLOCK` считается стоящим один раз в каждой цепочке
 args=("$@"); [ "${args[0]}" = "-w" ] && args=("${args[@]:2}")
@@ -162,8 +142,8 @@ esac
 
 
 @unittest.skipUnless(shutil.which("bash"), "нужен bash")
-class ModeSwitchTests(unittest.TestCase):
-    """переключение режимов на лету и отсутствие ручной блокировки в режиме «только сервис»"""
+class MigrationAndNotifyMenuTests(unittest.TestCase):
+    """переход с Python-бота на bash, меню уведомлений, отсутствие ручной блокировки"""
 
     def _run(self, script: str, stdin: str = "", mode: str = "service", fake_ipt: bool = False):
         with tempfile.TemporaryDirectory() as d:
@@ -195,31 +175,9 @@ class ModeSwitchTests(unittest.TestCase):
         self.assertNotIn("Заблокировать IP вручную", out)
         self.assertNotIn("Разблокировать IP", out)
 
-    def test_в_варианте_с_ботом_ручная_блокировка_остаётся(self):
-        """в варианте с Telegram пункты блокировки/разблокировки на месте"""
-        r, _, _ = self._run("blocklist_menu", stdin="0\n", mode="bot")
-        self.assertIn("Заблокировать IP вручную", r.stdout)
-        self.assertIn("Разблокировать IP", r.stdout)
 
-    def test_меню_telegram_предлагает_переключение_только_из_бота(self):
-        """из бота есть возврат на «только сервис», из сервис-режима - только подключение Telegram"""
-        r, _, _ = self._run("telegram_menu", stdin="0\n", mode="bot")
-        self.assertIn("Переключить на 'только сервис'", r.stdout)
-        r, _, _ = self._run("telegram_menu", stdin="0\n", mode="service")
-        self.assertNotIn("Переключить на 'только сервис'", r.stdout)
-        self.assertIn("Подключить Telegram", r.stdout)
 
-    def test_переключение_в_сервис_режиме_ничего_не_делает(self):
-        """switch_to_service в режиме «только сервис» только предупреждает"""
-        r, mode_after, _ = self._run("switch_to_service", mode="service")
-        self.assertIn("Уже режим", r.stdout)
-        self.assertEqual(mode_after, "service")
 
-    def test_отказ_от_переключения_ничего_не_меняет(self):
-        """без подтверждения режим остаётся «bot»"""
-        r, mode_after, _ = self._run("switch_to_service", stdin="n\n", mode="bot")
-        self.assertIn("Отменено", r.stdout)
-        self.assertEqual(mode_after, "bot")
 
     def test_переносятся_только_бессрочные_блокировки_бота(self):
         """из data/blocked_ips.json берутся записи с нулевым сроком, блокировки на срок - нет"""
@@ -253,14 +211,74 @@ class ModeSwitchTests(unittest.TestCase):
         m = re.search(r'^INSTALLER_VERSION="([^"]+)"', text, re.M)
         self.assertEqual(m.group(1), (ROOT / "VERSION").read_text(encoding="utf-8").strip())
 
-    def test_telegram_ввод_проверяется_до_записи(self):
-        """мусор вместо токена, chat_id или admin_ids не попадает в config.yaml"""
-        script = 'cp "$INSTALL_DIR/config.example.yaml" "$SERVICE_CONF"; configure_telegram; grep -E "^  (bot_token|chat_id|admin_ids):" "$SERVICE_CONF"'
-        r, _, _ = self._run(script, stdin='1"\nmonitoring: x\n')
-        self.assertIn("на токен бота", r.stdout + r.stderr)
-        r, _, _ = self._run(script, stdin="123456:ABC-def\nabc\n")
-        self.assertIn("chat_id", r.stdout + r.stderr)
-        r, _, _ = self._run(script, stdin="123456:ABC-def\n-100123\n1,x\n")
-        self.assertIn("admin_ids", r.stdout + r.stderr)
-        self.assertIn('bot_token: ""', r.stdout)                              # конфиг не изменён
-        self.assertNotIn("123456:ABC-def", r.stdout)
+
+    def _conf_after(self, script, stdin=""):
+        r, _, _ = self._run('cp "$INSTALL_DIR/config.example.yaml" "$SERVICE_CONF"\n' + script +
+                            '\n_conf_lib; for k in telegram.bot_token telegram.chat_id matrix.homeserver matrix.access_token matrix.room_id; '
+                            'do echo "$k=$(yaml_get "$SERVICE_CONF" $k)"; done', stdin=stdin)
+        out = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line and line.split("=")[0].count(".") == 1)
+        return r, out
+
+    def test_telegram_сохраняется_только_после_проверки(self):
+        """мусор вместо токена или chat_id не попадает в config.yaml, нормальные значения - попадают"""
+        r, out = self._conf_after("configure_telegram", 'bad"token\n5\n')
+        self.assertEqual(out["telegram.bot_token"], "")
+        r, out = self._conf_after("configure_telegram", "123456:ABC-def\nabc\n")
+        self.assertEqual(out["telegram.bot_token"], "")
+        r, out = self._conf_after("configure_telegram", "123456:ABC-def\n-100123\nn\n")
+        self.assertEqual((out["telegram.bot_token"], out["telegram.chat_id"]), ("123456:ABC-def", "-100123"))
+        r, out = self._conf_after("configure_telegram", "0\n")
+        self.assertEqual(out["telegram.bot_token"], "")
+        self.assertIn("Отменено", r.stdout)
+
+    def test_matrix_сохраняется_только_после_проверки(self):
+        """homeserver только https, room_id - идентификатор; токен не печатается на экран"""
+        r, out = self._conf_after("configure_matrix", "http://matrix.example.org\ntok\n!a:example.org\n")
+        self.assertEqual(out["matrix.access_token"], "")
+        r, out = self._conf_after("configure_matrix", "https://matrix.example.org\ntok\n#alias:example.org\n")
+        self.assertEqual(out["matrix.room_id"], "")
+        r, out = self._conf_after("configure_matrix", "https://matrix.example.org/\nsyt_secret\n!room:example.org\nn\n")
+        self.assertEqual((out["matrix.homeserver"], out["matrix.access_token"], out["matrix.room_id"]),
+                         ("https://matrix.example.org", "syt_secret", "!room:example.org"))
+        self.assertNotIn("syt_secret", r.stdout.split("telegram.bot_token=")[0])      # ввод токена не показывается на экране
+
+    def test_отключение_канала_очищает_секрет(self):
+        """disable_channel убирает токен из config.yaml"""
+        r, out = self._conf_after('configure_telegram <<< $\'123456:ABC-def\\n-100123\\nn\\n\'; disable_channel telegram')
+        self.assertEqual((out["telegram.bot_token"], out["telegram.chat_id"]), ("", "0"))
+
+    def test_включение_канала_при_режиме_block_предлагает_block_notify(self):
+        """в режиме 'block' демон уведомлений не запущен: меню предлагает включить block_notify"""
+        r, _, _ = self._run('cp "$INSTALL_DIR/config.example.yaml" "$SERVICE_CONF"; _service_conf_set ACTION_MODE block\n'
+                            '_after_notify_change; _service_conf_get ACTION_MODE', stdin="y\nn\n")
+        self.assertEqual(r.stdout.strip().splitlines()[-1], "block_notify")
+        r, _, _ = self._run('cp "$INSTALL_DIR/config.example.yaml" "$SERVICE_CONF"; _service_conf_set ACTION_MODE block\n'
+                            '_after_notify_change; _service_conf_get ACTION_MODE', stdin="n\nn\n")
+        self.assertEqual(r.stdout.strip().splitlines()[-1], "block")
+
+    def test_прежний_python_вариант_распознаётся(self):
+        """метка bot или юнит skipa-watchdog.service - признак прежнего Python-бота"""
+        r, _, _ = self._run('_has_legacy_bot && echo yes || echo no', mode="bot")
+        self.assertEqual(r.stdout.strip(), "yes")
+        r, _, _ = self._run('SYSTEMD_DIR="$INSTALL_DIR/units"; mkdir -p "$SYSTEMD_DIR"; _has_legacy_bot && echo yes || echo no', mode="service")
+        self.assertEqual(r.stdout.strip(), "no")
+        r, _, _ = self._run('SYSTEMD_DIR="$INSTALL_DIR/units"; mkdir -p "$SYSTEMD_DIR"; touch "$SYSTEMD_DIR/skipa-watchdog.service"; '
+                            '_has_legacy_bot && echo yes || echo no', mode="service")
+        self.assertEqual(r.stdout.strip(), "yes")
+
+    def test_остатки_python_убираются(self):
+        """venv и каталог bot/ (не из git) удаляются, config.yaml и data/ остаются"""
+        r, _, _ = self._run('mkdir -p "$INSTALL_DIR/venv/bin" "$INSTALL_DIR/bot/__pycache__" "$INSTALL_DIR/data"\n'
+                            'touch "$INSTALL_DIR/config.yaml" "$INSTALL_DIR/data/blocked_ips.json"\n'
+                            '_cleanup_python_leftovers; ls "$INSTALL_DIR" | sort | tr "\\n" " "')
+        out = r.stdout.strip().splitlines()[-1]                      # последняя строка - ls каталога
+        self.assertNotIn("venv", out.split())
+        self.assertNotIn("bot", out.split())
+        self.assertIn("config.yaml", out)
+        self.assertIn("data", out)
+
+    def test_в_установщике_нет_ссылок_на_python(self):
+        """install.sh не вызывает python/pip/venv и не знает про watchdog.py"""
+        text = (ROOT / "install.sh").read_text(encoding="utf-8")
+        for bad in ("pip install", "python3 -m venv", "ensure_venv", "watchdog.py", "requirements"):
+            self.assertNotIn(bad, text, bad)

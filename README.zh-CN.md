@@ -6,83 +6,49 @@
 [![license: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 [![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/FlexEbat/badge.svg)](https://hub.xerj.org/contributors/FlexEbat)
 
-Skipa Watchdog 能发现已知扫描器（CyberOK/Skipa、GRChTs、NKTsKI 及其他附加名单）对服务器的连接，
-对其进行封锁和/或发送通知。防护对主机本身以及通过 Docker 和 Kubernetes 发布的服务均有效。
+Skipa Watchdog 会在你的服务器上封锁来自已知扫描器（CyberOK/Skipa、GRCHTs、NKTsKI 及额外名单）的连接，并可选地通过
+Telegram 或 Matrix 通知你。防护覆盖主机，以及通过 Docker 和 Kubernetes 发布的服务。
 
-- **内核级封锁。** 整个名单加载到 `ipset` 中，扫描器在第一个数据包就会被拦截。
-- **统一配置。** 两种安装方式读取同一个 `config.yaml`。
-- **Telegram 可选。** 不使用 Telegram 时，一切通过本地日志工作。
-- **自我恢复。** 重启后，规则和 ipset 集合（包括已保存的封锁）在两种方式下都会自动恢复；Docker 重启或 `ufw reload` 由 Telegram 方式修复。
-- **防止自我封锁。** 内部网络和你自己的 SSH 会话不会被封锁。
+- **在内核中封锁。** 名单加载进 `ipset`，扫描器的第一个数据包就会被丢弃。封锁不依赖任何常驻进程。
+- **纯 bash。** 只需要 `iptables`、`ipset`、`curl`、`systemd`。安装和运行都不需要 Python。
+- **全自动。** 名单由定时器更新，封锁自动完成，没有手动封锁/解除。唯一的手动手段是白名单。
+- **通知可选。** Telegram 和/或 Matrix，一波扫描只发一条消息。不配置时仍有本地日志。
+- **自我恢复。** 重启后 ipset 集合和规则会自动恢复。
+- **防止把自己锁在外面。** 内部网络和你自己的 SSH 会话无法被封锁。
 
 ## 目录
 
-- [安装方式](#安装方式)
 - [快速开始](#快速开始)
 - [工作原理](#工作原理)
 - [配置](#配置)
 - [防止自我封锁](#防止自我封锁)
-- [Docker 与 Kubernetes](#docker-与-kubernetes)
-- [Telegram](#telegram)
-- [附加功能](#附加功能)
+- [Docker 和 Kubernetes](#docker-和-kubernetes)
+- [通知：Telegram 和 Matrix](#通知telegram-和-matrix)
+- [额外来源](#额外来源)
 - [运维](#运维)
+- [从 Python 机器人版本升级](#从-python-机器人版本升级)
 - [安全](#安全)
 - [常见问题](#常见问题)
 - [开发](#开发)
-- [许可证](#许可证)
-
-## 安装方式
-
-| | 仅服务 | 服务 + Telegram |
-| --- | --- | --- |
-| 实现 | bash、`iptables`、`ipset` | `watchdog.py`（Python 3.10+）、venv |
-| Python | 不需要 | 需要 |
-| 封锁 | 在内核中，名单由 systemd 定时器更新 | 在内核中，进程自行更新并修复规则 |
-| 通知 | 写入 `detections.log` | `detections.log` 以及 Telegram 消息 |
-| “封禁”按钮、`/stats` 图表、仪表盘、健康检查 | 无 | 有 |
-| 附加来源（`sources.extra`：`cidr_list`、`abuseipdb`） | 有 | 有 |
-| 重启后的保护 | 单元 `skipa-watchdog-ipset` 和 `skipa-watchdog-rules` | 进程 + `skipa-watchdog-fw-rules` |
-
-可以先用第一种方式，之后再从菜单（第 4 项）中接入 Telegram。两种方式可随时双向切换，无需重装，防护也不会中断：从机器人切回纯 bash 请用第 4 项 →“切换为仅服务”。永久手动封锁会被迁移，`config.yaml`（含 Telegram 设置）和 `data/` 保留，venv 可以删除。
-
-### 各方式的功能对照
-
-控制面板（`sudo skipa-watchdog`）、机器人和服务脚本能做的事情相同，区别只在调用方式。无论从哪里修改
-`config.yaml`，使用的都是同一段代码（`service/confctl.sh`）。
-
-| 功能 | 面板 | 机器人 | 不含 Python 的服务 |
-| --- | --- | --- | --- |
-| 状态与检查 | 第 1 项，`install.sh status` | `/status` | 第 1 项，`install.sh status` |
-| 更新 IP 数据库 | 第 9 项 | `/update` | 第 9 项，`sync-lists` 定时器 |
-| 封锁 / 解除 | 第 6 项（可指定小时数或永久） | `/block <ip> [小时]`、`/unblock` | 无：封锁完全自动，例外通过白名单 |
-| 封锁列表 | 第 6 项 | `/blocklist` | 第 6 项，`blockctl.sh list` |
-| 白名单 | 第 7 项 | `/allowlist`、`/allow`、`/unallow` | 第 7 项，`blockctl.sh allow\|unallow\|allowlist` |
-| 动作模式、名单来源、检测方式 | 第 3 项 | `/settings` | 第 3 项 |
-| 检测统计 | 第 8 项，`install.sh stats` | `/stats`（含图表）、`/export` | 第 8 项，`service/stats.sh` |
-| 日志 | 第 10 项 | `/logs [行数]` | 第 10 项 |
-| Docker/Kubernetes | 第 5 项 | `/env` | 第 5 项 |
-| 项目更新检查 | 每次启动菜单时，第 12 项 | 服务启动时：“安装”按钮，`/version` | 写入日志；在面板中安装 |
-
-仅 Python 方式具备（由其性质决定）：测试通知 `/testalert`、队列 `/pending`、告警中的“封禁”按钮、仪表盘、
-限时自动封锁和手动封锁/解除（仅服务方式下一切自动运行，没有手动封锁）。
 
 ## 快速开始
 
-需要 root 权限和 `git`（如果没有，`install.sh` 会自动安装）。
+需要 root 和 `git`（缺少时 `install.sh` 会自动安装，`iptables`、`ipset`、`curl` 同理）。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/FlexEbat/skipa_watchdog/main/install.sh -o install.sh
 sudo bash install.sh
 ```
 
-安装程序会显示说明，询问安装方式，并应用 `iptables` 规则。代码安装到 `/opt/skipa_watchdog`，
-日志写入 `/var/log/skipa_watchdog`。之后使用下面的命令进行管理：
+安装程序会显示说明、下载名单、构建 `ipset` 并应用 `iptables` 规则。代码安装到 `/opt/skipa_watchdog`，日志写入
+`/var/log/skipa_watchdog`。之后用下面的命令管理：
 
 ```bash
 sudo skipa-watchdog
 ```
 
-每次启动菜单时会检查是否有新版本并提示安装。
+菜单项：1 运行状况检查，2 服务管理，3 检测设置，4 通知，5 Docker/Kubernetes，6 已封锁的 IP（仅查看），7 白名单，
+8 统计，9 更新数据库，10 日志，11 编辑配置，12 更新项目，13 卸载。每次启动菜单时会检查是否有新版本并提示安装。
 
 不使用菜单：
 
@@ -90,36 +56,23 @@ sudo skipa-watchdog
 sudo bash install.sh install       # 安装或更新
 sudo bash install.sh status        # 简要状态
 sudo bash install.sh fw-rules      # 应用 Docker/Kubernetes 规则
-sudo bash install.sh check-lists   # 检查名单是否有新版本
+sudo bash install.sh check-lists   # 检查名单新版本
+sudo bash install.sh test-notify   # 向 Telegram/Matrix 发送测试消息
+sudo bash install.sh stats [天数]  # 检测统计
 sudo bash install.sh uninstall     # 卸载（会询问是否移除规则和 ipset）
 ```
 
-**安装完成后请立即**把你自己的 SSH IP（如果是固定 IP）写入 `/opt/skipa_watchdog/config.yaml` 中的
-`monitoring.ignore_ips`。
-
-> 安装程序菜单和机器人的消息目前为俄语。
+**安装后请立即把你的 SSH IP 加入白名单**（菜单第 7 项），如果它是固定的。
 
 <details>
-<summary>手动安装（不使用 install.sh）</summary>
-
-仅服务：
+<summary>不使用 install.sh 手动安装</summary>
 
 ```bash
 sudo apt install ipset curl
 cp config.example.yaml config.yaml && chmod 600 config.yaml
 sudo bash service/sync-lists.sh config.yaml          # 填充 ipset
 sudo bash service/setup-ipset-rules.sh config.yaml   # iptables 规则
-sudo bash service/notify-tail.sh config.yaml         # （可选）写入 detections.log
-```
-
-使用 Telegram：
-
-```bash
-python3 -m venv venv && . venv/bin/activate
-pip install -r requirements.txt -r requirements-telegram.txt
-cp config.example.yaml config.yaml && chmod 600 config.yaml   # 填写 telegram.*
-sudo bash install-firewall-rules.sh
-python watchdog.py config.yaml
+sudo bash service/notify-tail.sh config.yaml         # （可选）detections.log 和通知
 ```
 
 </details>
@@ -127,149 +80,122 @@ python watchdog.py config.yaml
 ## 工作原理
 
 ```
-IP 名单 ──► 数据库（缓存 data/ip_cache.json）──► ipset skipa-db ──► 内核级拦截
-                      │
- poll（/proc/net/tcp、conntrack）─┐
-                                  ├─► 命中 ─► 封锁 + detections.log + Telegram
- kernel_log（LOG 规则）───────────┘          （具体做什么由 action.mode 决定）
+IP 名单 ──► sync-lists.sh（定时器）──► ipset skipa-scanners ──► 内核 DROP（INPUT、DOCKER-USER、KUBE-*）
+                                                  │
+                                 LOG 规则 ──► 内核日志 ──► notify-tail.sh ──► detections.log
+                                                                           └──► Telegram / Matrix
 ```
 
-**检测方式**（`monitoring.method`）：
+**封锁。** `iptables` 规则把源地址与 `ipset` 集合比对：`skipa-scanners`（名单）、`skipa-manual`（从旧版本迁移来的永久封锁）
+和 `skipa-allow`（白名单）。一切由内核决定，封锁不涉及用户态进程。
 
-| 方法 | 原理 | 能看到什么 |
-| --- | --- | --- |
-| `poll` | 每隔 `poll_interval_seconds` 读取 `/proc/net/tcp` 和内核 conntrack | 入站连接、发往 Docker 容器端口的流量、短时扫描 |
-| `kernel_log` | 读取 iptables LOG 规则写入的内核日志 | 扫描器的每一个首包，即时发现 |
-| `both`（默认） | 两者同时 | 以上全部 |
+**检测与通知。** LOG 规则把扫描器的第一个数据包写入内核日志，`skipa-watchdog-notify.service` 读取它（`journalctl -k`），
+写入 `detections.log` 并发送通知。同一个 IP 在 `alert_cooldown_minutes` 内不会重复记录或发送。
 
-**封锁。** 规则位于独立的 `SKIPA-BLOCK` 链中，`INPUT`、`DOCKER-USER` 和 `KUBE-*` 会跳转到该链。
-如果安装了 `ipset`，整个数据库会加载到 `skipa-db` 集合中，动态封锁（带超时）放在 `skipa-dyn`，
-你自己的地址放在 `skipa-allow`。没有 `ipset` 时，会为每个 IP 单独创建一条 `DROP` 规则。
+**动作模式**（`action.mode`，菜单第 3 项）：
 
-**动作模式**（`action.mode`）：
-
-| 模式 | 封锁 | 通知 |
+| 模式 | 封锁 | 日志和通知 |
 | --- | --- | --- |
 | `block_notify`（默认） | 是 | 是 |
-| `block` | 是 | 仅写入日志 |
+| `block` | 是 | 否（不启动 `notify` 守护进程） |
 | `notify` | 否 | 是 |
 
 ## 配置
 
-使用单一的 `config.yaml` 文件（模板：[`config.example.yaml`](config.example.yaml)，所有参数都在其中以注释说明）。
-“仅服务”方式只读取其中一部分，最后一列已标出。
+统一的 `config.yaml`（模板：[`config.example.yaml`](config.example.yaml)，所有参数都有注释）。最简单的修改方式是通过菜单；
+手动编辑后请应用更改（菜单第 11 项会自动提示）。
 
-| 键 | 默认值 | 用途 | bash |
-| --- | --- | --- | --- |
-| `action.mode` | `block_notify` | 动作模式 | 是 |
-| `action.block_timeout_hours` | `72` | 自动封锁时长，`0` 表示永久 | 否 |
-| `action.preload_db` | `true` | 预先把整个数据库加载到 ipset | 否 |
-| `sources.active_list` | `merged` | 使用哪些名单：`list1`、`list2`、`merged` | 是 |
-| `sources.primary_list_url` / `blacklist_url` | 见模板 | 名单地址 | 是 |
-| `sources.update_interval_days` | `7` | 数据库更新频率 | 是 |
-| `sources.min_prefix` | `20` | 名单中接受的最大网段（前缀长度）；Spamhaus DROP 请设为 `16` | 是 |
-| `sources.allow_insecure_http` | `false` | 允许通过明文 http 下载名单（默认仅 https） | 是 |
-| `updates.check_on_start` | `true` | 启动面板和服务时检查项目更新 | 是 |
-| `sources.min_entries` | `10` | 来源在首次下载时至少要有的条目数（防止只有三行的“垃圾”名单）；很小的自定义名单请调低 | 是 |
-| `firewall.keep_established_tcp` | `false` | 不切断已建立的 TCP 会话：只封锁新的 TCP 连接（SYN）和所有非 TCP 流量。注意：已建立会话的扫描器会在该会话内继续工作。用一对 DROP 规则实现，而不是 `RETURN`（在内置的 `INPUT`/`DOCKER-USER` 中 `RETURN` 会跳过主机的其余规则）。修改后需重新应用规则 | 是 |
-| `sources.extra` | 空 | 附加来源 | 否 |
-| `monitoring.method` | `both` | `poll`、`kernel_log`、`both` | 否 |
-| `monitoring.ignore_ips` | 空 | 永不封锁的地址 | 是 |
-| `monitoring.alert_cooldown_minutes` | `60` | 同一 IP 的记录间隔不低于此值 | 是 |
-| `monitoring.use_conntrack` | `true` | `poll` 同时读取 conntrack | 否 |
-| `monitoring.auto_allowlist` | `true` | 不封锁当前 SSH 会话的 IP | 否 |
-| `telegram.bot_token`、`chat_id`、`admin_ids` | 空 | 接入 Telegram | 否 |
-| `firewall.log_limit`、`log_burst` | `30/second`、`40` | LOG 规则的速率限制 | 是 |
-| `logging.log_dir` | `/var/log/skipa_watchdog` | 日志目录 | 是 |
+| 键 | 默认值 | 作用 |
+| --- | --- | --- |
+| `action.mode` | `block_notify` | 动作模式 |
+| `sources.active_list` | `merged` | 使用哪些名单：`list1`、`list2`、`merged` |
+| `sources.primary_list_url`、`blacklist_url` | 见模板 | 名单地址 |
+| `sources.update_interval_days` | `7` | 数据库更新频率 |
+| `sources.min_prefix` | `20` | 接受的最宽网络（前缀长度）；Spamhaus DROP 请设为 `16` |
+| `sources.allow_insecure_http` | `false` | 允许通过普通 http 下载名单（默认仅 https） |
+| `sources.min_entries` | `10` | 首次下载时来源的最少条目数（防止只有三行的垃圾名单） |
+| `sources.extra` | 空 | 额外来源 |
+| `firewall.keep_established_tcp` | `false` | 不切断已建立的 TCP 会话：只封锁新的 TCP 连接（SYN）和所有非 TCP 流量。注意：已建立会话的扫描器会在该会话内继续工作。修改后请重新应用规则（第 5 项） |
+| `firewall.log_limit`、`log_burst` | `30/second`、`40` | LOG 规则限速 |
+| `monitoring.ignore_ips` | 空 | 永不封锁的地址 |
+| `monitoring.auto_allowlist`、`ssh_ports` | `true`、`[22]` | 不封锁当前 SSH 会话的 IP |
+| `monitoring.alert_cooldown_minutes` | `60` | 同一 IP 的重复记录间隔 |
+| `monitoring.kernel_log_prefix` | `CONN: ` | LOG 规则在内核日志中的前缀 |
+| `telegram.*`、`matrix.*` | 空 | 通知渠道 |
+| `notifications.batch_seconds`、`batch_max` | `30`、`20` | 消息累积秒数和列出的地址数 |
+| `notifications.language` | `ru` | 消息文本语言：`ru` 或 `en` |
+| `environment.docker_scan`、`k8s_scan` | `true` | 是否把规则挂到 `DOCKER-USER` 和 `KUBE-*` |
+| `logging.log_dir` | `/var/log/skipa_watchdog` | 日志目录 |
 
 默认来源：
 
-- **名单 1** —— [tread-lightly/CyberOK_Skipa_ips](https://github.com/tread-lightly/CyberOK_Skipa_ips)
-  （CyberOK/Skipa、GRChTs、NKTsKI）。
-- **名单 2** —— [sngvy](https://gist.github.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8) 的黑名单
-  （CIDR、地址范围和单个 IP；包含 Censys 等扫描器的网段）。
+- **名单 1** — [tread-lightly/CyberOK_Skipa_ips](https://github.com/tread-lightly/CyberOK_Skipa_ips)
+  （CyberOK/Skipa、GRCHTs、NKTsKI）。
+- **名单 2** — [sngvy](https://gist.github.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8) 的黑名单
+  （CIDR、范围和单个 IP；包含 Censys 等扫描器网络）。
 
-两份名单始终都会下载，`active_list` 决定哪些条目进入数据库。如果某个来源不可用，或返回的条目数只有
-之前的一半，则使用其上一个版本，并在一小时后重新检查不完整的数据库。比 `sources.min_prefix`（默认 `/20`）更大的网段会被丢弃；整体覆盖超过约 400 万个地址的来源会被拒绝，以免被篡改的名单封锁半个互联网。名单只通过 https 下载，重定向到 http 会被拒绝。
-
-可以通过菜单修改设置（第 3 项：名单来源、动作模式、检测方式；第 11 项：编辑文件），也可以手动修改；
-修改后请通过菜单应用，或执行 `sudo systemctl restart skipa-watchdog`。
+两个名单始终都会下载，`active_list` 决定哪些条目进入集合。如果某个来源不可用或返回的条目数只有之前的一半，则使用它上一次的版本。
+比 `sources.min_prefix` 更宽的网络会被丢弃，总共覆盖超过约 400 万个地址的来源会被拒绝，因此“膨胀”的第三方名单不会把半个互联网封掉。
+名单只通过 https 下载，重定向到 http 会被拒绝。形如 `1.2.3.0/24/垃圾` 的条目会被整体丢弃。
 
 ## 防止自我封锁
 
-名单来自外部，而封锁是自动进行的，因此以下内容永远不会被封锁：
+名单来自外部且封锁是自动的，因此以下内容永远不会被封锁：
 
-- 回环地址、私有网络（`10/8`、`172.16/12`、`192.168/16`）和链路本地地址；
+- 回环、私有网络（`10/8`、`172.16/12`、`192.168/16`）和 link-local；
 - `monitoring.ignore_ips` 中的地址；
-- 在 `monitoring.ssh_ports` 上有打开的 SSH 会话的 IP（`monitoring.auto_allowlist`）；在“仅服务”方式中由 `skipa-watchdog-allow-ssh.timer` 每分钟添加；
-- 前缀短于 `/16` 的网段（包括 `0.0.0.0/0`）、IPv6，以及与白名单有交集的任何内容。
+- 在 `monitoring.ssh_ports` 上有打开的 SSH 会话的 IP（`monitoring.auto_allowlist`），由 `skipa-watchdog-allow-ssh.timer`
+  每分钟添加一次；
+- 比 `/16` 更短的网络（包括 `0.0.0.0/0`）、IPv6，以及与白名单相交的任何内容。
 
-`poll` 方法只统计入站连接：服务器自己发起的出站连接不会被当作扫描。
+## Docker 和 Kubernetes
 
-## Docker 与 Kubernetes
+发往已发布容器端口的流量走 `FORWARD` 链，而不是 `INPUT`。因此规则会同时挂到 `DOCKER-USER`，以及（如果存在）
+`KUBE-EXTERNAL-SERVICES`、`KUBE-NODEPORTS`。安装程序会自动找到它们；可通过菜单（第 5 项）或
+`sudo bash install.sh fw-rules` 重新应用规则。关闭这些链：`environment.docker_scan: false`、`environment.k8s_scan: false`。
 
-发往容器已发布端口的流量走的是 `FORWARD` 链，而不是 `INPUT`。因此，到 `SKIPA-BLOCK` 的跳转会同时设置在
-`DOCKER-USER` 中，以及（如果存在）`KUBE-EXTERNAL-SERVICES` 和 `KUBE-NODEPORTS` 中。安装程序会自动找到它们；
-可以通过菜单（第 5 项）或 `sudo bash install.sh fw-rules` 重新应用规则。要禁用这些链：
-`environment.docker_scan: false`、`environment.k8s_scan: false`。
+## 通知：Telegram 和 Matrix
 
-这类流量在主机的 `/proc/net/tcp` 中看不到，所以 `poll` 会读取内核 conntrack（需要 root），
-而 `kernel_log` 通过 `DOCKER-USER` 上的 LOG 规则工作。
+通知只负责发送：没有聊天命令，不需要管理机器人，也不需要 Python。一切都由 bash 里的 `curl` 完成。通过菜单第 4 项配置
+（令牌输入时不回显，写入 `config.yaml` 之前先检查格式），用 `sudo bash install.sh test-notify` 验证。
 
-## Telegram
+**Telegram。** 在 [@BotFather](https://t.me/BotFather) 创建机器人，把它加入聊天或频道，并填写令牌和 `chat_id`（群组为负数）。
+如果无法直接访问 Telegram，请设置 `telegram.proxy`（`http://`、`https://`、`socks5://`、`socks5h://`）。
 
-可以通过菜单（第 4 项）接入，或在 `config.yaml` 中设置：`telegram.bot_token`（从
-[@BotFather](https://t.me/BotFather) 获取）、`chat_id` 和 `admin_ids`。`admin_ids` 为空表示只接受 `chat_id`
-用户的私聊命令；在群组中命令被关闭，需先在 `admin_ids` 中列出管理员。如果无法直接访问 Telegram，请设置 `telegram.proxy`（使用 `socks5://` 需要
-`pip install "python-telegram-bot[socks]"`）。
+**Matrix。** 需要 homeserver 地址（`https://matrix.example.org`；`http` 仅允许用于 localhost）、用户或机器人的
+`access_token`，以及形如 `!abc:example.org` 的 `room_id`（不是 `#房间` 别名）。该用户必须已在房间中。
 
-Telegram 不可用不会中断防护：该层在后台启动并重试，未发送的告警会进入队列等待（最多 500 条，最长一周）。
+可以同时启用两个渠道。保证如下：
 
-| 命令 | 作用 |
-| --- | --- |
-| `/menu`、`/status` | 菜单，数据库、规则和监视器的状态 |
-| `/update` | 立即更新数据库 |
-| `/blocklist`（`/banlist`） | 封锁列表 |
-| `/block <ip 或网段> [小时]` | 封锁（默认永久） |
-| `/unblock <ip>`（`/unban`） | 解除封锁 |
-| `/stats [天数]`、`/export [天数]` | 带图表的统计，以及事件导出 |
-| `/testalert [ip]` | 测试通知 |
-| `/pending`、`/env` | 未发送告警的队列、Docker/Kubernetes 环境 |
-| `/allowlist`、`/allow <ip 或网段>`、`/unallow <ip 或网段>` | 白名单（`monitoring.ignore_ips`）：立即生效并写入 `config.yaml` |
-| `/settings` | 动作模式、名单来源、检测方式（需确认并重启服务） |
-| `/logs [行数]` | 日志的最后几行（机器人令牌会被隐藏） |
-| `/version` | 版本及更新检查，带“安装”按钮 |
+- **一波一条消息。** 检测结果累积 `notifications.batch_seconds` 秒（默认 30），以最多 `batch_max` 个地址的列表发送，其余以
+  “还有 N 个”一行表示。
+- **带重试的队列。** 消息先进入队列（`/var/lib/skipa_watchdog/notify-spool`），每个渠道一个文件。网络错误和 5xx 会按顺序重试；
+  遇到 429 会等待 `retry_after`（最长 60 秒）。如果服务器返回 400/401/403/404（令牌、聊天或房间错误），消息会被丢弃并在
+  `skipa-watchdog.log` 中留下记录，而不是永远堆积。超过一天的消息和超过 200 个文件的部分会被丢弃。重试时 Matrix 收到相同的
+  `txnId`，因此不会重复。
+- **秘密不会出现在 `ps` 中。** 带令牌的 URL 和 `Authorization` 头通过 stdin（`-K -`）传给 `curl`，而不是作为参数。
+- **纯文本。** 没有 HTML 或 Markdown，因此无需转义。
 
-通知示例（数值取自文档专用地址段，RFC 5737 和 RFC 5398；机器人的消息文本为俄语）：
+消息示例（`notifications.language: "en"`）：
 
 ```
-🚨 УГРОЗА. СКАНЕР ОБНАРУЖЕН - IP
-
-IP: 203.0.113.42
-▢ MaxMind & IPinfo & Cloudflare:
-🇩🇪 DE Germany, Bavaria, Example City
-AS64500 / Example Hosting GmbH
-База: Skipa | Совпадение: 203.0.113.0/24
-
-🚫 IP заблокирован.
+Skipa Watchdog @ my-server
+Scanners detected: 3 (blocked by the kernel)
+• 203.0.113.42  TCP/22
+• 203.0.113.43  TCP/443
+• 198.51.100.7  UDP/3478
 ```
 
-## 附加功能
+通知由 `skipa-watchdog-notify` 守护进程发送，它只在 `action.mode` 包含通知（`notify`、`block_notify`）时运行。如果在 `block`
+模式下启用渠道，菜单会提示切换到 `block_notify`。
 
-仅在 Telegram 方式下可用，并在 `config.yaml` 中启用。
+## 额外来源
 
-- **附加来源**（`sources.extra`）：Spamhaus DROP、FireHOL、AbuseIPDB 或你自己的名单（两种方式均可用；类型 `cidr_list` 和 `abuseipdb`，字段 `min_entries`/`min_confidence`）。
-  Telegram 方式下每个来源在告警中以各自的名称显示。支持 `#` 和 `;` 注释（Spamhaus 格式）。仅限 IPv4：来源中的 IPv6 条目会被跳过，但现在会写入日志（`... 条 IPv6 记录被跳过`）。
-- **按钮封禁**（`banning.enabled`）：告警下方会出现“🚫 Забанить”（封禁）按钮
-  （时长为 `manual_ban_duration_minutes`）。`auto_ban_new_hits` 会自动封禁每个发现的 IP，
-  `fail2ban_jail` 会把封禁同步到 fail2ban。历史记录写入 `data/bans.jsonl`。
-  替代方案：[`fail2ban/`](fail2ban) 中的过滤器和 jail，根据 `detections.log` 进行封禁。
-- **统计**（`/stats`、`/export`、每周摘要 `digest.*`）：事件写入 `data/events.jsonl`。
-  图表由 `matplotlib` 绘制（`pip install -r requirements-extras.txt`），没有它时会收到文本直方图。
-- **仪表盘**（`dashboard.enabled`）：显示数据库状态、事件、封锁和监视器状态的页面。
-  它监听 `127.0.0.1`，请通过 SSH 隧道访问：`ssh -L 8080:localhost:8080 user@server`。
-  如果要在 localhost 之外访问，请设置 `username`/`password`（HTTP Basic Auth），并放在带 TLS 的代理之后。
-- **健康检查**（`healthcheck.*`）：如果监视器沉默超过 `stale_after_minutes`，会收到警告，恢复后也会收到消息。
+`config.yaml` 中的 `sources.extra`：Spamhaus DROP、FireHOL、AbuseIPDB 或你自己的名单。类型为 `cidr_list`（纯文本名单，
+`#` 和 `;` 为注释）和 `abuseipdb`（需要你自己的 `api_key`，字段 `min_confidence`），每个都可以设置 `min_entries`。只要
+`enabled: true`，它们就与 `active_list` 无关地参与。仅支持 IPv4：IPv6 条目会被跳过并记录日志。
+
+可以用 fail2ban 替代内核封锁：[`fail2ban/`](fail2ban) 中的过滤器和 jail 根据 `detections.log` 封禁。
 
 ## 运维
 
@@ -278,97 +204,101 @@ AS64500 / Example Hosting GmbH
 | 内容 | 位置 |
 | --- | --- |
 | 检测记录 | `/var/log/skipa_watchdog/detections.log` |
-| 进程 | `/var/log/skipa_watchdog/skipa-watchdog.log`、`journalctl -u skipa-watchdog` |
-| 名单和定时器（仅服务） | `journalctl -u skipa-watchdog-sync-lists -u skipa-watchdog-notify` |
+| 进程、通知错误 | `/var/log/skipa_watchdog/skipa-watchdog.log` |
+| 名单与守护进程 | `journalctl -u skipa-watchdog-sync-lists -u skipa-watchdog-notify` |
 
-**重启与规则。** Telegram 方式每隔 `monitoring.guard_interval_seconds`（60 秒）自行检查并修复跳转和 ipset，
-同时还会安装 `skipa-watchdog-fw-rules.service` 单元。
+日志轮转（`/etc/logrotate.d/skipa-watchdog`）由安装程序配置。
 
-在“仅服务”方式中，ipset 集合和规则只存在于内核内存，因此会被保存并在开机时恢复
-（`/var/lib/skipa_watchdog/ipsets.save`，每次同步、每次白名单变更以及切换方式时迁移封锁后更新）：
+**重启与规则。** ipset 集合和规则只存在于内核内存中，因此会被保存并在开机时恢复（`/var/lib/skipa_watchdog/ipsets.save`，
+每次同步和每次修改白名单后更新）：
 
-- `skipa-watchdog-ipset.service` —— 在 `netfilter-persistent` 之前尽早运行：恢复集合（没有文件则创建空集合）。
-  这很重要：若服务器上保存了引用 `skipa-*` 的规则而集合尚不存在，`iptables-restore` 会拒绝整个规则文件，
-  服务器将完全没有防火墙；
-- `skipa-watchdog-rules.service` —— 稍后，在 Docker 和 kubelet 之后（它们提供 `DOCKER-USER` 和 `KUBE-*` 链）：应用规则并验证结果；
-- `skipa-watchdog-sync-lists.timer` 在开机 10 分钟后及之后按计划更新名单。
+- `skipa-watchdog-ipset.service` — 很早，在 `netfilter-persistent` 之前：恢复集合（没有文件则创建空集合）。这很重要：如果保存的规则
+  引用了 `skipa-*` 而集合尚不存在，`iptables-restore` 会拒绝整个规则文件，服务器将完全没有防火墙；
+- `skipa-watchdog-rules.service` — 稍后，在 Docker 和 kubelet 之后（它们需要 `DOCKER-USER` 和 `KUBE-*` 链）：应用规则并检查结果；
+- `skipa-watchdog-sync-lists.timer` 在开机 10 分钟后更新名单，之后按计划更新。
 
-不能合并为一个单元：`After=docker.service` 与 `Before=netfilter-persistent.service` 同时存在会形成排序环
-（`netfilter-persistent` 在 `network-pre.target` 之前，Docker 在 `network-online.target` 之后），systemd 会随机删除某个任务来打破它。
+不能只用一个单元：`After=docker.service` 加 `Before=netfilter-persistent.service` 会形成排序环，systemd 会随机删除一个任务来打破它。
 
-对集合的所有操作（定时器、菜单第 9 项、`blockctl.sh`、应用规则、开机）都在同一个 `flock`
-（`/var/lib/skipa_watchdog/ipset.lock`）下执行，因此不会重叠。应用规则后脚本会验证集合存在，且 `INPUT`、`DOCKER-USER`
-和 `KUBE-*` 中有规则，并报告结果（`✓`/`✗`）；菜单第 1 项显示同样内容。
-在 Telegram 方式中，如果你自己用 `netfilter-persistent save` 保存规则，请注意集合由进程启动时创建：引用 `skipa-*` 的已保存规则在其启动前无法加载。
+所有对集合的操作（定时器、菜单第 9 项、`blockctl.sh`、应用规则、开机）都在同一个 `flock`（`/var/lib/skipa_watchdog/ipset.lock`）下运行，
+因此不会交叉。应用规则后，脚本会检查集合存在，且 `INPUT`、`DOCKER-USER`、`KUBE-*` 中有规则，并报告结果（`✓`/`✗`）；菜单第 1 项显示同样内容。
 
-**手动封锁** 仅 Telegram 方式提供：通过菜单（第 6 项）或 `/block` 命令。这些封锁保存在 `data/blocked_ips.json` 中，并在启动时恢复。仅服务方式下没有手动封锁/解除：一切自动运行（内核丢弃名单中的扫描器，定时器更新名单），要排除某个地址请用白名单（第 7 项或 `blockctl.sh allow <ip>`，这也会解除切换方式时迁移过来的封锁）。
+**白名单。** 菜单第 7 项或 `sudo bash service/blockctl.sh allow|unallow|allowlist [ip]`：立即写入 `config.yaml` 和 `ipset`。
+没有手动封锁/解除：一切自动。
 
-**切换方式。** 菜单第 4 项。仅服务 → 服务 + 机器人：接入 Telegram。服务 + 机器人 → 仅服务：Python 进程停止，bash 单元和 `ipset` 规则启动，之后才移除 `SKIPA-BLOCK` 链及 `skipa-dyn`/`skipa-db` 集合，因此防护不会中断。永久封锁会被迁移，限时封锁（含自动封锁）不会。
+**单元。** 以 root 运行（需要 `iptables`、`ipset`、内核日志）。启用了不妨碍运行的 systemd 限制：`NoNewPrivileges`、`PrivateTmp`、
+`PrivateDevices`、`ProtectSystem=full`、`RestrictNamespaces`、`RestrictAddressFamilies` 等；通知守护进程另外有
+`ProtectKernelModules`/`ProtectKernelTunables`。调用 `iptables` 的单元不使用严格沙箱：`iptables` 会加载内核模块，沙箱在部分系统上会导致启动失败。
 
-**服务。** `skipa-watchdog.service` 以 root 身份运行：它需要 `iptables`、`ipset`、
-读取 conntrack 的权限，以及对安装目录和日志的写权限。仅启用了安全的限制（`NoNewPrivileges`、`PrivateTmp`、
-`ProtectSystem=full`、`RestrictAddressFamilies` 等）；不使用严格沙箱（`ProtectSystem=strict`、
-`ProtectKernelModules`）：iptables 需要加载内核模块，严格沙箱曾在部分系统上导致无法启动。
-
-**更新。** 每次启动面板（`sudo skipa-watchdog`）时都会检查是否有新版本并提示安装；拒绝后并不会就此作罢：菜单顶部会保留提醒。服务启动时，机器人会向聊天发送带“安装”按钮的消息（也可用 `/version` 随时查询）；未启用 Telegram 或仅服务方式下，新版本信息会写入日志。`updates.check_on_start: false` 可关闭检查（单次可用 `SKIPA_NO_UPDATE_CHECK=1`）；`sudo bash install.sh check-update` 不带提示地检查（退出码 10 表示有更新）。手动更新：菜单第 12 项或 `sudo bash install.sh install`。如果 `git pull` 失败（仓库历史被改写），
-安装程序会提示切换到最新版本：`config.yaml` 和 `data/` 不受影响。
+**更新。** 每次启动面板（`sudo skipa-watchdog`）都会检查是否有新版本并提示安装；拒绝不是永久的：菜单标题中会保留提醒。
+`SKIPA_NO_UPDATE_CHECK=1` 可单次关闭检查，`sudo bash install.sh check-update` 无提示检查（退出码 10 表示有更新）。手动更新：
+菜单第 12 项或 `sudo bash install.sh install`。如果 `git pull` 失败（仓库历史被改写），安装程序会提议切换到当前版本：
+`config.yaml` 和 `data/` 不受影响。
 
 **卸载。** 菜单第 13 项。安装程序会单独询问是否移除 `iptables` 规则和 `ipset` 集合。
 
+## 从 Python 机器人版本升级
+
+从 4.0 起，项目中不再有 Python。如果你之前用的是“服务 + Telegram 机器人”版本，更新（`sudo skipa-watchdog` → 第 12 项，或
+`sudo bash install.sh install`）会自动把它迁移到 bash，防护不中断：先启动 bash 单元和 `ipset` 规则，然后才移除机器人的单元、
+`SKIPA-BLOCK` 链和 `skipa-dyn`/`skipa-db` 集合，并删除 venv。
+
+- **保留：** `config.yaml`（Telegram 令牌和 `chat_id` 继续作为通知使用）、`data/`、白名单和永久手动封锁（迁移到 `skipa-manual`）。
+- **消失：** 有时限的封锁（包括自动封锁；它们本来就会过期）、聊天命令（`/block`、`/allow`、`/stats` 等）、“封禁”按钮、仪表盘、
+  告警补充信息（国家、ASN）、每周摘要和机器人的健康检查。白名单取代手动封锁，其余已不再需要。
+
 ## 安全
 
-- `config.yaml` 包含机器人令牌：安装程序会将权限设置为 `600`。
-- 机器人令牌和 API 密钥在日志中会被屏蔽（`skipa-watchdog.log`、`journalctl`）。
-- 机器人命令只接受管理员（`admin_ids`，或与 `chat_id` 的私聊）的指令。
-- 防止自我封锁的机制见上文。如果你仍然被挡在外面，请通过主机控制台登录并运行 `sudo skipa-watchdog`：
-  Telegram 方式下第 6 项可解除指定 IP 的封锁，仅服务方式下请将 IP 加入白名单（第 7 项）；第 13 项会连同规则一起删除项目。
-- 来自外部 API 的数据（组织、ASN）在 Telegram 和仪表盘页面中会被转义，写入文本日志前还会去除换行和控制字符（否则网络所有者可向 fail2ban 注入带有他人 IP 的伪造行）。
-- 未设置 `username` 的仪表盘对任何能访问该端口的人开放：请勿将其发布到互联网。若 `dashboard.host` 不是回环地址且未设置登录，仪表盘只会监听 `127.0.0.1` 并在日志中说明。
-- 发现漏洞请私下联系仓库所有者，不要发布到公开的 issue 中。
+- `config.yaml` 含有令牌：安装程序设置权限 `600`，若配置含秘密而权限不同会发出警告。
+- 令牌通过 stdin 而不是参数传给 `curl`，在 `ps` 中不可见。
+- 菜单中输入的值在写入前会检查格式（Telegram 令牌、`chat_id`、`homeserver`、`room_id`），写入 `config.yaml` 时不会展开 `\n`，
+  并拒绝可用来夹带额外键的引号、反斜杠和换行。
+- 内核日志写入 `detections.log` 前会去除控制字符（否则可以为 fail2ban 伪造相邻记录）。
+- 防自我封锁见上文。如果仍被挡在外面，请通过主机控制台登录并运行 `sudo skipa-watchdog`：把你的 IP 加入白名单（第 7 项）；
+  第 13 项会连同规则一起删除项目。
+- 更新项目就是以 root 身份从仓库执行 `git pull`：谁控制仓库，谁就控制你的服务器。请为 GitHub 账号启用 2FA；如果想在更新前审阅改动，
+  请把 `SKIPA_REPO_URL` 指向你自己的 fork。
+- 发现漏洞请私下联系仓库所有者，不要提公开 issue。
 
 ## 常见问题
 
-**收到了针对一个“不在规则里”的 IP 的告警。** 请检查该地址是否属于某个名单，包括第二个名单中的地址范围：
+**收到了“不在规则里”的 IP 的通知。** 检查该地址是否属于某个名单，包括第二个名单中的范围：
 
 ```bash
-sudo ipset test skipa-scanners 66.132.186.215        # 仅服务
-sudo ipset test skipa-db 66.132.186.215              # 服务 + Telegram（ipset）
+sudo ipset test skipa-scanners 66.132.186.215
 ```
 
-名单中的扫描器网段比单个地址更大：例如，`66.132.186.215` 属于第二个名单中的 `66.132.186.0/24`。
-命中的网段会显示在告警和 `detections.log` 中。扫描器的任何数据包都会产生记录：在“仅服务”方式下，
-LOG 规则对所有协议生效（在 `detections.log` 中可以看到 `proto=UDP port=3478`），数据包在记录后被丢弃。
+名单中的扫描器网络比单个地址更宽：例如 `66.132.186.215` 属于第二个名单中的 `66.132.186.0/24`。扫描器的任何数据包都会产生记录：
+LOG 规则对所有协议生效（`detections.log` 中能看到 `proto=UDP port=3478`），记录后数据包会被丢弃。
 
-**菜单提示 INPUT 未连接，但规则已经存在。** 请更新项目（第 12 项）。之前的检查只查找旧格式的规则，
-现在会查找该链中项目的任何规则。
+**收不到通知。** 菜单第 4 项 →“发送测试消息”会按渠道报告结果：“已送达”、“服务器拒绝请求”（令牌、`chat_id` 或房间错误）或“无连接”。
+还要检查 `action.mode` 不是 `block`，以及守护进程是否存活：`systemctl status skipa-watchdog-notify`。发送错误会写入
+`skipa-watchdog.log`。菜单第 1 项会显示未发送消息队列的大小。
 
-**服务无法启动。** 执行 `journalctl -u skipa-watchdog -n 50`。常见原因：没有 `ipset`
-（服务以简化的 iptables 模式运行）、`config.yaml` 无效、仪表盘端口被占用。
+**对合法扫描器的误报**（例如你自己的安全监控）：把它的 IP 加入白名单（第 7 项）。
 
-**对合法扫描器的误报**（例如你自己的安全监控）：将其 IP 添加到 `monitoring.ignore_ips`。
-
-**对容器不起作用。** 打开菜单第 5 项 → “显示当前规则”：`DOCKER-USER` 中也必须有到 `SKIPA-BLOCK`
-的跳转。在服务之后启动的 Docker 会在一分钟内被识别。
+**对容器不生效。** 打开菜单第 5 项 →“显示当前规则”：`DOCKER-USER` 中也必须有规则。如果 Docker 启动得更晚，请重新应用规则
+（第 5 项；开机时由 `skipa-watchdog-rules.service` 完成）。
 
 ## 开发
 
 ```bash
-python3 -m unittest discover -s tests -t .     # 200+ 个测试，无需 root
-shellcheck -S warning service/*.sh install-firewall-rules.sh
+python3 -m unittest discover -s tests -t .     # 100+ 个测试，无需 root
+shellcheck -S warning install.sh service/*.sh
 ```
 
-测试用模拟对象替代 `iptables` 和 `ipset`（[`tests/fakes.py`](tests/fakes.py)、[`tests/netfake.py`](tests/netfake.py)），不会触碰真实防火墙；CI 在 Python 3.10–3.13 上运行，并配合 `bash -n` 和 `shellcheck`。“仅服务”方式在真实 `ipset`/`iptables` 上的端到端场景（重启、`iptables-restore`、flock）需要显式开启，因为它会修改主机的集合和规则：在一次性环境中以 root 运行 `SKIPA_REAL_NETFILTER_TESTS=1 python3 -m unittest tests.test_real_netfilter`。
+项目本身是纯 bash；Python 只用于测试（它们运行 bash 脚本）和用 PyYAML 检查 `config.yaml`。测试用模拟实现替换 `iptables`、`ipset`、
+`curl` 和 `journalctl`（[`tests/netfake.py`](tests/netfake.py) 以及测试内的桩脚本），不会触碰真实防火墙和网络。使用真实
+`ipset`/`iptables` 的端到端场景（重启、`iptables-restore`、flock）需要显式开启，因为它会修改主机的集合和规则：
+在一次性环境中以 root 运行 `SKIPA_REAL_NETFILTER_TESTS=1 python3 -m unittest tests.test_real_netfilter`。
 
-目录结构：
+结构：
 
 ```
-watchdog.py            Telegram 方式的入口
 install.sh             安装程序和菜单
-bot/                   Python 模块（监控、封锁、名单、Telegram、仪表盘）
-service/               bash 方式以及读取 config.yaml 的公共库
+service/               脚本：名单、规则、通知、config.yaml 读取、白名单
 fail2ban/              过滤器和 jail（另一种封禁方式）
 tests/                 测试
-config.example.yaml    统一配置模板
+config.example.yaml    配置模板
 ```
 
 ## 许可证

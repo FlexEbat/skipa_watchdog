@@ -35,7 +35,7 @@ fi
 source "$HERE/lib-config.sh"
 # shellcheck source=lib-ipset.sh
 source "$HERE/lib-ipset.sh"
-load_service_config "$CONF"   # единый config.yaml, тот же, что читает watchdog.py
+load_service_config "$CONF"   # единый config.yaml
 STATE_DIR="${SKIPA_STATE_DIR:-/var/lib/skipa_watchdog}"
 mkdir -p "$LOG_DIR" "$STATE_DIR"
 

@@ -16,9 +16,8 @@
 # опции требует повторно применить правила (старый вариант убирается автоматически).
 #
 # Применяется к INPUT (хост) и, если есть, DOCKER-USER и
-# KUBE-EXTERNAL-SERVICES/KUBE-NODEPORTS (Docker/Kubernetes) - как и
-# install-firewall-rules.sh для режима с ботом, только здесь вместо
-# динамической цепочки SKIPA-BLOCK используется статичный ipset-матчинг.
+# KUBE-EXTERNAL-SERVICES/KUBE-NODEPORTS (Docker/Kubernetes);
+# вместо динамической цепочки используется статичный ipset-матчинг.
 #
 # Использование:
 #   sudo bash setup-ipset-rules.sh [config.yaml | notify|block|block_notify]
